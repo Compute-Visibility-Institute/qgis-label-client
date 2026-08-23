@@ -71,7 +71,10 @@ def build_oapif_uri(
         ``compound`` class spans 3428 x 2652 km and fetching all of it to draw one
         campus is a minute of waiting for nothing.
     ``filter``
-        CQL2-text, which the provider sends as ``filter=...&filter-lang=cql2-text``.
+        a **QGIS expression**, which the provider compiles to CQL2 itself and sends as
+        ``filter=...&filter-lang=cql2-text``. Not literal CQL2: an expression QGIS
+        cannot parse makes the layer invalid rather than unfiltered. See
+        :mod:`.asof` for the specific trap.
     ``authcfg``
         reference into ``qgis-auth.db``. Never a token.
     """

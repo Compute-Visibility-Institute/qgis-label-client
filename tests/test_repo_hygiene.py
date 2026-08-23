@@ -18,10 +18,17 @@ trip its own scan.
 
 from __future__ import annotations
 
+import ast
 import re
 
 import pytest
-from hygiene_rules import FORBIDDEN_STRINGS, FORBIDDEN_SUFFIXES, SELF, SKIP_DIRECTORIES
+from hygiene_rules import (
+    DOMAIN_VOCABULARY,
+    FORBIDDEN_STRINGS,
+    FORBIDDEN_SUFFIXES,
+    SELF,
+    SKIP_DIRECTORIES,
+)
 
 PACKAGE = "qgis_label_client"
 
@@ -119,6 +126,30 @@ def test_the_pure_core_imports_no_qgis(repo_root):
         if pattern.search(path.read_text(encoding="utf-8"))
     ]
     assert offenders == [], offenders
+
+
+def test_no_class_or_attribute_name_is_compiled_into_the_plugin(repo_root):
+    # THE constraint the whole schema design exists to protect. Attributes live in JSONB
+    # governed by the class's JSON Schema, so adding one is an UPDATE on the server and
+    # needs no plugin release -- which only holds while every client reads the registry
+    # instead of shipping its own copy.
+    #
+    # Whole string constants are compared, via the AST rather than a grep, so a comment
+    # or a docstring explaining why cooling units matter does not trip the check and a
+    # dictionary key that reaches into `attrs` by name does.
+    offenders: list[str] = []
+    for path in _python_files(repo_root):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and node.value in DOMAIN_VOCABULARY
+            ):
+                offenders.append(f"{path.relative_to(repo_root)}:{node.lineno}: {node.value!r}")
+    assert offenders == [], (
+        f"These come from the class registry at runtime and must never be literals: {offenders}"
+    )
 
 
 def test_the_licence_is_gpl_v2(repo_root):

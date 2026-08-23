@@ -47,6 +47,19 @@ def test_classes_sort_by_sort_order_then_id():
     assert [cls.class_id for cls in registry] == ["sprocket", "widget"]
 
 
+def test_the_nested_multilingual_label_shape_is_understood():
+    """The backend serves the display name both flat and nested under ``labels``.
+
+    Reading only the flat form does not fail loudly when the backend sends only the
+    nested one: it falls through to ``class_id``, so the layer legend reads "widget"
+    instead of "Widget (小部件)" and looks like a deliberate choice.
+    """
+    registry = parse_registry(
+        {"classes": [{"class_id": "widget", "labels": {"en": "Widget", "zh": "小部件"}}]}
+    )
+    assert registry.get("widget").display_name == "Widget (小部件)"
+
+
 def test_retired_classes_are_kept_but_excluded_from_active():
     registry = parse_registry(DOC)
     assert len(registry) == 2

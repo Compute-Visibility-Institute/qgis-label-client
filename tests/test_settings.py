@@ -26,6 +26,17 @@ def test_no_setting_holds_a_credential():
     assert not any(key for key in DEFAULTS if key in ("token", "api_key", "password", "secret"))
 
 
+def test_the_custom_endpoint_paths_live_under_the_backend_namespace():
+    """The two non-OAPIF endpoints sit under the backend's own `v1/` prefix.
+
+    Everything outside that prefix is proxied straight to the feature service, so a
+    path without it returns an OAPIF error about an unknown collection -- an error
+    that points at the wrong component and reads like a backend outage.
+    """
+    assert DEFAULTS["class_registry_path"] == "v1/classes"
+    assert DEFAULTS["signed_urls_path"] == "v1/imagery/signed-urls"
+
+
 def test_defaults_are_returned_when_nothing_is_stored():
     settings = PluginSettings()
     assert settings.get("page_size") == 1000

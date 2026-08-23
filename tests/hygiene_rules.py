@@ -57,3 +57,42 @@ FORBIDDEN_STRINGS = (
 
 #: The one file exempt from the string scan: this one.
 SELF = "hygiene_rules.py"
+
+#: Domain vocabulary that must never be a string literal in the plugin.
+#:
+#: Class ids and attribute names live in the server's class registry -- `label_class` and
+#: the JSON Schema it publishes -- and every one the plugin renders is read from there at
+#: runtime. A literal here would reintroduce exactly the drift the schema design removes:
+#: the web UI would show a newly added attribute the day it was added and QGIS would show
+#: it whenever the plugin was next released.
+#:
+#: This is a deny list, so it proves less than the general property -- it cannot know
+#: about a vocabulary term added after this file was written. It does catch the actual
+#: regression, which is somebody reaching into `attrs` by name rather than through the
+#: registry. Comments and docstrings are not scanned; the check compares whole string
+#: constants, so prose that merely mentions a class is fine.
+DOMAIN_VOCABULARY = frozenset(
+    {
+        # class ids
+        "compound",
+        "datacenter_building",
+        "substation",
+        "backup_generator",
+        "cooling_unit",
+        "powerline",
+        "administrative",
+        # attribute names
+        "operator",
+        "cooling_unit_count",
+        "transformer_count",
+        "commissioned_year",
+        "area_m2",
+        "building_designator",
+        "building_use",
+        "floors",
+        "voltage_kv",
+        "unit_count",
+        "cooling_type",
+        "admin_level",
+    }
+)

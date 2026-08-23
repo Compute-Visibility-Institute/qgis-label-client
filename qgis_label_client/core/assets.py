@@ -62,9 +62,17 @@ class SignedAsset:
     expires_at: datetime | None = None
 
     @property
-    def key(self) -> str:
-        """Stable identifier for the (capture, derivative) pair."""
-        return f"{self.stac_id}:{self.role}"
+    def key(self) -> str | None:
+        """Stable identifier for the (capture, derivative) pair.
+
+        ``None`` when the backend did not name the scene. Without ``stac_id`` the key
+        would be ``":visual"`` for *every* capture, which is worse than having no key:
+        two captures would collide in the lookup below and a layer stamped with it would
+        bind to an arbitrary scene on the next refresh -- the wrong imagery under the
+        right layer name, which is exactly the kind of silent error a signed-URL refresh
+        must not introduce. Fall back to matching by object path instead.
+        """
+        return f"{self.stac_id}:{self.role}" if self.stac_id else None
 
     @property
     def object_key(self) -> str | None:
@@ -169,8 +177,8 @@ def parse_signed_assets(document: Any) -> tuple[list[SignedAsset], datetime | No
              "url": "https://storage.googleapis.com/...", "gs_uri": "gs://..."}]}
 
     A bare array of asset objects is also accepted. Returns the assets and the earliest
-    expiry across them, which is what the panel counts down -- the session is only good
-    until the first URL dies.
+    expiry across them, which is what the panel reports and warns on -- the session is
+    only good until the first URL dies.
     """
     if isinstance(document, Mapping):
         raw_assets = document.get("assets")
@@ -187,9 +195,15 @@ def parse_signed_assets(document: Any) -> tuple[list[SignedAsset], datetime | No
     for raw in raw_assets:
         if not isinstance(raw, Mapping):
             continue
+        # Two vocabularies, both accepted. The backend's capture rows are STAC-shaped,
+        # where an asset is a map key plus an ``href``; this client reads a flat list
+        # where each entry names its own ``asset`` and ``url``. Reading only one
+        # spelling does not degrade gracefully -- an entry missing it is skipped, and
+        # skipping them all raises "no usable assets", which names neither field and
+        # sends whoever reads it looking at the network rather than at the payload.
         url = raw.get("url") or raw.get("href")
         stac_id = raw.get("stac_id") or raw.get("scene_id")
-        role = raw.get("asset") or raw.get("role") or raw.get("name")
+        role = raw.get("asset") or raw.get("role") or raw.get("name") or raw.get("key")
         if not isinstance(url, str) or not url or not isinstance(role, str) or not role:
             continue
         expiry = _parse_expiry(raw.get("expires_at")) or overall_expiry
@@ -246,7 +260,7 @@ def plan_rewrites(
     a layer that renders yesterday's cached tiles and looks fine until it doesn't.
     """
     asset_list = list(assets)
-    by_key = {asset.key: asset for asset in asset_list}
+    by_key = {asset.key: asset for asset in asset_list if asset.key}
     by_object: dict[str, SignedAsset] = {}
     for asset in asset_list:
         object_key = asset.object_key

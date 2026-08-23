@@ -22,8 +22,8 @@ def test_one_cycle_attaches_and_detaches_everything(fake_iface):
     plugin.initGui()
     assert len(fake_iface.toolbar_icons) == 1
     assert len(fake_iface.docks) == 1
-    # Two menu entries: the panel toggle and the imagery refresh.
-    assert [menu for menu, _ in fake_iface.plugin_menu] == [MENU_NAME, MENU_NAME]
+    # Three menu entries: the panel toggle, the imagery refresh and the bootstrap publish.
+    assert [menu for menu, _ in fake_iface.plugin_menu] == [MENU_NAME] * 3
 
     plugin.unload()
     assert fake_iface.toolbar_icons == []
@@ -51,12 +51,13 @@ def test_unload_is_idempotent(fake_iface):
 def test_every_attachment_registers_a_teardown(fake_iface):
     plugin = LabelClientPlugin(fake_iface)
     plugin.initGui()
-    # dock, toolbar icon, two menu entries.
+    # dock, toolbar icon, three menu entries.
     assert plugin.teardown.labels == [
         "dock widget",
         "toolbar icon",
         "menu: panel",
         "menu: refresh imagery",
+        "menu: publish local layers",
     ]
     plugin.unload()
     assert len(plugin.teardown) == 0

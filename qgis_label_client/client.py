@@ -4,21 +4,27 @@ Everything in here blocks. Nothing in here touches Qt widgets, ``iface`` or
 ``QgsProject``. That is the contract for code reachable from ``QgsTask.run()``, and
 keeping it in one module makes the boundary easy to check.
 
-Four calls, and only one of them is not standard OGC API - Features:
+Only two of these are not standard OGC API - Features:
 
-* ``/collections`` and ``/collections/{id}/items`` -- Part 1, also what QGIS's native
-  provider speaks;
+* ``/collections`` and ``/collections/{id}/items`` -- Part 1 for reads and Part 4 for
+  creates, both also spoken by QGIS's native provider;
 * the class registry, which has no OGC equivalent because "here is the JSON Schema for
   each class" is not a features question;
 * signed imagery URLs, likewise.
 
 The two custom endpoints are configurable paths rather than constants, so a deployment
 can mount them wherever it likes.
+
+The creates at the bottom exist for the bootstrap publish only. Ordinary editing goes
+through the native provider's Part 4 support, where QGIS already owns the edit buffer,
+the undo stack and the conflict handling; duplicating that here would be a second, worse
+editor. What the provider cannot do is take a *local* layer -- a shapefile that has never
+been part of the collection -- and turn it into features, which is the one case below.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from qgis.core import QgsFeedback
@@ -28,7 +34,7 @@ from .core.assets import SignedAsset, parse_signed_assets
 from .core.collections import Collection, parse_collections
 from .core.history import HistoryEntry, parse_history
 from .core.registry import ClassRegistry, parse_registry
-from .network import request_json
+from .network import post_json, request_json
 
 
 def fetch_collections(
@@ -101,3 +107,47 @@ def fetch_features(
     """Fetch a raw FeatureCollection. Used by the coverage check for survey extents."""
     url = urls.with_query(urls.items_url(base_url, collection_id), query or {})
     return request_json(url, authcfg=authcfg, feedback=feedback)
+
+
+def create_feature(
+    base_url: str,
+    collection_id: str,
+    feature: Mapping[str, Any],
+    authcfg: str,
+    feedback: QgsFeedback | None = None,
+) -> Any:
+    """Create one feature. OGC API - Features Part 4: POST a Feature to ``/items``.
+
+    No feature id is sent. ``label.label_id`` is ``uuid DEFAULT gen_random_uuid()`` and
+    the surrogate OAPIF id is ``GENERATED ALWAYS AS IDENTITY``; both are the server's to
+    assign, and the source data's own ``id`` column is 0% populated across all 1,246
+    features -- it is the defect being fixed, not a fallback.
+    """
+    return post_json(
+        urls.items_url(base_url, collection_id),
+        dict(feature),
+        authcfg=authcfg,
+        feedback=feedback,
+    )
+
+
+def create_features(
+    base_url: str,
+    collection_id: str,
+    features: Sequence[Mapping[str, Any]],
+    authcfg: str,
+    feedback: QgsFeedback | None = None,
+) -> Any:
+    """Create several features in one request, as a GeoJSON FeatureCollection.
+
+    Part 4 allows a FeatureCollection body and pygeoapi accepts one, which turns 1,246
+    round trips into a couple of dozen. It is an optimisation and nothing more: the caller
+    is expected to fall back to :func:`create_feature` when a batch is rejected, because a
+    batch failure names no feature and a per-feature retry does.
+    """
+    return post_json(
+        urls.items_url(base_url, collection_id),
+        {"type": "FeatureCollection", "features": [dict(f) for f in features]},
+        authcfg=authcfg,
+        feedback=feedback,
+    )

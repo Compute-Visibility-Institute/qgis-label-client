@@ -37,16 +37,29 @@ def test_cql2_filter_covers_the_open_upper_bound():
     # The null test is load-bearing: an unbounded tstzrange upper bound means "still true
     # as far as we know", and without this clause every current label vanishes.
     text = cql2_filter(date(2026, 4, 21))
-    assert "valid_from <= TIMESTAMP('2026-04-21T00:00:00Z')" in text
-    assert "valid_to IS NULL" in text
-    assert "valid_to > TIMESTAMP('2026-04-21T00:00:00Z')" in text
+    assert "\"valid_from\" <= '2026-04-21T00:00:00Z'" in text
+    assert '"valid_to" IS NULL' in text
+    assert "\"valid_to\" > '2026-04-21T00:00:00Z'" in text
+
+
+def test_cql2_filter_is_a_qgis_expression_not_literal_cql2():
+    # Regression. The provider's `filter` URI parameter is parsed with QgsExpression and
+    # compiled to CQL2 by QGIS; literal CQL2 does not merely get ignored, it makes the
+    # QgsVectorLayer INVALID. TIMESTAMP() is valid CQL2 and is not a QGIS expression
+    # function -- QGIS 3.44 answers "Function TIMESTAMP is not known" and refuses the
+    # layer, so the analyst gets no data at all. Verified against QGIS 3.44.13.
+    text = cql2_filter(date(2026, 4, 21))
+    assert "TIMESTAMP(" not in text
+    # to_datetime() parses but does not compile to CQL2, which silently downgrades the
+    # filter to client-side evaluation and downloads the whole collection.
+    assert "to_datetime(" not in text
 
 
 def test_cql2_filter_honours_server_supplied_field_names():
     fields = CoreFields().merged({"valid_from": "vf", "valid_to": "vt"})
     text = cql2_filter(date(2026, 4, 21), fields)
-    assert "vf <=" in text
-    assert "vt IS NULL" in text
+    assert '"vf" <=' in text
+    assert '"vt" IS NULL' in text
     assert "valid_from" not in text
 
 

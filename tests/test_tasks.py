@@ -46,6 +46,33 @@ def test_cancelling_stops_the_callbacks_firing():
     assert seen == []
 
 
+def test_a_cancelled_write_still_reports_what_it_managed_to_do():
+    # Cancelling a read discards a result nobody wanted. Cancelling a write cannot: some
+    # of it already happened on a server, and the summary is the only record of which
+    # part. The bootstrap publish opts in for exactly that reason.
+    seen: list[object] = []
+    task = FunctionTask(
+        "publish", lambda feedback: "partial", on_success=seen.append, deliver_when_cancelled=True
+    )
+    task.run()
+    task.cancel()
+    task.finished(True)
+    assert seen == ["partial"]
+
+
+def test_opting_in_does_not_defeat_detach():
+    # detach(), not the cancellation guard, is what stops a task calling into a widget
+    # that unload() has destroyed.
+    seen: list[object] = []
+    runner = TaskRunner()
+    task = runner.run(
+        "publish", lambda feedback: 1, on_success=seen.append, deliver_when_cancelled=True
+    )
+    runner.shutdown()
+    task.finished(True)
+    assert seen == []
+
+
 def test_cancel_also_cancels_the_feedback_so_the_socket_aborts():
     task = FunctionTask("work", lambda feedback: None)
     assert task._feedback.isCanceled() is False

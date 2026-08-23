@@ -42,12 +42,23 @@ class FunctionTask(QgsTask):
         work: WorkCallable,
         on_success: SuccessCallable | None = None,
         on_error: ErrorCallable | None = None,
+        deliver_when_cancelled: bool = False,
     ) -> None:
         super().__init__(description, QgsTask.Flag.CanCancel)
         self._work = work
         self._on_success = on_success
         self._on_error = on_error
+        # Cancelling a *read* means "I do not want this any more" and the result is simply
+        # dropped. Cancelling a *write* is different: some of it already happened, on a
+        # server, and the user has to be told what. Tasks that change something on the far
+        # end opt in to being reported even when they were stopped early.
+        self._deliver_when_cancelled = deliver_when_cancelled
         self._feedback = QgsFeedback()
+        # The work callable is handed nothing but the feedback, so the feedback is also
+        # its only way to report progress. Forwarding it here means a long run -- a
+        # thousand-feature publish, say -- shows a moving bar in the task manager and a
+        # cancel button that does something, without the work knowing what a QgsTask is.
+        self._feedback.progressChanged.connect(self.setProgress)
         self._result: Any = None
         self._message: str = ""
         self._traceback: str = ""
@@ -75,7 +86,9 @@ class FunctionTask(QgsTask):
     # --- main thread -----------------------------------------------------------
 
     def finished(self, result: bool) -> None:
-        if self.isCanceled():
+        # ``detach()`` -- not this guard -- is what makes the unload path safe, so opting
+        # in here cannot resurrect a callback into a destroyed widget.
+        if self.isCanceled() and not self._deliver_when_cancelled:
             return
         if result:
             if self._on_success is not None:
@@ -104,8 +117,9 @@ class TaskRunner:
         work: WorkCallable,
         on_success: SuccessCallable | None = None,
         on_error: ErrorCallable | None = None,
+        deliver_when_cancelled: bool = False,
     ) -> FunctionTask:
-        task = FunctionTask(description, work, on_success, on_error)
+        task = FunctionTask(description, work, on_success, on_error, deliver_when_cancelled)
 
         def _release() -> None:
             # Runs on the main thread via the task's own signals, so mutating the list

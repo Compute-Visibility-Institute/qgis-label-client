@@ -22,8 +22,30 @@ of the QGIS OAPIF URI and is appended to every items request as
 ``filter=...&filter-lang=cql2-text``, so it always survives. It expresses the same
 question directly against the valid-time columns.
 
-Both are here, both are tested, and which one a deployment uses is a setting rather than
-a patch. That is the honest resolution: the standard mechanism first, a mechanism that
+THE TRAP IN THAT SECOND MECHANISM, AND WHY :func:`cql2_filter` LOOKS THE WAY IT DOES
+
+The provider's ``filter`` parameter does **not** take CQL2-text. It takes a *QGIS
+expression*, which the provider then compiles to CQL2 itself and appends as
+``filter=...&filter-lang=cql2-text``. Handing it literal CQL2 is not merely ignored: an
+expression QGIS cannot parse makes ``QgsVectorLayer`` invalid, so the analyst gets no
+layer at all rather than an unfiltered one.
+
+Concretely, ``TIMESTAMP('...')`` -- correct CQL2, and the obvious thing to write -- is
+not a QGIS expression function, and QGIS 3.44 answers "Function TIMESTAMP is not known"
+and refuses the layer. Writing the comparison against a plain quoted string instead lets
+QGIS do the conversion, and it emits exactly the CQL2 that was wanted::
+
+    "valid_from" <= '2026-01-01T00:00:00Z'
+        -> filter=("valid_from" <= TIMESTAMP('2026-01-01T00:00:00.000Z'))&filter-lang=cql2-text
+
+Two consequences worth keeping in mind when editing this function: identifiers are
+double-quoted because that is a QGIS expression's column reference, and only functions
+QGIS knows *and* can compile may appear -- ``to_datetime()`` parses but does not compile,
+which silently downgrades the filter to client-side evaluation and downloads the whole
+collection.
+
+Both mechanisms are here, and which one a deployment uses is a setting rather than a
+patch. That is the honest resolution: the standard mechanism first, a mechanism that
 cannot silently no-op second.
 """
 
@@ -72,17 +94,32 @@ def datetime_query(value: date | datetime) -> dict[str, str]:
 
 
 def cql2_filter(value: date | datetime, fields: CoreFields = DEFAULT_FIELDS) -> str:
-    """CQL2-text selecting the state valid at `value`.
+    """Filter expression selecting the state valid at `value`.
 
     Mirrors the range containment the database performs (``valid @> :instant``) using
     only the flattened bounds the OAPIF view exposes. The upper bound is exclusive and
     NULL means "still true as far as we know" -- an unbounded ``tstzrange`` upper bound
     -- so the null test is load-bearing, not defensive: without it every currently-valid
     label disappears from the as-of view.
+
+    Rendered as a **QGIS expression**, not as CQL2-text: the provider parses this string
+    with ``QgsExpression`` and does the CQL2 conversion itself. See the module docstring
+    -- writing CQL2 here fails the layer outright.
     """
     moment = instant(value)
-    lo, hi = fields.valid_from, fields.valid_to
-    return f"{lo} <= TIMESTAMP('{moment}') AND ({hi} IS NULL OR {hi} > TIMESTAMP('{moment}'))"
+    lo, hi = _identifier(fields.valid_from), _identifier(fields.valid_to)
+    literal = _literal(moment)
+    return f"{lo} <= {literal} AND ({hi} IS NULL OR {hi} > {literal})"
+
+
+def _identifier(name: str) -> str:
+    """Quote a column name as a QGIS expression column reference."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _literal(text: str) -> str:
+    """Quote a value as a QGIS expression string literal."""
+    return "'" + text.replace("'", "''") + "'"
 
 
 def describe(value: date | datetime | None, mechanism: AsOfMechanism) -> str:

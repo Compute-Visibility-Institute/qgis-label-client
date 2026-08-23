@@ -236,13 +236,21 @@ def _coerce_class(raw: Mapping[str, Any]) -> LabelClass:
     if not isinstance(class_id, str) or not class_id:
         raise RegistryError(f"class entry has no class_id: {raw!r}")
     geom_type = raw.get("geom_type") or raw.get("geometry_type") or _ANY_GEOMETRY
-    label_en = raw.get("label_en") or raw.get("label") or class_id
+    # The display name arrives either flat -- as ``label_class`` names the columns --
+    # or nested under ``labels`` as a multilingual object, and the backend currently
+    # sends both. Reading only one of them does not fail: it falls through to
+    # ``class_id``, so the legend reads "cooling_unit" and looks like a styling choice
+    # rather than a dropped field.
+    names = raw.get("labels")
+    names = names if isinstance(names, Mapping) else {}
+    label_en = raw.get("label_en") or names.get("en") or raw.get("label") or class_id
+    label_zh = raw.get("label_zh") or names.get("zh") or None
     sort_order = raw.get("sort_order", 100)
     return LabelClass(
         class_id=class_id,
         geom_type=str(geom_type),
         label_en=str(label_en),
-        label_zh=raw.get("label_zh") or None,
+        label_zh=label_zh or None,
         description=raw.get("description") or None,
         attr_schema=_as_mapping(raw.get("attr_schema")),
         form=_as_mapping(raw.get("form")),

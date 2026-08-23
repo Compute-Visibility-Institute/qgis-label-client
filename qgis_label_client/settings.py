@@ -35,11 +35,20 @@ DEFAULTS: dict[str, Any] = {
     "api_base_url": "",
     # Reference into qgis-auth.db. NOT a token.
     "authcfg": "",
-    # Path, relative to api_base_url, of the class-registry document. A path rather than
-    # a full URL so a deployment that moves the API does not have to update two settings.
-    "class_registry_path": "classes",
-    # Path of the signed-URL minting endpoint.
-    "signed_urls_path": "imagery/signed-urls",
+    # Paths, relative to api_base_url, of the two endpoints that are not OGC API -
+    # Features. Paths rather than full URLs so a deployment that moves the API does not
+    # have to update two settings, and settings rather than constants so a deployment
+    # may mount them elsewhere.
+    #
+    # The `v1/` prefix is the backend's own namespace: everything outside it is proxied
+    # verbatim to the feature service, so the two cannot collide. A path without it
+    # reaches the feature service instead and comes back as an OAPIF error about an
+    # unknown collection, which points at the wrong component entirely.
+    "class_registry_path": "v1/classes",
+    # Mints signed URLs for many captures at once -- one round trip per session, not one
+    # per scene. Session start is exactly when a project's raster layers are all dead at
+    # the same time.
+    "signed_urls_path": "v1/imagery/signed-urls",
     # OAPIF page size. 1000 is pygeoapi's usual maximum; larger is silently clamped.
     "page_size": 1000,
     # Fetch only features overlapping the canvas. On by default because the compound
@@ -56,6 +65,11 @@ DEFAULTS: dict[str, Any] = {
     "history_collection": "",
     # Warn this many minutes before the signed URLs expire.
     "expiry_warning_minutes": 30,
+    # Features per POST when publishing local layers. A FeatureCollection body turns 1,246
+    # round trips into a couple of dozen; set it to 1 against a server that only accepts a
+    # single Feature per create. Failures fall back to one at a time either way, so this is
+    # a speed setting and never a correctness one.
+    "publish_batch_size": 50,
 }
 
 

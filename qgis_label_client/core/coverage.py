@@ -94,9 +94,15 @@ class CoverageReport:
     """Everything the QA panel needs to say something true and specific."""
 
     findings: tuple[Finding, ...]
-    #: Classes with no exhaustive extent declared anywhere at all. Distinct from a label
-    #: merely falling outside one, and a much stronger signal: nobody has ever recorded a
-    #: sweep for this class.
+    #: Classes with no exhaustive extent among the extents that were checked. Distinct
+    #: from a label merely falling outside one, and a much stronger signal: no sweep for
+    #: this class has been recorded anywhere in the area examined.
+    #:
+    #: Scoped to what was checked on purpose. The caller supplies the extents, and with
+    #: the provider's canvas restriction on -- the default, because the national layer is
+    #: thousands of kilometres across -- that is the current view rather than the whole
+    #: deployment. Claiming "nowhere at all" from a canvas-sized sample would be a false
+    #: statement in a dialog.
     classes_without_extents: tuple[str, ...] = ()
 
     def by_coverage(self, coverage: Coverage) -> tuple[Finding, ...]:
@@ -132,7 +138,8 @@ class CoverageReport:
             bits.append(f"{len(self.partial_only)} inside only a partial extent (see its caveat)")
         if self.classes_without_extents:
             bits.append(
-                "no exhaustive extent exists at all for: " + ", ".join(self.classes_without_extents)
+                "no exhaustive extent among those checked for: "
+                + ", ".join(self.classes_without_extents)
             )
         return (
             f"{len(self.findings)} labels checked - "
