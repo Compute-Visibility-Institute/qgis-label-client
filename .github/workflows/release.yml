@@ -69,7 +69,11 @@ jobs:
           # No secret to configure: the automatic workflow token is enough because the
           # repository is public and the release is public.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # --release-tag keeps the two apart on purpose. The version goes into the packaged
+        # metadata.txt, where a leading "v" would confuse the plugin manager's version
+        # comparison; the tag is what exists in git and is what the release attaches to.
         run: |
           qgis-plugin-ci release "${{ steps.tag.outputs.version }}" \
+            --release-tag "${{ steps.tag.outputs.tag }}" \
             --github-token "$GITHUB_TOKEN" \
             --create-plugin-repo

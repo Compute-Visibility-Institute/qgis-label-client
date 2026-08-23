@@ -352,8 +352,10 @@ class LabelClientDock(QDockWidget):
         ]
 
     def set_registry(self, registry: ClassRegistry | None) -> None:
-        self.class_combo.clear()
+        # Assign before clearing: clear() emits currentIndexChanged, and _show_class_help
+        # would otherwise render the previous registry's text for one frame.
         self._registry = registry
+        self.class_combo.clear()
         if registry is None:
             self.class_help.setPlainText("")
             return

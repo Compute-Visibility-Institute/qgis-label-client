@@ -124,7 +124,8 @@ class LabelClientPlugin:
         :meth:`_detach_dock` destroys. Registering them anyway would be teardown that
         runs against a deleted object.
         """
-        assert self.dock is not None
+        if self.dock is None:
+            return
         self.dock.connectRequested.connect(self.connect_backend)
         self.dock.signInRequested.connect(self.sign_in)
         self.dock.signOutRequested.connect(self.sign_out)
@@ -135,7 +136,8 @@ class LabelClientPlugin:
         self.dock.coverageRequested.connect(self.check_coverage)
 
     def _restore_settings(self) -> None:
-        assert self.dock is not None
+        if self.dock is None:
+            return
         self.dock.set_api_url(self.settings.api_base_url)
         self.dock.set_as_of(self.settings.as_of)
         self.dock.set_as_of_mechanism(self.settings.as_of_mechanism.value)
@@ -166,10 +168,15 @@ class LabelClientPlugin:
         )
 
     def _persist_url(self) -> str:
-        assert self.dock is not None
-        url = self.dock.api_url()
-        self.settings.set("api_base_url", url)
-        return url
+        """Save whatever is currently in the URL field and return it.
+
+        Called before every network action rather than only on Connect: the toolbar and
+        menu entries can fire without the panel focused, and reading a stale setting while
+        a different URL sits in the field is a confusing five minutes.
+        """
+        if self.dock is not None:
+            self.settings.set("api_base_url", self.dock.api_url())
+        return self.settings.api_base_url
 
     # ---------------------------------------------------------------- connection
 
@@ -215,7 +222,8 @@ class LabelClientPlugin:
 
     def connect_backend(self) -> None:
         """Fetch the collection list and the class registry."""
-        assert self.dock is not None
+        if self.dock is None:
+            return
         url = self._persist_url()
         if not url:
             self._fail("Enter the API URL first.")
@@ -325,7 +333,7 @@ class LabelClientPlugin:
 
     def refresh_imagery(self) -> None:
         """Mint fresh signed URLs and swap them into the raster layers."""
-        url = self.settings.api_base_url
+        url = self._persist_url()
         if not url:
             self._fail("Enter the API URL first.")
             return

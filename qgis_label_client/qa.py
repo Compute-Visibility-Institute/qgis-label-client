@@ -76,9 +76,9 @@ def _load_extents(
         key = str(feature.id())
         extents[key] = ref
         geometries[key] = geometry
-        indexed = QgsFeature(feature.id())
-        indexed.setGeometry(geometry)
-        index.addFeature(indexed)
+        # The (id, bounds) overload: the index only ever needs bounding boxes, and the
+        # exact geometry is kept alongside for the confirming intersection test below.
+        index.addFeature(feature.id(), geometry.boundingBox())
 
     return extents, index, geometries
 

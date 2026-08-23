@@ -16,8 +16,7 @@ changelog_include: true
 changelog_path: CHANGELOG.md
 changelog_number_of_entries: 3
 
-# No translation pipeline yet. Left explicit so the absence is a decision rather than an
-# omission; the UI strings are English and the data is multilingual, which is the part
-# that actually matters here.
+# No translation pipeline yet, and `translation_languages` is deliberately absent rather
+# than empty -- a null value here is read as None and breaks the default. The UI strings
+# are English; the multilingual part is the data, which lives in label.names as JSONB.
 translation_source_language: en
-translation_languages:
