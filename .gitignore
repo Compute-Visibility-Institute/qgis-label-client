@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.zip
+qt6.log
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+
+# Belt and braces for the two things that must never be committed to a public repo.
+# The hygiene test in tests/test_repo_hygiene.py fails the build if either slips past.
+*.tif
+*.tiff
+*.jp2
+*.IMD
+*.RPB
+*.TIL
+*.qgz
+*.qgs
+qgis-auth.db
+*.pem
+*.key
+*.p12

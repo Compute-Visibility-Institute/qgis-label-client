@@ -1,0 +1,43 @@
+[general]
+name=CVI Label Client
+qgisMinimumVersion=3.44
+qgisMaximumVersion=4.99
+supportsQt6=True
+description=Thin client for a bitemporal OGC API - Features labeling backend: token auth, refreshed signed imagery URLs, a registry-driven class vocabulary and an as-of-date control.
+version=0.1.0
+author=Compute Visibility Institute
+email=opensource@example.org
+
+about=Connects QGIS to a labeling platform that serves OGC API - Features (Parts 1, 2 and 4).
+    QGIS's native provider does all vector reading and editing, so this plugin only covers what
+    QGIS cannot do on its own:
+    .
+    * stores the API token in QgsAuthManager, so no credential is ever written into a .qgz;
+    * refreshes short-lived signed object-storage URLs and re-points raster layers at them,
+      which a project file cannot do because the URLs expire;
+    * loads collections and the label class vocabulary from the backend, so forms and styling
+      cannot drift from the server's class registry;
+    * an as-of-date control on valid time, sent as the OGC datetime parameter or as a CQL2
+      filter;
+    * QA: a label's edit history, and a check for labels drawn outside any declared
+      exhaustive survey extent.
+    .
+    Licensed under GPL v2 or later, as required for QGIS plugins. No credentials, imagery or
+    deployment hostnames are distributed with this plugin - the backend URL is a user setting.
+
+tracker=https://github.com/Compute-Visibility-Institute/qgis-label-client/issues
+repository=https://github.com/Compute-Visibility-Institute/qgis-label-client
+homepage=https://github.com/Compute-Visibility-Institute/qgis-label-client
+
+category=Web
+icon=icons/cvi.svg
+tags=ogc,oapif,ogc api features,wfs,labeling,annotation,cog,remote sensing,temporal
+
+experimental=True
+deprecated=False
+server=False
+hasProcessingProvider=no
+
+changelog=0.1.0
+    - First release: auth via QgsAuthManager, signed imagery URL refresh, registry-driven
+      collections and styling, as-of-date control, history and coverage QA.

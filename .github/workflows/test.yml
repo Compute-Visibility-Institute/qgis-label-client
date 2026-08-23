@@ -1,0 +1,82 @@
+name: test
+
+# Runs on every push and pull request. Nothing here needs QGIS installed: the pure core
+# imports no QGIS at all, and the UI modules are exercised against the stubs in
+# tests/qgis_stubs. See tests/qgis_stubs/__init__.py for why that boundary is deliberate.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is what QGIS 3.44 ships on most platforms; 3.12 is what QGIS 4.x uses.
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dev dependencies
+        run: python -m pip install --upgrade pip -r requirements-dev.txt
+
+      - name: Ruff
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Pytest
+        run: pytest -q
+
+  qt6-check:
+    # Informational. Oslandia's checker reports PyQt5-only idioms that will break on the
+    # Qt6 build. Running it from the first commit is what makes the October 2026 flip to
+    # QGIS 4.2 a config change rather than a migration.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: pyqgis-4-checker
+        run: |
+          docker run --rm -v "$PWD:/home/pyqgisdev/" \
+            registry.gitlab.com/oslandia/qgis/pyqgis-4-checker/pyqgis-qt-checker:latest \
+            pyqt5_to_pyqt6.py --dry_run --logfile /home/pyqgisdev/qt6.log qgis_label_client
+      - name: Show findings
+        if: always()
+        run: cat qt6.log || echo "no findings"
+
+  package:
+    # Proves the zip builds and has exactly one top-level directory before a tag depends
+    # on it. Cheaper to fail here than at release time.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip qgis-plugin-ci
+      - name: Build the plugin zip
+        run: qgis-plugin-ci package 0.0.0-ci --allow-uncommitted-changes
+      - name: Check the archive layout
+        run: |
+          python - <<'PY'
+          import glob, zipfile, sys
+          archives = glob.glob("*.zip")
+          assert archives, "qgis-plugin-ci produced no archive"
+          tops = {name.split("/")[0] for name in zipfile.ZipFile(archives[0]).namelist()}
+          assert tops == {"qgis_label_client"}, f"expected one top-level dir, got {tops}"
+          print(f"{archives[0]}: OK")
+          PY

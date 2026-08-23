@@ -1,0 +1,23 @@
+# qgis-plugin-ci configuration.
+#
+# `plugin_path` is the single top-level directory that goes into the zip, and it must be
+# named identically to the Python package. Zipping the contents instead of the folder is
+# the most common QGIS packaging mistake and it fails with an unhelpful error.
+#
+# Publishing target is GitHub Releases, not plugins.qgis.org. That works with no
+# credentials beyond the workflow's own GITHUB_TOKEN precisely because this repository is
+# public -- see README, "Why this repository is public".
+
+plugin_path: qgis_label_client
+github_organization_slug: Compute-Visibility-Institute
+project_slug: qgis-label-client
+
+changelog_include: true
+changelog_path: CHANGELOG.md
+changelog_number_of_entries: 3
+
+# No translation pipeline yet. Left explicit so the absence is a decision rather than an
+# omission; the UI strings are English and the data is multilingual, which is the part
+# that actually matters here.
+translation_source_language: en
+translation_languages:

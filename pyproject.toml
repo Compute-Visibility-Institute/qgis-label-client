@@ -1,0 +1,51 @@
+# Tooling configuration only.
+#
+# This project is NOT pip-installable and deliberately declares no build backend: a QGIS
+# plugin is distributed as a zip containing one top-level directory, installed by the
+# plugin manager, and adding a wheel build would create a second, divergent packaging
+# path. qgis-plugin-ci builds the artifact; see .qgis-plugin-ci.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["build", "dist"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # import order
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "SIM",  # simplify
+    "C4",   # comprehensions
+    "RUF",
+    "N",    # pep8-naming
+    "BLE",  # blind-except: every broad catch here must be justified with a noqa
+]
+ignore = [
+    # Qt signals are camelCase by convention and by every example in the QGIS API. A
+    # snake_case signal would be the odd one out in a file full of Qt names.
+    "N815",
+    # Line length is enforced by the formatter, not the linter.
+    "E501",
+    # UP017 (datetime.UTC) and UP042 (StrEnum) are both 3.11-only rewrites, and the
+    # runtime here is not ours to choose: the plugin executes inside whatever interpreter
+    # the user's QGIS 3.44 build ships, which is 3.10 on some Linux packages. An
+    # ImportError at plugin load fails SILENTLY in the plugin manager, so these two stay
+    # off even though the dev and CI toolchain is 3.11+.
+    "UP017",
+    "UP042",
+]
+
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Import mode matters: the stubs must be installed by conftest before test modules are
+# imported, and conftest runs first only when tests/ is on the path as a rootdir-relative
+# directory rather than an installed package.
+addopts = "-q --strict-markers"
+filterwarnings = ["error::DeprecationWarning"]

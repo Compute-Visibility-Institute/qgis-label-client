@@ -1,0 +1,6 @@
+# Development and CI only. The plugin itself has NO runtime dependencies beyond what
+# QGIS 3.44 already ships -- deliberately, because every extra dependency is something an
+# annotator has to install into the QGIS Python environment by hand.
+pytest~=8.3
+ruff~=0.6
+qgis-plugin-ci~=2.8

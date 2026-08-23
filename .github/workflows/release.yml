@@ -1,0 +1,75 @@
+name: release
+
+# Tag v0.1.0 -> a GitHub Release carrying the plugin zip AND a plugins.xml.
+#
+# The plugins.xml is what turns this repository into a QGIS plugin repository. Users add
+#
+#     https://github.com/Compute-Visibility-Institute/qgis-label-client/releases/latest/download/plugins.xml
+#
+# once, and from then on the plugin updates itself like an official one. That URL needs no
+# authentication, which is only true because the repository is public -- the alternative
+# was a VPN-only host or HTTP Basic auth plus credential distribution plus, on first use,
+# a QGIS master password every new annotator would have to be walked through.
+#
+# qgis-plugin-ci treats a semver pre-release suffix (v0.2.0-beta1) as experimental
+# automatically, which gives a canary channel for free.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # qgis-plugin-ci reads the changelog and tag history.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dev dependencies
+        run: python -m pip install --upgrade pip -r requirements-dev.txt
+
+      - name: Test before releasing
+        run: pytest -q
+
+      - name: Resolve the tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="${GITHUB_REF_NAME}"; fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse a tag that does not match metadata.txt
+        # Otherwise the plugin manager's upgrade detection, which keys on version=,
+        # disagrees with the release name and users silently never get the update.
+        run: |
+          META=$(sed -n 's/^version=//p' qgis_label_client/metadata.txt | head -1 | tr -d '[:space:]')
+          if [ "$META" != "${{ steps.tag.outputs.version }}" ]; then
+            echo "metadata.txt version=$META but tag is ${{ steps.tag.outputs.tag }}" >&2
+            exit 1
+          fi
+
+      - name: Release to GitHub, with a plugins.xml
+        env:
+          # No secret to configure: the automatic workflow token is enough because the
+          # repository is public and the release is public.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          qgis-plugin-ci release "${{ steps.tag.outputs.version }}" \
+            --github-token "$GITHUB_TOKEN" \
+            --create-plugin-repo
