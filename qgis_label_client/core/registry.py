@@ -86,6 +86,12 @@ class AttributeSpec:
             else None
         )
 
+    @property
+    def max_length(self) -> int | None:
+        """``maxLength``, which the server's validator enforces and rejects on."""
+        value = self.schema.get("maxLength")
+        return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
+
     def summary(self) -> str:
         """One line describing the attribute, for form help text."""
         bits: list[str] = [self.name]
@@ -97,6 +103,8 @@ class AttributeSpec:
             lo = "" if self.minimum is None else f"{self.minimum:g}"
             hi = "" if self.maximum is None else f"{self.maximum:g}"
             bits.append(f"range {lo}..{hi}")
+        if self.max_length is not None:
+            bits.append(f"at most {self.max_length} characters")
         if self.description:
             bits.append("- " + self.description)
         return " ".join(bits)

@@ -43,7 +43,16 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .fields import DEFAULT_FIELDS, CoreFields
-from .legacy import ClassGuess, FieldMapping, build_attrs, guess_class, map_fields, name_entries
+from .legacy import (
+    ClassGuess,
+    FieldMapping,
+    FieldRole,
+    build_attrs,
+    guess_class,
+    map_fields,
+    name_columns,
+    name_entries,
+)
 from .names import NameSet, build_names
 from .registry import ClassRegistry, LabelClass
 
@@ -60,12 +69,28 @@ ANY_GEOMETRY = "Any"
 #: analysis exists to prevent.
 STORAGE_CRS = "EPSG:4326"
 
+#: Ordinates per position in storage. ``label.geom`` is ``geometry(Geometry, 4326)``, and
+#: a PostGIS typmod fixes dimensionality as well as SRID: a three-ordinate position is
+#: refused with "Geometry has 3 dimensions but column has 2". Esri tooling writes
+#: Z-enabled shapefiles by default and the QGIS layer looks identical, so without
+#: :func:`strip_elevation` a publish of one fails on every single row with a message that
+#: names neither the layer nor the fix.
+STORAGE_DIMENSIONS = 2
+
 _SINGLE_TO_MULTI = {
     "Point": "MultiPoint",
     "LineString": "MultiLineString",
     "Polygon": "MultiPolygon",
 }
 _MULTI_TO_SINGLE = {multi: single for single, multi in _SINGLE_TO_MULTI.items()}
+
+#: Geometry type names this module can reason about before seeing a feature. Anything else
+#: -- a curve type, or a layer OGR reports as "Unknown (any)" -- is decided per feature by
+#: :func:`conform_geometry` instead of being pre-judged in the preview.
+_KNOWN_GEOMETRY_TYPES = frozenset(_SINGLE_TO_MULTI) | frozenset(_MULTI_TO_SINGLE)
+
+#: WKB display-string suffixes marking extra ordinates: ``PolygonZ``, ``PointZM``.
+_DIMENSION_SUFFIXES = ("Z", "M")
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +213,95 @@ def was_promoted(before: Mapping[str, Any] | None, after: Mapping[str, Any] | No
     return before.get("type") != after.get("type")
 
 
+def _is_position(value: Any) -> bool:
+    """True for a GeoJSON position -- a flat list of ordinates rather than a nesting."""
+    return (
+        isinstance(value, (list, tuple))
+        and bool(value)
+        and isinstance(value[0], (int, float))
+        and not isinstance(value[0], bool)
+    )
+
+
+def has_elevation(coordinates: Any) -> bool:
+    """True when any position in a GeoJSON coordinate tree carries a third ordinate."""
+    if not isinstance(coordinates, (list, tuple)):
+        return False
+    if _is_position(coordinates):
+        return len(coordinates) > STORAGE_DIMENSIONS
+    return any(has_elevation(part) for part in coordinates)
+
+
+def _flatten(coordinates: Any) -> Any:
+    if not isinstance(coordinates, (list, tuple)):
+        return coordinates
+    if _is_position(coordinates):
+        return list(coordinates[:STORAGE_DIMENSIONS])
+    return [_flatten(part) for part in coordinates]
+
+
+def strip_elevation(
+    geometry: Mapping[str, Any] | None,
+) -> tuple[Mapping[str, Any] | None, bool]:
+    """Drop any third ordinate, returning ``(geometry, dropped)``.
+
+    Not a modelling choice: see :data:`STORAGE_DIMENSIONS`. The schema has nowhere to put
+    an elevation, so the alternative to dropping it is every row of a Z-enabled layer
+    being refused by PostGIS. It is *counted* and reported rather than done quietly,
+    because the analyst may not know their shapefile carries a Z at all.
+    """
+    if geometry is None:
+        return None, False
+    coordinates = geometry.get("coordinates")
+    if not has_elevation(coordinates):
+        return geometry, False
+    return {**geometry, "coordinates": _flatten(coordinates)}, True
+
+
+def base_geometry_type(name: str) -> str:
+    """A WKB display string with its dimensionality suffix removed.
+
+    ``QgsWkbTypes.displayString`` spells a Z-enabled polygon layer ``PolygonZ``, which is
+    the same *shape* as ``Polygon`` for the purpose of matching a class.
+    """
+    base = (name or "").strip()
+    while base and base[-1] in _DIMENSION_SUFFIXES:
+        base = base[:-1]
+    return base
+
+
+def geometry_mismatch(source_type: str, want: str) -> str | None:
+    """Why a layer of `source_type` could publish nothing as a class wanting `want`.
+
+    Answered from the layer's declared WKB type, before a single feature is read, because
+    the alternative is a run that reads 872 features, sends none of them and explains why
+    afterwards. A type this module cannot place -- a curve, or the "Unknown (any)" OGR
+    reports for a mixed layer -- yields ``None`` and is decided per feature instead; a
+    guess that blocks a legitimate publish is worse than a run that reports skips.
+    """
+    have = base_geometry_type(source_type)
+    if want == ANY_GEOMETRY or have not in _KNOWN_GEOMETRY_TYPES:
+        return None
+    if have == want or _SINGLE_TO_MULTI.get(have) == want:
+        return None
+    if _MULTI_TO_SINGLE.get(have) == want:
+        # Lossless for the single-part features that dominate shapefile "multi" layers,
+        # refused per feature for the rest. A note, not a blocker.
+        return None
+    return f"holds {have} geometry but this class stores {want}; no feature could be published"
+
+
+def demotion_warning(source_type: str, want: str) -> str | None:
+    """Whether publishing this layer as `want` means discarding multi-part features."""
+    have = base_geometry_type(source_type)
+    if have in _KNOWN_GEOMETRY_TYPES and _MULTI_TO_SINGLE.get(have) == want:
+        return (
+            f"{have} features with more than one part cannot become {want} without "
+            "discarding geometry; those are skipped and reported."
+        )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # One feature
 # ---------------------------------------------------------------------------
@@ -229,6 +343,8 @@ class DraftResult:
     issues: tuple[str, ...] = ()
     #: Set when the geometry had to be promoted to the class's multi-part type.
     promoted: bool = False
+    #: Set when a third ordinate was dropped so PostGIS would accept the geometry.
+    flattened: bool = False
     #: Language keys whose name carries the UTF-7 truncation signature.
     damaged_names: tuple[str, ...] = ()
     #: Damaged names left out because the plan asked for that.
@@ -255,6 +371,9 @@ def build_draft(
     conformed, problem = conform_geometry(geometry, label_class.geom_type)
     if problem or conformed is None:
         return DraftResult(issues=(f"geometry: {problem}",))
+    # After the reshape, so a promoted geometry's freshly nested coordinates are covered
+    # by the same pass.
+    conformed, flattened = strip_elevation(conformed)
 
     names: NameSet = build_names(name_entries(values, mappings), skip_damaged=skip_damaged_names)
     attributes = build_attrs(values, mappings, label_class)
@@ -266,8 +385,11 @@ def build_draft(
             names=names.names,
             attrs=attributes.attrs,
         ),
-        issues=attributes.issues,
+        # A dropped name is data loss, exactly like a refused attribute, and belongs in
+        # the same list rather than in the silence between two dictionary writes.
+        issues=attributes.issues + names.collisions,
         promoted=was_promoted(geometry, conformed),
+        flattened=flattened,
         damaged_names=names.damaged,
         omitted_names=names.omitted,
     )
@@ -287,7 +409,16 @@ class SourceLayer:
     #: GeoJSON-style geometry type: Point, LineString, Polygon or a Multi* form.
     geometry_type: str = ""
     crs_authid: str = ""
+    #: False when QGIS could not work out what the coordinates mean -- a shapefile with
+    #: no ``.prj`` beside it, most often. See :meth:`LayerPlan.problems`.
+    crs_valid: bool = True
     feature_count: int = 0
+    #: False when the provider answered "I cannot tell you yet" -- QGIS returns -1 from
+    #: ``featureCount()`` for providers that do not know in advance. Collapsing that into
+    #: a count of zero turns "unknown" into "empty", and :meth:`LayerPlan.problems` makes
+    #: empty a blocker: the Publish button greys out against a layer visibly full of
+    #: features, with nothing on the screen explaining the contradiction.
+    count_known: bool = True
     field_names: tuple[str, ...] = ()
     #: Features whose name carries the UTF-7 truncation signature, counted by a scan of
     #: the name columns before anything is sent.
@@ -299,7 +430,23 @@ class SourceLayer:
 
     @property
     def needs_reprojection(self) -> bool:
-        return bool(self.crs_authid) and self.crs_authid.upper() != STORAGE_CRS
+        """True when the coordinates have to be moved before they can be stored.
+
+        Keyed on the CRS being *valid* rather than on it having an authority code. A CRS
+        defined only by WKT -- which QGIS reports with an empty ``authid()`` -- is a real
+        CRS that is almost certainly not EPSG:4326, and reading an empty authid as "no
+        reprojection needed" would publish its coordinates verbatim.
+        """
+        return self.crs_valid and self.crs_authid.upper() != STORAGE_CRS
+
+    @property
+    def has_elevation(self) -> bool:
+        """True when the layer's WKB type carries a Z or M ordinate.
+
+        Read from the declared type rather than from the features, because it is needed
+        in the preview -- see :data:`STORAGE_DIMENSIONS` for why it matters at all.
+        """
+        return self.geometry_type.endswith(_DIMENSION_SUFFIXES)
 
 
 @dataclass(frozen=True)
@@ -309,12 +456,23 @@ class LayerChoice:
     layer_id: str
     publish: bool = False
     class_id: str | None = None
-    #: Declare a ``labeled_extent`` for this class from the layer's bounding box.
-    #: Defaults off, and stays off unless a human ticks it: a bounding box is a claim
-    #: about where somebody looked, and only a human can make that claim honestly.
-    declare_extent: bool = False
+    #: ``labeled_extent.completeness`` to declare for this layer's bounding box, or ``""``
+    #: to declare nothing. Empty by default, and stays empty unless a human picks a value.
+    #:
+    #: A single value rather than a flag plus a constant, because the two halves of this
+    #: claim are not separable. ``exhaustive`` is the only value that licenses the export
+    #: pipeline to treat unlabeled ground inside the polygon as negative, and it is the
+    #: whole reason the collection was read-only until this workflow existed. A tool that
+    #: writes it whenever a checkbox is ticked has not asked the question; it has answered
+    #: it, in the direction that poisons every model trained from the result.
+    extent_completeness: str = ""
     #: Omit names carrying the truncation signature instead of publishing them.
     skip_damaged_names: bool = False
+
+    @property
+    def declare_extent(self) -> bool:
+        """True when this layer will write a ``labeled_extent`` row."""
+        return bool(self.extent_completeness)
 
 
 @dataclass(frozen=True)
@@ -346,23 +504,122 @@ class LayerPlan:
                 f"{self.source.name}: class {self.label_class.class_id!r} is retired and "
                 "the server refuses new labels on it.",
             )
-        if not self.source.feature_count:
+        if self.source.count_known and not self.source.feature_count:
             return (f"{self.source.name}: no features to publish.",)
+        if not self.source.crs_valid:
+            # Blocking, and the only geometry problem here that is. A reprojection needs
+            # a source CRS; without one QGIS builds a transform that silently does
+            # nothing, so projected metres would be stored as if they were degrees of
+            # longitude. label.geom has no range check to catch that, ST_GeometryType
+            # still matches the class, and the features land somewhere in the Gulf of
+            # Guinea looking exactly like valid data.
+            return (
+                f"{self.source.name}: QGIS does not know what this layer's coordinates "
+                "mean - there is no valid CRS, which usually means a shapefile with no "
+                ".prj beside it. Set it in Layer Properties > Source before publishing; "
+                "guessing here would store the numbers as if they were degrees.",
+            )
+        # Checked here rather than discovered per feature: the class combo is the one
+        # control on this screen that can be wrong in a way that publishes nothing at
+        # all, and the preview exists to say so before the run rather than after it.
+        mismatch = geometry_mismatch(self.source.geometry_type, self.label_class.geom_type)
+        if mismatch:
+            return (f"{self.source.name} {mismatch}.",)
         return ()
+
+    def mapping_lines(self) -> tuple[str, ...]:
+        """Every source column and where its values would go, one line each.
+
+        Shown in the preview rather than only in the report, because the matcher is
+        structural: it maps a column onto whichever declared attribute its concept is a
+        subset of, and it has no way to know that a particular column is *wrong* for
+        reasons outside the schema. The source ``Area`` column is the standing example --
+        it matches an area attribute perfectly well, and any value in it was computed in
+        EPSG:4326 and is therefore square degrees in a field that means square metres. It
+        is empty in every one of the 1,246 features today, which is luck rather than
+        safety.
+
+        The plugin cannot hold a list of columns to distrust; that list is exactly the
+        second copy of the vocabulary the class registry exists to prevent. What it can do
+        is put the whole mapping in front of the person publishing, which is the same
+        answer this screen gives to damaged names and to missing survey coverage: not a
+        rule, a visible choice.
+
+        For that to work the line has to carry what the *registry* says about the target,
+        not just its name. ``Area -> attribute area_m2`` looks correct and is exactly the
+        mapping that is wrong; the sentence that gives it away -- "Computed in a projected
+        CRS. NEVER in EPSG:4326." -- is already in the class's own schema, and dropping it
+        here leaves the human with nothing to catch the mistake with. It costs nothing to
+        show and it is not a second copy of anything: it arrives at runtime with the class.
+        """
+        lines: list[str] = []
+        for mapping in self.mappings:
+            line = mapping.describe()
+            if (
+                self.label_class is not None
+                and mapping.role is FieldRole.ATTRIBUTE
+                and mapping.target
+            ):
+                detail = self.label_class.attribute(mapping.target).summary()
+                # summary() opens with the attribute name, which the line already has.
+                detail = detail[len(mapping.target) :].strip()
+                if detail:
+                    line = f"{line}  {detail}"
+            lines.append(line)
+        return tuple(lines)
+
+    def mapping_summary(self) -> str:
+        """One cell's worth of "where do this layer's columns go?"."""
+        if self.label_class is None:
+            return ""
+        counts: dict[str, int] = {}
+        for mapping in self.mappings:
+            key = "unmapped" if mapping.target is None else f"-> {mapping.role.value}"
+            counts[key] = counts.get(key, 0) + 1
+        if not counts:
+            return "no columns"
+        return ", ".join(f"{count} {key}" for key, count in sorted(counts.items()))
 
     def notes(self) -> tuple[str, ...]:
         """Things worth saying before publishing. Advisory, never blocking."""
         notes: list[str] = []
         if self.source.previous is not None:
             notes.append(self.source.previous.describe())
+        if not self.source.count_known:
+            notes.append(
+                "This layer's provider does not report a feature count in advance, so the "
+                "count shown is unknown rather than zero and the progress bar cannot move."
+            )
         if self.source.needs_reprojection:
             notes.append(f"{self.source.crs_authid} will be reprojected to {STORAGE_CRS}.")
+        if self.source.has_elevation:
+            notes.append(
+                "The geometries carry a third ordinate. Label geometry is stored in two "
+                "dimensions, so it will be dropped; nothing else in the schema records it."
+            )
+        if self.label_class is not None:
+            demotion = demotion_warning(self.source.geometry_type, self.label_class.geom_type)
+            if demotion:
+                notes.append(demotion)
+        if not self.source.scanned and name_columns(self.source.field_names):
+            # A scan that did not happen returns zero, and a zero on this screen reads as
+            # "checked, and clean". Only the sentence below distinguishes the two, and the
+            # difference is 81 names published as authoritative.
+            notes.append(
+                "The name columns were NOT scanned for the UTF-7 truncation, so nothing "
+                "here says whether these names are damaged. Layers that do not come from "
+                "a local file are left unscanned: reading them to count would freeze QGIS "
+                "while the preview is built."
+            )
         if self.source.damaged_names:
             floor = "at least " if self.source.scanned < self.source.feature_count else ""
             action = "omitted" if self.choice.skip_damaged_names else "PUBLISHED AS THEY ARE"
             notes.append(
-                f"{floor}{self.source.damaged_names} name(s) have lost their final "
-                f"character to the UTF-7 truncation; they will be {action}."
+                f"{floor}{self.source.damaged_names} name(s) look like they have lost "
+                f"their final character to the UTF-7 truncation; they will be {action}. "
+                "That is an upper bound, not a measurement: a two-character site "
+                "designator after a Chinese character cannot be told apart from a cut "
+                "escape run, so omitting these may destroy an intact name."
             )
         if self.guess.tied_with:
             notes.append(self.guess.describe())
@@ -408,12 +665,20 @@ class PublishPlan:
         server, and on a bootstrap into an empty backend the answer is the same either way.
         It is the narrower and always-true statement: *this* publish records what was found
         and not where anybody looked.
+
+        Asked per *layer*, not per class, and then reduced to class names. The claim an
+        extent makes is about an area, so one layer's Ulanqab sweep says nothing about a
+        second layer covering the rest of the country -- and subtracting class ids would
+        let the first silence the warning for the second, which is the one place this
+        warning is most needed.
         """
-        declared = {plan.class_id for plan in self.selected() if plan.choice.declare_extent}
         return tuple(
             sorted(
-                {plan.class_id for plan in self.selected() if plan.class_id}
-                - {class_id for class_id in declared if class_id}
+                {
+                    plan.class_id
+                    for plan in self.selected()
+                    if plan.class_id and not plan.choice.declare_extent
+                }
             )
         )
 
@@ -475,37 +740,99 @@ def build_plan(
 # ---------------------------------------------------------------------------
 
 
+#: How many named rows one deduplicated issue keeps. Enough to start looking with, far
+#: short of the wall an undeduplicated list would be. See :meth:`LayerOutcome.note`.
+MAX_ISSUE_SUBJECTS = 5
+
+
+@dataclass
+class Issue:
+    """One distinct complaint, how often it happened, and to which rows.
+
+    The count alone is what turns a partial run into a support ticket: "190 rejected" is a
+    number, and the operator's next question -- *which* 190, and what is left to re-send --
+    has no answer anywhere. The subjects are that answer, bounded so the report stays a
+    report.
+    """
+
+    count: int = 0
+    subjects: list[str] = field(default_factory=list)
+    #: Subjects past :data:`MAX_ISSUE_SUBJECTS`, counted rather than listed.
+    unnamed: int = 0
+
+    def add(self, subject: str = "") -> None:
+        self.count += 1
+        if not subject:
+            return
+        if len(self.subjects) < MAX_ISSUE_SUBJECTS:
+            self.subjects.append(subject)
+        else:
+            self.unnamed += 1
+
+    def describe(self, message: str) -> str:
+        line = message
+        if self.count > 1:
+            line += f"  [x{self.count}]"
+        if self.subjects:
+            named = "; ".join(self.subjects)
+            more = f" and {self.unnamed} more" if self.unnamed else ""
+            line += f"  ({named}{more})"
+        return line
+
+
 @dataclass
 class LayerOutcome:
     """What actually happened to one layer. Mutated by the worker as it goes."""
 
     layer_name: str
     class_id: str
+    #: Features the layer was expected to hold, from the plan. Zero when the provider
+    #: could not say in advance.
+    expected: int = 0
     read: int = 0
     published: int = 0
     failed: int = 0
     skipped_no_geometry: int = 0
     skipped_invalid_geometry: int = 0
     skipped_unshapeable: int = 0
+    #: Drafted but never sent, because the run was cancelled between drafting and the
+    #: POST. Distinct from :attr:`failed`: nobody refused these, so calling them failures
+    #: would report a deliberate stop as a server problem.
+    not_sent: int = 0
     promoted: int = 0
+    #: Features whose third ordinate was dropped to fit the two-dimensional geom column.
+    flattened: int = 0
     reprojected: bool = False
     damaged_names: int = 0
     omitted_names: int = 0
     extent_declared: bool = False
     extent_problem: str = ""
-    issues: dict[str, int] = field(default_factory=dict)
+    issues: dict[str, Issue] = field(default_factory=dict)
 
-    def note(self, message: str) -> None:
-        """Record one issue, deduplicated with a count.
+    def note(self, message: str, subject: str = "") -> None:
+        """Record one issue, deduplicated with a count and a few named rows.
 
         A 1,246-feature run produces the same complaint hundreds of times. An undeduplicated
-        list is not a report, it is a wall, and a wall is not read.
+        list is not a report, it is a wall, and a wall is not read. But a deduplicated
+        *count* is not actionable either: a save here is not atomic and there is no ETag,
+        so after a partial run the only way to know what still needs sending is to know
+        which rows were refused. `subject` is that -- a name, or a position in the layer --
+        and it is bounded so the wall does not come back.
         """
-        self.issues[message] = self.issues.get(message, 0) + 1
+        issue = self.issues.get(message)
+        if issue is None:
+            issue = Issue()
+            self.issues[message] = issue
+        issue.add(subject)
 
     @property
     def skipped(self) -> int:
         return self.skipped_no_geometry + self.skipped_invalid_geometry + self.skipped_unshapeable
+
+    @property
+    def never_reached(self) -> int:
+        """Features of this layer the run never even read, because it stopped first."""
+        return max(0, self.expected - self.read)
 
     def line(self) -> str:
         bits = [f"{self.layer_name} -> {self.class_id}: {self.published} published"]
@@ -513,8 +840,16 @@ class LayerOutcome:
             bits.append(f"{self.failed} rejected by the server")
         if self.skipped:
             bits.append(f"{self.skipped} skipped")
+        if self.not_sent:
+            bits.append(f"{self.not_sent} never sent (cancelled)")
+        if self.never_reached:
+            # Otherwise a stopped run reports only what it did, and how much of the layer
+            # is still on this machine has to be remembered from the previous dialog.
+            bits.append(f"{self.never_reached} never read (stopped first)")
         if self.promoted:
             bits.append(f"{self.promoted} promoted to multi-part")
+        if self.flattened:
+            bits.append(f"{self.flattened} flattened to two dimensions")
         if self.reprojected:
             bits.append(f"reprojected to {STORAGE_CRS}")
         if self.omitted_names:
@@ -534,9 +869,14 @@ class PublishReport:
     cancelled: bool = False
     #: Classes published in this run with no ``labeled_extent`` declared for them.
     classes_without_extent: tuple[str, ...] = ()
+    #: Set when the run stopped on an error nobody anticipated. The counts above are still
+    #: what reached the server, which is the only reason this is a field and not an
+    #: exception: an unhandled failure on row 900 has already written 899 rows, and the
+    #: user needs the report of those far more than they need a traceback in the log.
+    error: str = ""
 
-    def outcome_for(self, layer_name: str, class_id: str) -> LayerOutcome:
-        outcome = LayerOutcome(layer_name=layer_name, class_id=class_id)
+    def outcome_for(self, layer_name: str, class_id: str, expected: int = 0) -> LayerOutcome:
+        outcome = LayerOutcome(layer_name=layer_name, class_id=class_id, expected=expected)
         self.outcomes.append(outcome)
         return outcome
 
@@ -558,9 +898,16 @@ class PublishReport:
 
     @property
     def clean(self) -> bool:
-        return not self.failed and not self.skipped and not self.cancelled
+        return not self.failed and not self.skipped and not self.cancelled and not self.error
 
     def summary(self) -> str:
+        if self.error:
+            return (
+                f"Stopped by an unexpected error after publishing {self.published} "
+                f"feature(s): {self.error} What was already sent is on the server; "
+                "re-running publishes the rest AND a second copy of these, because the "
+                "server assigns identity."
+            )
         if self.cancelled:
             return (
                 f"Cancelled after publishing {self.published} feature(s). What was already "
@@ -579,9 +926,8 @@ class PublishReport:
         for outcome in self.outcomes:
             if outcome.extent_problem:
                 lines.append(f"{outcome.layer_name}: {outcome.extent_problem}")
-            for message, count in sorted(outcome.issues.items(), key=lambda kv: -kv[1]):
-                suffix = f"  [x{count}]" if count > 1 else ""
-                lines.append(f"{outcome.layer_name}: {message}{suffix}")
+            for message, issue in sorted(outcome.issues.items(), key=lambda kv: -kv[1].count):
+                lines.append(f"{outcome.layer_name}: {issue.describe(message)}")
         return lines
 
     def coverage_warning(self) -> str:

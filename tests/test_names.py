@@ -70,6 +70,26 @@ def test_the_slash_and_plus_forms_are_recognised():
     assert is_damaged("数据中U+")
 
 
+def test_a_nul_padded_field_is_still_scanned_for_damage():
+    # Some DBF writers pad a fixed-width field with NUL rather than with spaces. The walk
+    # back from the end of the string stops at the first character outside the base64
+    # alphabet, so without trimming it the whole layer reports as clean -- and a zero on
+    # the preview reads as "checked, and fine".
+    assert is_damaged("云枢智能云乌兰察布数据中X8\x00\x00")
+    assert truncated_tail("数据中X8\x00") == "X8"
+
+
+def test_padding_never_reaches_the_stored_name():
+    # A NUL has no representation in jsonb: Postgres refuses the whole row, and the
+    # feature service reports that as a bare HTML 500 naming nothing.
+    result = build_names([("zh", "云汇数据中心\x00\x00"), ("en", "  Yunhui \t")])
+    assert result.names == {"zh": "云汇数据中心", "en": "Yunhui"}
+
+
+def test_a_field_holding_only_padding_records_nothing():
+    assert build_names([("zh", "\x00\x00")]).names == {}
+
+
 def test_cjk_detection_covers_the_ranges_that_matter():
     assert is_cjk("中") and is_cjk("园")
     assert not is_cjk("B") and not is_cjk("-")

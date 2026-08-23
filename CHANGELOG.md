@@ -22,15 +22,31 @@ most recent entries into `metadata.txt` at release time.
 
   Legacy columns are matched onto the class's own `attr_schema` rather than through a
   lookup table, so `No. Cooler` and `No. Coolim` converge on one attribute without the
-  plugin containing either name. Empty values are omitted rather than written as nulls,
-  single-part geometries are promoted to the multi-part type the class declares, anything
-  not already in EPSG:4326 is reprojected, and invalid geometries are skipped and reported
-  instead of being sent for the server to reject.
+  plugin containing either name. The resolved mapping for every column is shown in the
+  preview, because a structural matcher cannot know that a column is wrong for reasons
+  outside the schema — `Compounds.Area` matches an area attribute and would be square
+  degrees — and the plugin must not carry a list of columns to distrust. Empty values are
+  omitted rather than written as nulls, single-part geometries are promoted to the
+  multi-part type the class declares, anything not already in EPSG:4326 is reprojected, and
+  invalid geometries are skipped and reported instead of being sent for the server to
+  reject. A layer whose CRS QGIS cannot determine is refused outright: an invalid CRS makes
+  `QgsCoordinateTransform` a silent no-op, so its coordinates would be stored verbatim in a
+  4326 column with nothing anywhere raising.
 
-  Runs in a `QgsTask` with progress and cancellation. Per-feature failures are counted and
-  attributed without aborting the run. Each published layer is stamped with a custom
-  property, so a second publish is warned about rather than silently doubling the data —
-  the server assigns identity, so nothing client-side can deduplicate.
+  Runs in a `QgsTask` with progress and cancellation, one feature per request, and nothing
+  is ever sent twice: a save is not atomic, there is no `If-Match`, and identity is
+  server-assigned, so retrying an ambiguous failure would duplicate rows that nothing
+  afterwards could tell apart. A `429` from the auth edge is waited out rather than counted
+  as a refusal. Per-feature failures are counted and attributed to a named row without
+  aborting the run, and the report survives a cancel and an unexpected exception alike,
+  because by then some of it is already on a server.
+
+  A survey extent is declared with the `completeness` value the user chose — never a
+  default — and only if the run earned it: a layer that published nothing, or an
+  `exhaustive` claim over a layer whose features did not all reach the database, is refused
+  with a reason. Each published layer is stamped with a custom property and the project is
+  marked dirty so the stamp survives closing QGIS, so a second publish is warned about
+  rather than silently doubling the data.
 
 ## [0.1.0] - 2026-08-23
 

@@ -29,6 +29,8 @@ explicitly thread-safe and queues to the main thread itself.
 from __future__ import annotations
 
 import json
+import time
+import traceback
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -55,7 +57,7 @@ from . import client
 from . import layers as layer_tools
 from .core.errors import BackendError, ConfigurationError
 from .core.fields import COMPLETENESS_EXHAUSTIVE, CoreFields
-from .core.legacy import FieldMapping, map_fields, name_columns
+from .core.legacy import FieldMapping, map_fields, name_columns, name_entries
 from .core.names import is_damaged
 from .core.publish import (
     PUBLISHED_PROPERTY,
@@ -76,6 +78,28 @@ from .log import log, log_warning
 #: nobody intends to publish; 20,000 is far above the 1,246 this exists for and far below
 #: the point where the scan is noticeable.
 NAME_SCAN_LIMIT = 20000
+
+#: Providers whose features come off local disk, and are therefore safe to read from the
+#: main thread while the preview is being built.
+#:
+#: The cap above bounds the number of rows, not the cost of a row. A PostGIS or WFS layer
+#: in the same project would have 20,000 rows pulled over the network before the dialog
+#: appears, with QGIS showing "Not responding" and nothing on screen saying why. A layer
+#: on a remote provider is still listed and still publishable -- it is only the *scan* that
+#: is skipped, and :meth:`~.core.publish.LayerPlan.notes` says so, because a scan that
+#: silently returned zero would read as "checked, and clean".
+LOCAL_PROVIDERS = frozenset(
+    {"ogr", "gdal", "delimitedtext", "spatialite", "memory", "virtual", "gpx", "gpkg"}
+)
+
+
+def is_local_provider(layer: QgsVectorLayer) -> bool:
+    """True when this layer's features come from a local file."""
+    try:
+        provider = str(layer.providerType() or "")
+    except (AttributeError, TypeError):  # pragma: no cover - binding shape, not logic
+        return False
+    return provider.lower() in LOCAL_PROVIDERS
 
 
 def _target_crs() -> QgsCoordinateReferenceSystem:
@@ -100,6 +124,31 @@ def python_value(value: Any) -> Any:
 def feature_values(feature: QgsFeature, field_names: Sequence[str]) -> dict[str, Any]:
     """A feature's attributes as a plain mapping, NULLs normalised away."""
     return {name: python_value(feature.attribute(name)) for name in field_names}
+
+
+#: Longest name put in front of a row's issue line. A report is read at a glance.
+_SUBJECT_LIMIT = 40
+
+
+def _subject(
+    values: Mapping[str, Any],
+    mappings: Sequence[FieldMapping],
+    index: int,
+) -> str:
+    """How one feature is referred to in the report.
+
+    The source ``id`` column is 0% populated and the server assigns identity, so there is
+    no key to quote -- but the name columns are in hand at the moment anything goes wrong,
+    and a position in the layer always is. Between them they turn "190 rejected" into
+    something the operator can look up in the attribute table.
+    """
+    for _language, raw in name_entries(values, mappings):
+        text = "" if raw is None else str(raw).strip()
+        if text:
+            if len(text) > _SUBJECT_LIMIT:
+                text = text[: _SUBJECT_LIMIT - 1] + "…"
+            return f"row {index} {text!r}"
+    return f"row {index}"
 
 
 def geometry_as_geojson(geometry: QgsGeometry | None) -> Mapping[str, Any] | None:
@@ -177,15 +226,30 @@ def local_vector_layers(project: QgsProject | None = None) -> list[QgsVectorLaye
     ]
 
 
-def describe_layer(layer: QgsVectorLayer, scan_names: bool = True) -> SourceLayer:
-    """Everything the preview dialog needs about one local layer."""
+def describe_layer(layer: QgsVectorLayer, scan_names: bool | None = None) -> SourceLayer:
+    """Everything the preview dialog needs about one local layer.
+
+    `scan_names` defaults to "only if reading this layer is cheap" -- see
+    :data:`LOCAL_PROVIDERS`.
+    """
+    if scan_names is None:
+        scan_names = is_local_provider(layer)
     damaged, scanned = count_damaged_names(layer) if scan_names else (0, 0)
+    crs = layer.crs()
+    # QGIS answers -1 from featureCount() for a provider that cannot say in advance.
+    # That is "I do not know yet", not "there is nothing here", and the difference matters
+    # because the preview makes an empty layer a blocking problem.
+    counted = int(layer.featureCount())
     return SourceLayer(
         layer_id=layer.id(),
         name=layer.name(),
         geometry_type=geometry_type_name(layer),
-        crs_authid=str(layer.crs().authid() or ""),
-        feature_count=max(int(layer.featureCount()), 0),
+        # description() rather than nothing when there is no authority code, so the CRS
+        # column says which CRS a WKT-only definition is instead of looking empty.
+        crs_authid=str(crs.authid() or crs.description() or ""),
+        crs_valid=bool(crs.isValid()),
+        feature_count=max(counted, 0),
+        count_known=counted >= 0,
         field_names=tuple(f.name() for f in layer.fields()),
         damaged_names=damaged,
         scanned=scanned,
@@ -270,11 +334,24 @@ def prepare(plans: Iterable[LayerPlan], project: QgsProject | None = None) -> li
                 "preview so the plan matches what is actually loaded."
             )
 
+        crs = layer.crs()
+        if not crs.isValid():
+            # The preview blocks this, so reaching it means the layer changed underneath
+            # the dialog. Refused rather than reprojected because QgsCoordinateTransform
+            # short-circuits to a no-op when either CRS is invalid: the geometries would
+            # be written to a 4326 column unchanged, with nothing raising and nothing to
+            # find them by afterwards.
+            raise ConfigurationError(
+                f"Layer {plan.source.name!r} has no valid coordinate reference system, so "
+                f"its coordinates cannot be converted to {STORAGE_CRS}. Set the layer CRS "
+                "and re-open the preview."
+            )
+
         transform = None
-        if layer.crs() != target:
+        if crs != target:
             # Built here because it needs the project's transform context. Afterwards it
             # is a value object and crosses the thread boundary safely.
-            transform = QgsCoordinateTransform(layer.crs(), target, project.transformContext())
+            transform = QgsCoordinateTransform(crs, target, project.transformContext())
 
         extent_geojson: Mapping[str, Any] | None = None
         extent_problem = ""
@@ -308,9 +385,16 @@ def stamp_published(
     Written after the run rather than before, and written even for a partial run, because
     the warning it produces next time is "some of this is already up there" -- which is
     exactly the state a partial run leaves behind.
+
+    The project is marked dirty afterwards. A custom property is in memory until the
+    project file is saved, and QGIS does not treat a plugin setting one as a change worth
+    prompting about -- so without this the analyst closes QGIS without being asked, reopens
+    the same shapefiles, and the entire founding dataset is pre-ticked for a second publish
+    with no warning anywhere. Marking it dirty is what makes the prompt appear.
     """
     project = project or QgsProject.instance()
     published_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    stamped = False
 
     # Paired by position, not by layer name: two layers in one project may share a name,
     # and one outcome is appended per prepared layer in order. A cancelled run has fewer
@@ -334,6 +418,10 @@ def stamp_published(
                 )
             ),
         )
+        stamped = True
+
+    if stamped:
+        project.setDirty(True)
 
 
 # ---------------------------------------------------------------------------
@@ -351,114 +439,200 @@ class PublishRequest:
     layers: list[PreparedLayer] = field(default_factory=list)
     extent_collection: str = ""
     fields: CoreFields = field(default_factory=CoreFields)
-    batch_size: int = 50
-    #: Cleared for the rest of the run once the server is shown not to accept a
-    #: FeatureCollection body. Mutable state on the request rather than a constant,
-    #: because it is discovered rather than configured. See :func:`_send`.
-    batch_supported: bool = True
+    #: How many times one feature is re-offered after the edge asks us to slow down.
+    #: Only a 429 is retried; see :func:`_send_one`.
+    max_throttle_retries: int = 6
 
     def total_features(self) -> int:
         return sum(prepared.plan.source.feature_count for prepared in self.layers)
+
+
+#: Longest single wait after a 429 when the server sent no ``Retry-After``. The edge
+#: refills its bucket at two writes a second, so a few seconds is always enough; the cap
+#: exists so a misconfigured header cannot park the task for an hour.
+MAX_BACKOFF_SECONDS = 30.0
+
+#: Granularity of that wait. A cancelled task must stop within a slice, not at the end of
+#: the sleep, or "cancel" means "cancel in half a minute".
+_BACKOFF_SLICE = 0.25
+
+
+def _wait(seconds: float, feedback: QgsFeedback | None) -> bool:
+    """Sleep, in slices, until the time is up or the run is cancelled.
+
+    Returns True if the wait completed. **Worker thread only** -- this blocks, which is
+    fine here and would freeze QGIS anywhere else.
+    """
+    remaining = min(max(seconds, 0.0), MAX_BACKOFF_SECONDS)
+    while remaining > 0:
+        if feedback is not None and feedback.isCanceled():
+            return False
+        slice_length = min(_BACKOFF_SLICE, remaining)
+        time.sleep(slice_length)
+        remaining -= slice_length
+    return feedback is None or not feedback.isCanceled()
 
 
 def _send_one(
     request: PublishRequest,
     feature: Mapping[str, Any],
     feedback: QgsFeedback | None,
-) -> tuple[int, list[str]]:
-    try:
-        client.create_feature(
-            request.base_url, request.collection_id, feature, request.authcfg, feedback
-        )
-    except BackendError as exc:
-        return 0, [str(exc)]
-    return 1, []
+) -> tuple[int, str | None]:
+    """POST one feature, waiting out the edge's rate limiter rather than failing on it.
 
+    Returns ``(published, error)``; ``(0, None)`` means the run was cancelled and nobody
+    refused anything.
 
-def _send_individually(
-    request: PublishRequest,
-    features: Sequence[Mapping[str, Any]],
-    feedback: QgsFeedback | None,
-) -> tuple[int, list[str]]:
-    published = 0
-    errors: list[str] = []
-    for feature in features:
+    A 429 is not a refusal of the content, it is "not yet". The auth edge caps writes at a
+    couple per second per principal and sends ``Retry-After`` saying how long its bucket
+    needs. Counting that as a rejection would end a 1,246-feature bootstrap with most of
+    the dataset reported as refused, a layer stamped as published, and no way to tell which
+    rows landed -- a half-written system of record, produced by the tool that exists to
+    found it. So it waits, and only gives up after that stops working.
+
+    Every other error is returned as-is. Retrying a *content* refusal cannot help, and
+    retrying an ambiguous failure is how duplicates are made: a save here is not atomic and
+    the server assigns identity, so nothing on this side can tell a lost response from a
+    refused write.
+    """
+    attempts = max(1, request.max_throttle_retries + 1)
+    for attempt in range(attempts):
         if feedback is not None and feedback.isCanceled():
-            break
-        sent, problems = _send_one(request, feature, feedback)
-        published += sent
-        errors += problems
-    return published, errors
+            return 0, None
+        try:
+            client.create_feature(
+                request.base_url, request.collection_id, feature, request.authcfg, feedback
+            )
+        except BackendError as exc:
+            if feedback is not None and feedback.isCanceled():
+                # The socket was aborted because the user pressed cancel. Nobody refused
+                # this feature, and reporting it as a rejection makes a deliberate stop
+                # look like a backend problem in the one report that gets acted on.
+                return 0, None
+            if not exc.throttled or attempt == attempts - 1:
+                return 0, str(exc)
+            delay = exc.retry_after if exc.retry_after else 2.0 * (attempt + 1)
+            log_warning(
+                f"Rate limited by the auth edge; waiting {min(delay, MAX_BACKOFF_SECONDS):.0f}s "
+                f"before retrying (attempt {attempt + 1} of {attempts})."
+            )
+            if not _wait(delay, feedback):
+                return 0, None
+            continue
+        return 1, None
+    return 0, None  # pragma: no cover - the loop always returns first
 
 
 def _send(
     request: PublishRequest,
-    features: Sequence[Mapping[str, Any]],
-    feedback: QgsFeedback | None,
-) -> tuple[int, list[str]]:
-    """POST a batch, falling back to one at a time when the batch is refused.
-
-    A rejected FeatureCollection names no feature, which turns "1,246 features failed" into
-    a support ticket. Retrying the batch feature by feature costs one extra round trip per
-    failing batch and buys an error message attached to a specific row -- the difference
-    between a report somebody can act on and a number.
-
-    If every feature of a refused batch then succeeds on its own, the batch was refused for
-    its *shape* rather than its content -- the deployment does not accept a FeatureCollection
-    body -- and the rest of the run goes one at a time rather than paying for a doomed batch
-    before every retry.
-    """
-    if not features:
-        return 0, []
-    if len(features) == 1 or not request.batch_supported:
-        return _send_individually(request, features, feedback)
-
-    try:
-        client.create_features(
-            request.base_url, request.collection_id, features, request.authcfg, feedback
-        )
-    except BackendError as exc:
-        log_warning(f"Batch of {len(features)} refused, retrying one at a time: {exc}")
-    else:
-        return len(features), []
-
-    published, errors = _send_individually(request, features, feedback)
-    if published == len(features):
-        request.batch_supported = False
-        log_warning(
-            "The server accepted every feature of that batch individually, so it does not "
-            "take a FeatureCollection body. Sending one feature per request from here on."
-        )
-    return published, errors
-
-
-def _flush(
-    request: PublishRequest,
-    batch: list[Mapping[str, Any]],
+    feature: Mapping[str, Any],
+    subject: str,
     outcome: LayerOutcome,
     feedback: QgsFeedback | None,
 ) -> None:
-    """Send one batch and fold the result into the layer's outcome."""
-    if not batch:
+    """Publish one drafted feature and fold the result into the layer's outcome.
+
+    ONE FEATURE PER REQUEST, AND WHY THE BATCH PATH IS GONE
+
+    This used to POST a FeatureCollection and fall back to one at a time when the batch was
+    refused. Three facts, none of which held when that was written, make the fallback
+    unsafe rather than merely slow:
+
+    * a save is **not atomic** -- one HTTP request is one edit, and the first rejection
+      aborts the rest of a batch *after* the earlier rows are already committed;
+    * there is no ETag and no If-Match anywhere, and identity is assigned by the server,
+      so nothing on this side can ask "did that one land?";
+    * the feature service's create handler takes a single ``Feature``; a
+      ``FeatureCollection`` body was never a verified capability.
+
+    Together those mean a refused batch that was *partly applied* is re-sent in full, and
+    the founding dataset gets duplicate rows with distinct server-assigned ``label_id``s
+    that nothing -- not the plugin, not ``v_coverage_gaps``, not the analyst -- can tell
+    apart afterwards. The batch also had to be *credited* on faith: a non-raising POST was
+    counted as ``len(features)`` published without anything verifying the server created
+    that many.
+
+    One request per feature costs round trips and buys the two properties this bootstrap
+    actually needs: every refusal names its row, and nothing is ever sent twice.
+    """
+    if feedback is not None and feedback.isCanceled():
+        # Already stopping. Sending would be one more write the user asked not to make.
+        outcome.not_sent += 1
         return
-    sent, errors = _send(request, batch, feedback)
-    outcome.published += sent
-    outcome.failed += len(batch) - sent
-    for message in errors:
-        outcome.note(f"the server refused a feature: {message}")
-    batch.clear()
+    published, error = _send_one(request, feature, feedback)
+    if published:
+        outcome.published += 1
+    elif error is None:
+        # Cancelled while the request was in flight: refused by nobody. Counting it as a
+        # failure is the one report that makes the re-run decision unanswerable.
+        outcome.not_sent += 1
+    else:
+        outcome.failed += 1
+        outcome.note(f"the server refused a feature: {error}", subject)
+
+
+def _extent_refusal(outcome: LayerOutcome, completeness: str) -> str:
+    """Why this layer's run has not earned the extent the user asked for, or ``""``.
+
+    An extent is a claim about ground, and the run is the only evidence for it. Two
+    separate checks, because the two values claim different things:
+
+    * *nothing* published means there is no sweep to declare at all. The previous version
+      declared the extent from the checkbox alone, so a layer whose features were 100%
+      refused still wrote an exhaustive survey claim over its bounding box -- and
+      ``classes_without_extent`` could not catch it, because that set is built from the
+      classes that *did* publish.
+    * ``exhaustive`` additionally means "everything of this class inside the polygon is
+      labeled". A feature that was refused, or skipped as unshapeable, or drafted and never
+      sent, is a thing on the ground that is not in the database, so the claim is false by
+      inspection. A shapefile null shape is not: there was nothing on the ground to miss.
+    """
+    if not outcome.published:
+        return (
+            "no survey extent was declared: nothing from this layer was published, so "
+            "there is no sweep to record"
+        )
+    if completeness != COMPLETENESS_EXHAUSTIVE:
+        return ""
+    unrecorded = outcome.failed + outcome.skipped_invalid_geometry + outcome.skipped_unshapeable
+    unrecorded += outcome.not_sent
+    if unrecorded:
+        return (
+            f"no survey extent was declared: {unrecorded} feature(s) of this layer did not "
+            "reach the database, so the ground inside the box holds labels this publish "
+            "did not record and the sweep is not exhaustive. Fix those and re-declare, or "
+            "declare the extent as partial"
+        )
+    return ""
 
 
 def _declare_extent(
     request: PublishRequest,
     prepared: PreparedLayer,
+    outcome: LayerOutcome,
     feedback: QgsFeedback | None,
 ) -> tuple[bool, str]:
-    """Create the ``labeled_extent`` the user asked for, if they asked for one."""
+    """Create the ``labeled_extent`` the user asked for, if the run earned it.
+
+    ``completeness`` comes from the user's own choice and is never assumed here. It is the
+    one field on this table that changes what a *training run* does: only ``exhaustive``
+    licenses the export pipeline to sample unlabeled ground inside the polygon as negative,
+    and the collection was read-only until this workflow existed precisely because of it.
+    A tool that writes ``exhaustive`` whenever a box is ticked has answered the question
+    rather than asked it -- over a bounding box, which for a layer spanning six provinces
+    is millions of square kilometres of supervised background nobody swept.
+    """
     if prepared.extent_geojson is None:
         return False, prepared.extent_problem
     if not request.extent_collection:
         return False, "no survey-extent collection is configured, so no extent was declared"
+
+    completeness = prepared.plan.choice.extent_completeness
+    if not completeness:  # pragma: no cover - callers check declare_extent first
+        return False, ""
+    refusal = _extent_refusal(outcome, completeness)
+    if refusal:
+        return False, refusal
 
     fields = request.fields
     feature = {
@@ -466,15 +640,19 @@ def _declare_extent(
         "geometry": dict(prepared.extent_geojson),
         "properties": {
             fields.class_id: prepared.plan.class_id,
-            fields.completeness: COMPLETENESS_EXHAUSTIVE,
-            # The caveat is not decoration. An extent claims the ground inside it was swept
-            # exhaustively, which licenses the export pipeline to treat every unlabeled
-            # pixel in it as negative. Recording that this particular polygon is a bounding
-            # box rather than a drawn sweep is what keeps that claim honest.
+            fields.completeness: completeness,
+            # The caveat is not decoration, and it is also not enough on its own: nothing
+            # in the export pipeline reads it, so it qualifies the claim for humans while
+            # `completeness` above is what machines act on. Recording that this particular
+            # polygon is a bounding box rather than a drawn sweep is what a person reading
+            # the row later needs in order to narrow it.
             fields.caveat: (
                 "Derived from the bounding box of the source layer "
                 f"{prepared.plan.source.name!r} during the bootstrap publish, not from a "
-                "drawn survey boundary. Replace it with the area actually swept."
+                "drawn survey boundary. Replace it with the area actually swept. No "
+                "imagery capture is recorded: the shapefiles do not say which capture "
+                "they were drawn against, and a sweep is only true of the imagery it was "
+                "done on."
             ),
         },
     }
@@ -520,13 +698,10 @@ def _publish_layer(
 ) -> LayerOutcome:
     """Publish one layer's features. Returns its outcome; never raises for a bad row."""
     plan = prepared.plan
-    outcome = report.outcome_for(plan.source.name, plan.class_id)
+    outcome = report.outcome_for(plan.source.name, plan.class_id, plan.source.feature_count)
     outcome.reprojected = prepared.transform is not None
     if plan.label_class is None:  # pragma: no cover - prepare() filters these out
         return outcome
-
-    batch: list[Mapping[str, Any]] = []
-    batch_size = max(1, request.batch_size)
 
     for feature in prepared.source.getFeatures():
         if feedback is not None and feedback.isCanceled():
@@ -534,6 +709,13 @@ def _publish_layer(
             break
         outcome.read += 1
         progress.step()
+
+        # Named before anything can go wrong with it, so every complaint below can say
+        # WHICH row. A deduplicated count of 190 refusals is not something anybody can act
+        # on, and after a partial run into a server that assigns identity it is the only
+        # way to work out what still needs sending.
+        values = feature_values(feature, prepared.field_names)
+        subject = _subject(values, prepared.mappings, outcome.read)
 
         geometry = QgsGeometry(feature.geometry())
         if geometry.isNull() or geometry.isEmpty():
@@ -546,41 +728,35 @@ def _publish_layer(
                 geometry.transform(prepared.transform)
             except QgsCsException as exc:
                 outcome.skipped_unshapeable += 1
-                outcome.note(f"could not be reprojected to {STORAGE_CRS}: {exc}")
+                outcome.note(f"could not be reprojected to {STORAGE_CRS}: {exc}", subject)
                 continue
         if not geometry.isGeosValid():
             # The server's own trigger would reject it. Failing here names the feature
-            # instead of letting one bad row take a batch of fifty good ones down with it.
+            # rather than letting the database refuse it as an untraceable HTTP 500.
             outcome.skipped_invalid_geometry += 1
-            outcome.note("invalid geometry, rejected before sending")
+            outcome.note("invalid geometry, rejected before sending", subject)
             continue
 
         result = build_draft(
-            feature_values(feature, prepared.field_names),
+            values,
             geometry_as_geojson(geometry),
             plan.label_class,
             prepared.mappings,
             skip_damaged_names=plan.choice.skip_damaged_names,
         )
         for message in result.issues:
-            outcome.note(message)
+            outcome.note(message, subject)
         if result.draft is None:
             outcome.skipped_unshapeable += 1
             continue
 
         outcome.promoted += int(result.promoted)
+        outcome.flattened += int(result.flattened)
         outcome.damaged_names += int(bool(result.damaged_names))
         outcome.omitted_names += int(bool(result.omitted_names))
 
-        batch.append(result.draft.to_geojson(request.fields))
-        if len(batch) >= batch_size:
-            _flush(request, batch, outcome, feedback)
+        _send(request, result.draft.to_geojson(request.fields), subject, outcome, feedback)
 
-    if not report.cancelled:
-        _flush(request, batch, outcome, feedback)
-    # A cancelled run drops whatever is still in the batch rather than sending it. Those
-    # features were drafted but never left the machine, and counting them as failures
-    # would misreport a deliberate stop as a server problem.
     return outcome
 
 
@@ -592,6 +768,12 @@ def publish(request: PublishRequest, feedback: QgsFeedback | None = None) -> Pub
     cannot be cleanly re-run into -- so every failure is counted, attributed and carried to
     the end. Only a caller error (no URL, no collection) raises, and it raises before
     anything is sent.
+
+    That reasoning does not stop at the errors this code anticipated. A ``RuntimeError``
+    from a layer the user removed mid-run, or any other unforeseen exception, has exactly
+    the same property: some of it already happened, on a server. Letting it escape loses
+    the whole report -- the task wrapper keeps the traceback and discards the result -- so
+    the layer loop records the failure into the report and returns what did land.
     """
     if not request.base_url:
         raise ConfigurationError("No backend URL configured.")
@@ -601,20 +783,47 @@ def publish(request: PublishRequest, feedback: QgsFeedback | None = None) -> Pub
     report = PublishReport()
     progress = _Progress(total=request.total_features(), feedback=feedback)
     for prepared in request.layers:
-        outcome = _publish_layer(request, prepared, report, progress, feedback)
-        if prepared.plan.choice.declare_extent and not report.cancelled:
-            outcome.extent_declared, outcome.extent_problem = _declare_extent(
-                request, prepared, feedback
-            )
-        elif prepared.extent_problem:
-            outcome.extent_problem = prepared.extent_problem
+        # The extent POST is inside the same guard as the features, because it has the
+        # same property: by the time it runs, this layer's rows are already on the server,
+        # and an exception that escapes here would discard the report of all of them.
+        try:
+            outcome = _publish_layer(request, prepared, report, progress, feedback)
+            # _publish_layer only notices a cancellation between features, so a run stopped
+            # during a layer's last request would otherwise finish reporting itself as a
+            # complete one -- and would go on to declare a survey extent for a sweep that
+            # was interrupted.
+            if feedback is not None and feedback.isCanceled():
+                report.cancelled = True
+            if prepared.plan.choice.declare_extent:
+                if report.cancelled:
+                    outcome.extent_problem = (
+                        "no survey extent was declared: the run was cancelled before this "
+                        "layer finished, so the box was not swept by this publish"
+                    )
+                else:
+                    outcome.extent_declared, outcome.extent_problem = _declare_extent(
+                        request, prepared, outcome, feedback
+                    )
+            elif prepared.extent_problem:
+                outcome.extent_problem = prepared.extent_problem
+        except Exception as exc:  # noqa: BLE001 - see the docstring: the report survives
+            log_warning(f"Publish stopped by an unexpected error:\n{traceback.format_exc()}")
+            report.error = f"{type(exc).__name__}: {exc}"
+            break
         if report.cancelled:
             break
 
+    # Per layer, then reduced to class names. An extent covers an area, so a class that
+    # got one from a campus-sized layer has told us nothing about a second layer of the
+    # same class covering the rest of the country; subtracting class ids would let the
+    # first silence the warning for the second.
     report.classes_without_extent = tuple(
         sorted(
-            {o.class_id for o in report.outcomes if o.published and o.class_id}
-            - {o.class_id for o in report.outcomes if o.extent_declared}
+            {
+                outcome.class_id
+                for outcome in report.outcomes
+                if outcome.published and outcome.class_id and not outcome.extent_declared
+            }
         )
     )
     log(f"Publish finished: {report.summary()}")

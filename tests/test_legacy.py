@@ -207,6 +207,14 @@ def test_name_columns_become_names_not_attributes(column, language):
     assert mapping.target == language
 
 
+def test_an_unmarked_name_column_says_that_its_language_is_a_guess():
+    # Substation.Name declares no language, so the key is decided per value from the
+    # content -- and a pinyin transliteration in it will be filed under the English key.
+    # The preview is where that is catchable.
+    line = map_field("Name", SUBSTATION).describe()
+    assert "does not say which language" in line
+
+
 def test_a_column_naming_an_attribute_is_not_mistaken_for_the_feature_name():
     # "<something>_name" names an attribute of the feature, not the feature.
     assert map_field("operator_name", COMPOUND).role is not FieldRole.NAME
@@ -285,6 +293,143 @@ def test_an_undeclared_attribute_passes_through_untouched():
     # Every seeded class sets additionalProperties true: capture first, formalise later.
     value, problem = coerce("whatever", COMPOUND.attribute("invented_attribute"))
     assert problem is None and value == "whatever"
+
+
+class _Unserialisable:
+    """Stands in for a QDate or a QByteArray: what a DBF Date or Binary column hands back."""
+
+    def __repr__(self) -> str:
+        return "QDate(2020, 1, 1)"
+
+
+def test_a_value_with_no_json_form_is_reported_rather_than_passed_on():
+    # It would reach json.dumps and raise TypeError -- not a BackendError, so it would
+    # escape the per-feature handler AND the task, taking down a run that had already
+    # published 900 features and losing the report saying which.
+    value, problem = coerce(_Unserialisable(), COMPOUND.attribute("attribute_with_no_type"))
+    assert value is None
+    assert "no JSON form" in problem
+
+
+def test_a_non_finite_number_is_refused_before_it_poisons_a_batch():
+    # json.dumps writes a bare NaN, which is not valid JSON, so a strict server refuses
+    # the whole FeatureCollection it travelled in rather than the one feature.
+    value, problem = coerce(float("nan"), COMPOUND.attribute("area_m2"))
+    assert value is None and "finite" in problem
+    assert coerce(float("inf"), COMPOUND.attribute("area_m2"))[0] is None
+
+
+def test_a_value_with_no_json_form_never_reaches_attrs():
+    # A declared attribute stating no `type` is legal JSON Schema, and is what "adding an
+    # attribute is an UPDATE to label_class" produces in a hurry.
+    label_class = parse_registry(
+        {
+            "classes": [
+                {
+                    "class_id": "widget",
+                    "geom_type": "Polygon",
+                    "label_en": "Widget",
+                    "attr_schema": {
+                        "type": "object",
+                        "properties": {"surveyed": {}, "tally": {"type": "integer"}},
+                    },
+                }
+            ]
+        }
+    ).get("widget")
+    values = {"Surveyed": _Unserialisable(), "Tally": 6}
+    result = build_attrs(values, map_fields(list(values), label_class), label_class)
+
+    # The good column still publishes; only the unserialisable one is dropped, with a
+    # reason that names the attribute.
+    assert result.attrs == {"tally": 6}
+    assert any("JSON" in issue and "surveyed" in issue for issue in result.issues)
+
+
+#: A class declaring the three types a DBF column arrives in the wrong shape for. Built
+#: here rather than taken from the seed because the point is the *type*, and the registry
+#: is free to add an attribute of any of them with an UPDATE and no plugin release.
+TYPED = parse_registry(
+    {
+        "classes": [
+            {
+                "class_id": "widget",
+                "geom_type": "Polygon",
+                "label_en": "Widget",
+                "attr_schema": {
+                    "type": "object",
+                    "properties": {
+                        "flag": {"type": "boolean"},
+                        "reference": {"type": "string"},
+                        "short_note": {"type": "string", "maxLength": 4},
+                        "serial": {"type": "integer"},
+                    },
+                },
+            }
+        ]
+    }
+).get("widget")
+
+
+@pytest.mark.parametrize("raw", ["false", "F", "f", "0", "no", "N", "off", 0, False])
+def test_the_spellings_a_shapefile_uses_for_false_are_read_as_false(raw):
+    # Python truthiness reads every one of these as True, the server's validator sees a
+    # valid boolean, and the founding dataset records the opposite of the truth.
+    value, problem = coerce(raw, TYPED.attribute("flag"))
+    assert problem is None and value is False
+
+
+@pytest.mark.parametrize("raw", ["true", "T", "Y", "1", "on", 1, True])
+def test_the_spellings_a_shapefile_uses_for_true_are_read_as_true(raw):
+    value, problem = coerce(raw, TYPED.attribute("flag"))
+    assert problem is None and value is True
+
+
+def test_a_value_that_is_not_recognisably_a_boolean_is_refused_rather_than_guessed():
+    value, problem = coerce("maybe", TYPED.attribute("flag"))
+    assert value is None and "guess" in problem
+
+
+def test_a_dbf_numeric_column_becomes_the_string_the_code_actually_is():
+    # An official administrative code stored as a double arrives as 150000.0, and
+    # "150000.0" joins against nothing.
+    value, problem = coerce(150000.0, TYPED.attribute("reference"))
+    assert problem is None and value == "150000"
+
+
+def test_an_object_with_no_text_form_never_becomes_its_python_repr():
+    # str() is a valid JSON string for every Python object, which is what makes this
+    # branch dangerous: the server's validator accepts it and nothing reports it.
+    value, problem = coerce(_Unserialisable(), TYPED.attribute("reference"))
+    assert value is None and "repr" in problem
+
+
+def test_a_boolean_offered_to_a_string_attribute_is_refused():
+    value, problem = coerce(True, TYPED.attribute("reference"))
+    assert value is None and "boolean" in problem
+
+
+def test_a_long_registration_number_survives_exactly():
+    # int(float(x)) is exact only below 2^53, and jsonb stores arbitrary-precision
+    # numerics, so a rounded value would differ from the source with nothing objecting.
+    number = 913100001000012345
+    assert coerce(number, TYPED.attribute("serial")) == (number, None)
+    assert coerce(str(number), TYPED.attribute("serial")) == (number, None)
+
+
+def test_the_length_keyword_the_server_enforces_is_checked_here_too():
+    # Otherwise the rejection arrives as a bare HTML 500 naming neither the attribute nor
+    # the rule, because the feature service does not catch the trigger's exception.
+    assert schema_problem("ok", TYPED.attribute("short_note")) is None
+    problem = schema_problem("far too long", TYPED.attribute("short_note"))
+    assert problem is not None and "maximum of 4" in problem
+
+
+def test_padding_is_trimmed_before_a_string_attribute_is_stored():
+    # A field padded with NUL rather than with spaces cannot be stored in jsonb at all.
+    value, problem = coerce("ULQB-01\x00\x00", TYPED.attribute("reference"))
+    assert problem is None and value == "ULQB-01"
+    assert is_blank("\x00 \x00")
 
 
 def test_the_schema_keywords_the_server_enforces_are_checked_first():

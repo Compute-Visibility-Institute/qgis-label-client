@@ -307,6 +307,31 @@ def test_reprojection_is_announced_before_it_happens():
     )
 
 
+def test_a_crs_with_no_authority_code_still_needs_reprojecting():
+    # QGIS reports an empty authid() for a CRS defined only by WKT. Reading that as
+    # "already EPSG:4326" would publish its coordinates verbatim.
+    assert _source("Compounds", crs_authid="").needs_reprojection is True
+
+
+def test_a_layer_with_no_valid_crs_cannot_be_published_at_all():
+    # The failure this blocks is silent in every layer of the stack: QGIS builds a
+    # transform that does nothing, PostGIS has no range check on a 4326 column, and
+    # ST_GeometryType still matches the class. Projected metres become degrees and the
+    # features look exactly like valid data.
+    source = _source("Compounds", crs_valid=False)
+    plan = build_plan(
+        [source],
+        REGISTRY,
+        {source.layer_id: LayerChoice(source.layer_id, publish=True, class_id="compound")},
+    )
+    assert plan.problems() and ".prj" in plan.problems()[0]
+    assert source.needs_reprojection is False
+
+
+def test_an_unusable_crs_is_not_quietly_treated_as_the_storage_crs():
+    assert _source("Compounds", crs_valid=False).needs_reprojection is False
+
+
 def test_a_partial_damage_scan_is_reported_as_a_floor_not_a_total():
     plan = build_plan(
         [_source("Compounds", feature_count=190, damaged_names=81, scanned=100)], REGISTRY
@@ -339,12 +364,64 @@ def test_declaring_an_extent_removes_that_class_from_the_warning():
         REGISTRY,
         {
             compounds.layer_id: LayerChoice(
-                compounds.layer_id, publish=True, class_id="compound", declare_extent=True
+                compounds.layer_id,
+                publish=True,
+                class_id="compound",
+                extent_completeness="partial",
             ),
             cooling.layer_id: LayerChoice(cooling.layer_id, publish=True, class_id="cooling_unit"),
         },
     )
     assert plan.classes_without_extent() == ("cooling_unit",)
+
+
+def test_the_preview_can_show_every_column_and_where_it_goes():
+    # The matcher is structural, so it maps a column onto whichever declared attribute
+    # its concept is a subset of and cannot know that a particular column is wrong for
+    # reasons outside the schema. Making the whole mapping visible is the only defence
+    # that does not require the plugin to carry a second copy of the vocabulary.
+    plan = build_plan([_source("Compounds")], REGISTRY)
+    lines = plan.layers[0].mapping_lines()
+
+    assert len(lines) == len(SNAPSHOT_LAYERS["Compounds"])
+    assert any(line.startswith("Name:ch -> name") for line in lines)
+    assert any("cooling_unit_count" in line for line in lines)
+    # The standing example: empty in all 1,246 features today, and a square-degree value
+    # in a square-metre attribute the moment somebody fills it in.
+    assert any(line.startswith("Area -> attribute") for line in lines)
+
+
+def test_a_mapping_line_carries_what_the_registry_says_about_the_target():
+    # "Area -> attribute area_m2" looks correct and is exactly the mapping that is wrong.
+    # The sentence that gives it away is in the class's own schema and arrives at runtime
+    # with the class, so showing it is not a second copy of the vocabulary -- and dropping
+    # it leaves the human with nothing to catch the mistake with.
+    plan = build_plan([_source("Compounds")], REGISTRY)
+    line = next(li for li in plan.layers[0].mapping_lines() if li.startswith("Area ->"))
+
+    assert "NEVER in EPSG:4326" in line
+
+
+def test_a_mapping_line_carries_the_declared_range_and_length():
+    plan = build_plan([_source("Compounds")], REGISTRY)
+    lines = plan.layers[0].mapping_lines()
+
+    assert any("range 1990..2100" in line for line in lines)
+
+
+def test_the_field_summary_counts_what_lands_where():
+    summary = build_plan([_source("Compounds")], REGISTRY).layers[0].mapping_summary()
+    assert "1 unmapped" in summary
+    assert "2 -> name" in summary
+
+
+def test_there_is_no_field_summary_until_a_class_is_chosen():
+    source = _source("Roads")
+    plan = build_plan(
+        [source], REGISTRY, {source.layer_id: LayerChoice(source.layer_id, publish=True)}
+    )
+    assert plan.layers[0].mapping_summary() == ""
+    assert plan.layers[0].mapping_lines() == ()
 
 
 def test_the_summary_counts_features_layers_and_classes():
