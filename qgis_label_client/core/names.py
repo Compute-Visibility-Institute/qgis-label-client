@@ -73,6 +73,31 @@ MIN_TAIL_LENGTH = 2
 MAX_TAIL_LENGTH = 3
 
 
+#: Everything a DBF field can be padded with: space, tab and the C0 control characters,
+#: plus DEL. Used as the trim set rather than ``str.strip()``'s whitespace-only default.
+_PADDING = "".join(chr(code) for code in range(0x21)) + "\x7f"
+
+
+def clean_text(value: object) -> str:
+    """One source value as text, with padding trimmed from both ends.
+
+    ``str.strip()`` removes whitespace, which is what a DBF *should* pad a fixed-width
+    field with. Some writers pad with NUL instead, and a surviving NUL is silent twice
+    over:
+
+    * it stops the truncation scan dead. :func:`truncated_tail` walks back from the end of
+      the string looking for base64 characters, a NUL is not one, so every damaged name in
+      a NUL-padded layer reports as clean -- and a scan that returns zero reads as "this
+      layer was checked and is fine", which is the one direction this module refuses to
+      fail in.
+    * it cannot be stored. ``\\u0000`` has no representation in ``jsonb``; Postgres
+      refuses the whole row, and the feature service reports that as a bare 500.
+
+    Padding is not content, so trimming it loses nothing.
+    """
+    return ("" if value is None else str(value)).strip(_PADDING)
+
+
 def is_cjk(char: str) -> bool:
     """True for one CJK ideograph."""
     code = ord(char)
@@ -100,8 +125,25 @@ def truncated_tail(text: str) -> str:
 
     That second condition is what keeps ordinary English out of it. "Ulanqab Data Center"
     ends in six base64-alphabet characters and is not damaged; nothing CJK precedes them.
+
+    WHAT THIS CANNOT DISTINGUISH, AND WHY IT STILL FIRES
+
+    The residual of a cut escape run is arbitrary base64, so a two-character site
+    designator after a Chinese character -- 数据中心B2, 一号基地A1 -- is *indistinguishable*
+    from damage by any test on the string alone. Those are flagged too. The count this
+    produces is therefore an upper bound on the damage, not a measurement of it, and every
+    caller that shows the number to a person has to say so: the number is what a human
+    weighs when deciding whether to omit these names, and omitting an intact name destroys
+    it permanently.
+
+    Erring this way round is deliberate. An over-report costs a sentence of explanation; an
+    under-report reads as "this layer is clean" and publishes the damage as authoritative.
+    Narrowing it further has been tried and does not survive the real data: the tail length
+    that the encoding arithmetic predicts from the surviving run length disagrees with
+    three of the five recorded damaged names in ``tests/snapshot_fixtures``, so filtering
+    on it would silently stop reporting them.
     """
-    stripped = (text or "").rstrip()
+    stripped = clean_text(text)
     index = len(stripped)
     while index > 0 and stripped[index - 1] in B64_ALPHABET:
         index -= 1
@@ -128,6 +170,10 @@ class NameSet:
     damaged: tuple[str, ...] = ()
     #: Damaged languages left out because the caller asked for that.
     omitted: tuple[str, ...] = ()
+    #: Values dropped because two source columns resolved to the same language key. One
+    #: line each, naming the value that was lost: ``names`` is a mapping and the second
+    #: write would otherwise overwrite the first with nothing anywhere recording it.
+    collisions: tuple[str, ...] = ()
 
     def __bool__(self) -> bool:
         return bool(self.names)
@@ -147,23 +193,53 @@ def build_names(
     off, and the caller is expected to have asked a human first: an absent name is honest
     but ``Name_en`` often survives where ``Name:ch`` did not, and dropping a whole record's
     Chinese name loses more than it protects.
+
+    Two columns can resolve to one key -- an unmarked ``Name`` holding Chinese alongside a
+    ``Name:ch``, or a ``Name_en`` alongside a ``NAME_ENG``. A mapping cannot hold both, so
+    one value is lost; which one is chosen deliberately (a column that *declares* its
+    language outranks one whose language was inferred from its content) and the loss is
+    reported rather than left to the assignment order of a dictionary.
     """
     names: dict[str, str] = {}
+    inferred: set[str] = set()
     damaged: list[str] = []
     omitted: list[str] = []
+    collisions: list[str] = []
 
     for language, raw in entries:
-        text = "" if raw is None else str(raw).strip()
+        text = clean_text(raw)
         if not text:
             continue
         key = language
-        if key == AUTO:
+        guessed = key == AUTO
+        if guessed:
             key = CHINESE if looks_chinese(text) else ENGLISH
         if is_damaged(text):
             damaged.append(key)
             if skip_damaged:
                 omitted.append(key)
                 continue
+        if key in names:
+            # Keep the declared language over the inferred one; otherwise keep the first.
+            if guessed or key not in inferred:
+                collisions.append(
+                    f"two source columns both hold the {key!r} name; {text!r} was dropped "
+                    f"in favour of {names[key]!r}"
+                )
+                continue
+            collisions.append(
+                f"two source columns both hold the {key!r} name; {names[key]!r} was "
+                f"dropped in favour of {text!r}, which declares its language"
+            )
         names[key] = text
+        if guessed:
+            inferred.add(key)
+        else:
+            inferred.discard(key)
 
-    return NameSet(names=names, damaged=tuple(damaged), omitted=tuple(omitted))
+    return NameSet(
+        names=names,
+        damaged=tuple(damaged),
+        omitted=tuple(omitted),
+        collisions=tuple(collisions),
+    )

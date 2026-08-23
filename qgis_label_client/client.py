@@ -24,7 +24,7 @@ been part of the collection -- and turn it into features, which is the one case 
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from typing import Any
 
 from qgis.core import QgsFeedback
@@ -131,23 +131,17 @@ def create_feature(
     )
 
 
-def create_features(
-    base_url: str,
-    collection_id: str,
-    features: Sequence[Mapping[str, Any]],
-    authcfg: str,
-    feedback: QgsFeedback | None = None,
-) -> Any:
-    """Create several features in one request, as a GeoJSON FeatureCollection.
-
-    Part 4 allows a FeatureCollection body and pygeoapi accepts one, which turns 1,246
-    round trips into a couple of dozen. It is an optimisation and nothing more: the caller
-    is expected to fall back to :func:`create_feature` when a batch is rejected, because a
-    batch failure names no feature and a per-feature retry does.
-    """
-    return post_json(
-        urls.items_url(base_url, collection_id),
-        {"type": "FeatureCollection", "features": [dict(f) for f in features]},
-        authcfg=authcfg,
-        feedback=feedback,
-    )
+# There is deliberately no batch create.
+#
+# A FeatureCollection body would turn 1,246 round trips into a couple of dozen, and it was
+# here until three things about the deployment were established. A save is not atomic --
+# one HTTP request is one edit, and the first rejection aborts the rest after the earlier
+# rows are committed. There is no ETag and no If-Match, and identity is assigned by the
+# server, so nothing on this side can ask whether a request that failed ambiguously had
+# already been applied. And the feature service's Part 4 create handler takes a single
+# Feature; the collection body was never a verified capability.
+#
+# The three together mean the only sane response to a refused batch -- retry it one feature
+# at a time -- duplicates whatever the batch already wrote, in the founding dataset, with
+# distinct server-assigned identities that nothing can tell apart afterwards. Round trips
+# are cheaper than that. See qgis_label_client.publish._send.

@@ -16,6 +16,7 @@ Calling one on the main thread freezes the QGIS window for the duration of the r
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -52,6 +53,32 @@ class Response:
             ) from exc
 
 
+def _body_detail(body: bytes) -> str:
+    """The part of a response body worth putting in front of a person.
+
+    An HTML error page is not a message, it is a wall. The API's own errors are JSON and
+    say something useful; a framework's default 500 page is markup wrapped around a status
+    line that the status code already gave us. Rendering 300 characters of ``<!doctype
+    html>`` where the useful line should be is how a report stops being read, so an HTML
+    body is reduced to its ``<title>`` and labelled as what it is.
+    """
+    text = body[:2000].decode("utf-8", errors="replace").strip()
+    if not text:
+        return ""
+    lowered = text[:200].lower()
+    if lowered.startswith("<!doctype html") or lowered.startswith("<html"):
+        match = re.search(r"<title[^>]*>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
+        title = " ".join(match.group(1).split()) if match else ""
+        return (
+            f"the server returned an HTML error page ({title}) rather than a JSON error, "
+            "so it carries no detail about which rule refused the write"
+            if title
+            else "the server returned an HTML error page rather than a JSON error, so it "
+            "carries no detail about which rule refused the write"
+        )
+    return text[:300]
+
+
 def _describe_status(status: int, url: str, body: bytes) -> str:
     """Turn an HTTP status into something an annotator can act on."""
     hints = {
@@ -64,18 +91,44 @@ def _describe_status(status: int, url: str, body: bytes) -> str:
     }
     hint = hints.get(status)
     if hint is None and 500 <= status < 600:
+        # Deliberately two causes rather than one. The database enforces the class
+        # registry's JSON Schema, the geometry type and ST_IsValid in a trigger, and the
+        # feature service does not catch that exception -- so a write the schema refuses
+        # arrives here as a generic 500 with no JSON body. Naming only the cold start
+        # sends the reader to the deployment logs for a problem that is in their data.
         hint = (
-            "The backend returned a server error. It may still be starting up: a "
-            "scale-to-zero deployment is slow to answer the first request after an "
-            "idle period."
+            "The backend returned a server error. On a write this is most often the "
+            "database refusing the row -- the class's schema, the geometry type or "
+            "geometry validity -- which the feature service reports as a bare 500. It "
+            "can also be a cold start: a scale-to-zero deployment is slow to answer the "
+            "first request after an idle period."
         )
-    detail = body[:300].decode("utf-8", errors="replace").strip()
+    detail = _body_detail(body)
     parts = [f"HTTP {status} from {url}"]
     if hint:
         parts.append(hint)
     if detail:
         parts.append(f"Server said: {detail}")
     return " ".join(parts)
+
+
+def _retry_after(reply: Any) -> float | None:
+    """Seconds the server asked us to wait, if it asked.
+
+    The auth edge sends ``Retry-After`` with every 429 and it is the only number anywhere
+    that knows how long the token bucket needs. Guessing instead is how a client either
+    hammers a throttled server or sleeps far longer than it had to.
+    """
+    try:
+        raw = bytes(reply.rawHeader(b"Retry-After")).decode("ascii", errors="replace").strip()
+    except (AttributeError, TypeError, UnicodeDecodeError):
+        return None
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        # The HTTP-date form is legal and neither the edge nor pygeoapi sends it.
+        return None
+    return seconds if seconds >= 0 else None
 
 
 def _prepare(url: str, accept: str, authcfg: str) -> tuple[QNetworkRequest, Any]:
@@ -101,7 +154,11 @@ def _read(fetcher: Any, error: Any, url: str) -> Response:
     body = bytes(reply.content())
 
     if status and not (200 <= status < 300):
-        raise BackendError(_describe_status(status, url, body))
+        raise BackendError(
+            _describe_status(status, url, body),
+            status=status,
+            retry_after=_retry_after(reply),
+        )
 
     if error != QgsBlockingNetworkRequest.ErrorCode.NoError:
         message = fetcher.errorMessage() or reply.errorString() or "unknown network error"
@@ -146,10 +203,16 @@ def post_json(
     database, which is the only place the API token exists.
 
     A create returns ``201`` with a ``Location`` header and frequently an empty body, so an
-    empty response is ``None`` rather than a parse error. The body is not needed: the
-    server assigns ``label_id`` and this client deliberately never learns it, because
+    empty response is ``None`` rather than a parse error. The body is not needed at all:
+    the server assigns ``label_id`` and this client deliberately never learns it, because
     holding a client-side copy of an identity it did not issue is the defect this whole
     schema exists to remove.
+
+    Which is why an unparseable body on a *successful* status is also ``None`` rather than
+    an error. The status already said the row was created; raising over the shape of a
+    body nobody reads would report a feature that landed as one the server refused, and
+    the only repair for a refusal that did not happen is to publish it a second time.
+    A non-2xx status still raises, in :func:`_read`, before any of this.
     """
     request, fetcher = _prepare(url, accept, authcfg)
     request.setRawHeader(b"Content-Type", content_type.encode("ascii"))
@@ -157,4 +220,9 @@ def post_json(
 
     error = fetcher.post(request, QByteArray(body), False, feedback)
     response = _read(fetcher, error, url)
-    return response.json() if response.body.strip() else None
+    if not response.body.strip():
+        return None
+    try:
+        return response.json()
+    except BackendError:
+        return None

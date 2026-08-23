@@ -45,13 +45,14 @@ silent wrong guess is far more expensive than a question in a dialog.
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from .names import AUTO, CHINESE, ENGLISH
+from .names import AUTO, CHINESE, ENGLISH, clean_text
 from .registry import AttributeSpec, ClassRegistry, LabelClass
 
 #: Characters of a token kept when reducing it to a stem. See the module docstring for
@@ -249,6 +250,15 @@ class FieldMapping:
             return f"{self.source}: ambiguous between " + ", ".join(self.tied_with)
         if self.role is FieldRole.UNMAPPED:
             return f"{self.source}: nothing in the class schema resembles it"
+        if self.role is FieldRole.NAME and self.target == AUTO:
+            # The column declares no language, so the key is decided per value from the
+            # content. Saying so is the difference between a mapping a person can check
+            # and one that looks decided: this is the Substation layer's Name column, and
+            # a transliteration in it will be filed under the English key.
+            return (
+                f"{self.source} -> name, under {CHINESE!r} or {ENGLISH!r} depending on "
+                "each value: the column does not say which language it holds"
+            )
         return f"{self.source} -> {self.role.value} {self.target}"
 
 
@@ -363,10 +373,125 @@ def is_blank(value: Any) -> bool:
     if value is None:
         return True
     if isinstance(value, str):
-        return not value.strip()
+        # Padding, whatever a writer padded with, is not a record of anything.
+        return not clean_text(value)
     if isinstance(value, (Sequence, Mapping)) and not isinstance(value, (str, bytes)):
         return len(value) == 0
     return False
+
+
+def is_json_native(value: Any) -> bool:
+    """True when `value` can go into a request body as it stands.
+
+    The last gate before a QGIS attribute becomes JSON. A DBF column is typed by the file:
+    a Date column hands back a ``QDate``, a Binary column a ``QByteArray``, and neither has
+    a JSON form. If one reached ``json.dumps`` it would raise ``TypeError`` -- which is not
+    a :class:`.errors.BackendError`, so it would escape the per-feature handler, escape the
+    task, and take the whole run down along with the report of the 900 features that had
+    already worked. One unpublishable cell must cost one line in the report, not the run.
+
+    Non-finite floats are excluded for the same reason at one remove: ``json.dumps`` emits
+    them as bare ``NaN``/``Infinity``, which is not valid JSON, and a strict server refuses
+    the entire batch they are in rather than the one feature.
+    """
+    if value is None or isinstance(value, (str, bool)):
+        return True
+    if isinstance(value, int):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, Mapping):
+        return all(isinstance(k, str) and is_json_native(v) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return all(is_json_native(item) for item in value)
+    return False
+
+
+#: Spellings a DBF text column uses for a boolean. Generic notation, not domain
+#: vocabulary: nothing here names a class or an attribute. Present because Python
+#: truthiness reads every one of the *false* spellings as ``True``.
+_TRUE_WORDS = frozenset({"true", "t", "yes", "y", "1", "on"})
+_FALSE_WORDS = frozenset({"false", "f", "no", "n", "0", "off"})
+
+
+def _as_integer(value: Any) -> tuple[Any, str | None]:
+    """An ``integer`` attribute's value, without a detour through ``float``.
+
+    ``int(float(x))`` is exact only below 2^53. An 18-digit registration number routed
+    through a double comes back differing in its last three digits, and jsonb stores
+    arbitrary-precision numerics so nothing downstream objects. Values that are already
+    integers, and strings of digits, are therefore converted directly; ``float`` is the
+    fallback for the genuine DBF case, a numeric column handing back ``3.0``.
+    """
+    if isinstance(value, bool):
+        return None, f"{value!r} is a boolean, not a whole number"
+    if isinstance(value, int):
+        return value, None
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            return int(text, 10), None
+        except ValueError:
+            pass  # "3.0" in a text column is still a number; fall through.
+        value = text
+    as_float = float(value)
+    if not math.isfinite(as_float) or as_float != int(as_float):
+        return None, f"{value!r} is not a whole number"
+    return int(as_float), None
+
+
+def _as_string(value: Any) -> tuple[Any, str | None]:
+    """A ``string`` attribute's value, refusing anything whose text is an accident.
+
+    ``str(value)`` is a valid JSON string for *every* Python object, which is what makes
+    this branch dangerous: the server's validator sees a well-formed string and accepts
+    it, so a ``QDate`` lands in the system of record as the literal text
+    ``PyQt5.QtCore.QDate(2020, 1, 1)`` and nothing anywhere reports it. Only values with
+    an unambiguous text form are converted, and the routine one is the DBF numeric column:
+    an official code stored as a double arrives as ``150000.0`` and must not be written
+    as ``"150000.0"``, which joins against nothing.
+    """
+    if isinstance(value, str):
+        # clean_text rather than strip(): a fixed-width field padded with NUL rather than
+        # with spaces cannot be stored in jsonb at all, and Postgres refuses the row.
+        return clean_text(value), None
+    if isinstance(value, bool):
+        # JSON true is not the string "True", and which spelling was meant is unknowable.
+        return None, f"{value!r} is a boolean; the class declares a string"
+    if isinstance(value, int):
+        return str(value), None
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None, f"{value!r} has no string form"
+        return str(int(value)) if value == int(value) else repr(value), None
+    return None, (
+        f"{type(value).__name__} values have no unambiguous text form; converting this "
+        f"one would store its Python repr as the attribute's value ({value!r})"
+    )
+
+
+def _as_boolean(value: Any) -> tuple[Any, str | None]:
+    """A ``boolean`` attribute's value, without Python truthiness.
+
+    ``bool("false")`` is ``True``, and so is ``bool("F")`` and ``bool("0")`` -- the exact
+    spellings a shapefile uses for false. The wrong value is a valid boolean, so the
+    server's validator accepts it and the founding dataset records the opposite of the
+    truth with nothing reported. Only values that are boolean-*shaped* are converted.
+    """
+    if isinstance(value, bool):
+        return value, None
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value), None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_WORDS:
+            return True, None
+        if text in _FALSE_WORDS:
+            return False, None
+    return None, (
+        f"{value!r} is not recognisably true or false; reading it as a boolean would "
+        "publish a guess"
+    )
 
 
 def coerce(value: Any, spec: AttributeSpec) -> tuple[Any, str | None]:
@@ -375,27 +500,47 @@ def coerce(value: Any, spec: AttributeSpec) -> tuple[Any, str | None]:
     Returns ``(value, None)`` or ``(None, reason)``. A DBF column is typed by the file, not
     by the schema, so an integer attribute routinely arrives as ``3.0`` or ``"3"``.
 
-    An undeclared attribute is passed through untouched: every seeded class sets
-    ``additionalProperties: true`` -- capture first, formalise later -- and refusing
-    unforeseen attributes is exactly the friction that left the source data 0% populated.
+    Every branch refuses rather than guesses. The alternative is not "no conversion" but a
+    *silent wrong value*: a Python object has a string form, every non-empty string is
+    truthy, and both pass the server's JSON Schema check as valid values of the declared
+    type. This is a one-way bootstrap into an empty system of record, so a named issue in
+    the report beats a plausible number in the database.
+
+    A declared attribute whose schema fragment states no ``type`` -- entirely legal, and
+    what "adding an attribute is an UPDATE to label_class" produces in a hurry -- is passed
+    through untouched, because guessing at a type the class did not ask for is exactly the
+    friction that left the source data 0% populated. Untouched still has to mean sendable,
+    so :func:`is_json_native` is checked either way.
     """
     want = spec.type
     if want is None:
+        if not is_json_native(value):
+            return None, (
+                f"{type(value).__name__} values have no JSON form and the class declares "
+                f"no type to convert this one to ({value!r})"
+            )
         return value, None
     try:
         if want == "integer":
-            as_float = float(value)
-            if as_float != int(as_float):
-                return None, f"{value!r} is not a whole number"
-            return int(as_float), None
+            return _as_integer(value)
         if want == "number":
-            return float(value), None
+            if isinstance(value, bool):
+                return None, f"{value!r} is a boolean, not a number"
+            as_float = float(value)
+            if not math.isfinite(as_float):
+                return None, f"{value!r} is not a finite number"
+            return as_float, None
         if want == "string":
-            return str(value).strip(), None
+            return _as_string(value)
         if want == "boolean":
-            return bool(value), None
+            return _as_boolean(value)
     except (TypeError, ValueError):
         return None, f"{value!r} cannot be read as {want}"
+    if not is_json_native(value):
+        # The class declares a type this plugin does not convert -- "array", "object", or
+        # something added to the schema subset later. Passing it on is right; passing on
+        # something unserialisable is not.
+        return None, f"{type(value).__name__} values have no JSON form ({value!r})"
     return value, None
 
 
@@ -421,6 +566,12 @@ def schema_problem(value: Any, spec: AttributeSpec) -> str | None:
             return f"{value!r} is below the declared minimum {spec.minimum:g}"
         if spec.maximum is not None and value > spec.maximum:
             return f"{value!r} is above the declared maximum {spec.maximum:g}"
+
+    # The fourth keyword the server's validator checks. Without it a too-long string is
+    # drafted without complaint and refused by the database trigger, which the feature
+    # service reports as a bare 500 naming neither the attribute nor the rule.
+    if isinstance(value, str) and spec.max_length is not None and len(value) > spec.max_length:
+        return f"is {len(value)} characters; the class declares a maximum of {spec.max_length}"
     return None
 
 

@@ -41,7 +41,13 @@ SEED_CLASSES = [
                 "transformer_count": {"type": "integer", "minimum": 0},
                 "commissioned_year": {"type": "integer", "minimum": 1990, "maximum": 2100},
                 "status": _STATUS,
-                "area_m2": {"type": "number", "minimum": 0},
+                # The description is part of the seed and is load-bearing: it is the only
+                # thing that tells a human the Area column they just mapped is wrong.
+                "area_m2": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Computed in a projected CRS. NEVER in EPSG:4326.",
+                },
             },
         },
     },

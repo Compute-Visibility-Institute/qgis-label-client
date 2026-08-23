@@ -601,9 +601,17 @@ class LabelClientPlugin:
             return
 
         dialog = PublishDialog(sources, self.registry, self.iface.mainWindow())
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        try:
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+            plan = dialog.plan()
+        finally:
+            # Parented to the main window, so Qt keeps the C++ object alive after the last
+            # Python reference goes and unload() has nothing to detach it with. Publishing
+            # three times would otherwise leave three hidden dialogs -- each still holding
+            # a whole ClassRegistry -- as children of the QGIS window for the session.
+            dialog.deleteLater()
+        if not accepted:
             return
-        plan = dialog.plan()
         selected = list(plan.selected())
         if not selected:
             return
@@ -640,7 +648,6 @@ class LabelClientPlugin:
             layers=prepared,
             extent_collection=extent_collection,
             fields=self.registry.fields,
-            batch_size=int(self.settings.get("publish_batch_size")),
         )
 
         self.publishing = True
@@ -709,4 +716,10 @@ class LabelClientPlugin:
         level = Qgis.MessageLevel.Success if report.clean else Qgis.MessageLevel.Warning
         self._message(report.summary(), level)
         log(report.summary())
-        PublishReportDialog(report, self.iface.mainWindow()).exec()
+        results = PublishReportDialog(report, self.iface.mainWindow())
+        try:
+            results.exec()
+        finally:
+            # See publish_local_layers: parented to the main window, so nothing else
+            # detaches it.
+            results.deleteLater()

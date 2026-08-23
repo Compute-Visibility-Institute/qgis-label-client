@@ -42,6 +42,7 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
 )
 
+from .core.fields import COMPLETENESS_EXHAUSTIVE, COMPLETENESS_PARTIAL
 from .core.publish import LayerChoice, PublishPlan, PublishReport, SourceLayer, build_plan
 from .core.registry import ClassRegistry
 
@@ -51,7 +52,8 @@ _COLUMNS = (
     "Geometry",
     "CRS",
     "Class (from the registry)",
-    "Declare survey extent",
+    "Fields",
+    "Surveyed this box?",
     "Notes",
 )
 
@@ -60,8 +62,9 @@ COL_FEATURES = 1
 COL_GEOMETRY = 2
 COL_CRS = 3
 COL_CLASS = 4
-COL_EXTENT = 5
-COL_NOTES = 6
+COL_FIELDS = 5
+COL_EXTENT = 6
+COL_NOTES = 7
 
 #: Item data role carrying a layer id on a row.
 LAYER_ROLE = int(Qt.ItemDataRole.UserRole) + 1
@@ -172,30 +175,78 @@ class PublishDialog(QDialog):
             )
             self.table.setItem(row, COL_LAYER, name_item)
 
-            self.table.setItem(row, COL_FEATURES, _readonly(str(source.feature_count)))
+            # "unknown", not "0": a provider that cannot count in advance answers -1, and
+            # showing that as zero against a layer visibly full of features is a
+            # contradiction with nothing on screen to resolve it.
+            self.table.setItem(
+                row,
+                COL_FEATURES,
+                _readonly(str(source.feature_count) if source.count_known else "unknown"),
+            )
             self.table.setItem(row, COL_GEOMETRY, _readonly(source.geometry_type))
             self.table.setItem(row, COL_CRS, _readonly(source.crs_authid))
 
             self.table.setCellWidget(row, COL_CLASS, self._class_combo(layer_plan.choice.class_id))
 
-            extent_item = QTableWidgetItem("")
-            extent_item.setFlags(
-                (extent_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                & ~Qt.ItemFlag.ItemIsSelectable
-            )
-            # Never pre-ticked. A bounding box is a claim about where somebody looked, and
-            # only a human can make that claim honestly.
-            extent_item.setCheckState(Qt.CheckState.Unchecked)
-            extent_item.setToolTip(
-                "Declares a labeled_extent for this class from the layer's bounding box, "
-                "marked exhaustive with a caveat recording that it is a bounding box. "
-                "Tick it only if this layer really is a complete sweep of that rectangle."
-            )
-            self.table.setItem(row, COL_EXTENT, extent_item)
+            self.table.setItem(row, COL_FIELDS, _readonly(""))
+
+            self.table.setItem(row, COL_EXTENT, _readonly(""))
+            self.table.setCellWidget(row, COL_EXTENT, self._extent_combo())
 
             self.table.setItem(row, COL_NOTES, _readonly(""))
 
         self.table.resizeColumnsToContents()
+
+    def _extent_combo(self) -> QComboBox:
+        """The survey-extent claim, as a value rather than a tick.
+
+        ``completeness`` is the field on ``labeled_extent`` that changes what a training
+        run does: only *exhaustive* licenses the export pipeline to treat unlabeled ground
+        inside the polygon as negative, and everything outside a declared exhaustive extent
+        is unknown rather than negative. A checkbox cannot express that, and when the tool
+        picks the value itself the person clicking has not made the claim -- the tool has,
+        in the direction that poisons every model trained from the result.
+
+        So the choice is explicit, the default declares nothing, and the option that
+        licenses negative sampling says out loud what it licenses.
+        """
+        combo = QComboBox(self.table)
+        combo.addItem("no - declare nothing", "")
+        combo.addItem("partial - do NOT sample as negative", COMPLETENESS_PARTIAL)
+        combo.addItem("exhaustive - safe to sample as negative", COMPLETENESS_EXHAUSTIVE)
+        combo.setItemData(
+            0,
+            "Nothing is written about where anyone looked. Honest, and unrecoverable "
+            "later: the knowledge is in the surveyor's memory.",
+            int(Qt.ItemDataRole.ToolTipRole),
+        )
+        combo.setItemData(
+            1,
+            "Records that this area was surveyed for this class, but not completely. "
+            "Nothing inside it is treated as negative. The safe choice when the layer is "
+            "the result of triage rather than a sweep.",
+            int(Qt.ItemDataRole.ToolTipRole),
+        )
+        combo.setItemData(
+            2,
+            "Claims that EVERY feature of this class inside the layer's bounding box is "
+            "labeled here. Every unlabeled thing inside that rectangle then becomes "
+            "supervised background for the detector. Choose it only if the rectangle - "
+            "not the features, the whole rectangle - really was swept.",
+            int(Qt.ItemDataRole.ToolTipRole),
+        )
+        combo.setToolTip(
+            "Whichever you choose, the extent written here is the layer's bounding box "
+            "and names no imagery capture - the shapefiles do not record one. The export "
+            "pipeline refuses an extent with no capture unless it is explicitly "
+            "overridden, so both need correcting later; that is recorded in the row's "
+            "caveat."
+        )
+        # Never pre-selected past the first entry. A bounding box is a claim about where
+        # somebody looked, and only a human can make that claim honestly.
+        combo.setCurrentIndex(0)
+        combo.currentIndexChanged.connect(self._refresh)
+        return combo
 
     def _class_combo(self, selected: str | None) -> QComboBox:
         """A picker over the live registry. No class name is compiled into this plugin."""
@@ -220,13 +271,13 @@ class PublishDialog(QDialog):
         if item is None:
             return None
         combo = self.table.cellWidget(row, COL_CLASS)
-        extent = self.table.item(row, COL_EXTENT)
+        extent = self.table.cellWidget(row, COL_EXTENT)
         class_id = str(combo.currentData() or "") if combo is not None else ""
         return LayerChoice(
             layer_id=str(item.data(LAYER_ROLE)),
             publish=item.checkState() == Qt.CheckState.Checked,
             class_id=class_id or None,
-            declare_extent=extent is not None and extent.checkState() == Qt.CheckState.Checked,
+            extent_completeness=str(extent.currentData() or "") if extent is not None else "",
             skip_damaged_names=self.skip_damaged.isChecked(),
         )
 
@@ -259,18 +310,20 @@ class PublishDialog(QDialog):
         self._refreshing = True
         try:
             plan = self.plan()
-            self._render_notes(plan)
+            self._render_rows(plan)
             self._render_damage(plan)
             self._render_coverage(plan)
             self._render_summary(plan)
         finally:
             self._refreshing = False
 
-    def _render_notes(self, plan: PublishPlan) -> None:
+    def _render_rows(self, plan: PublishPlan) -> None:
+        """Re-render the two cells that depend on which class the row is set to."""
         by_layer = {layer_plan.source.layer_id: layer_plan for layer_plan in plan}
         for row in range(self.table.rowCount()):
             item = self.table.item(row, COL_LAYER)
             note_item = self.table.item(row, COL_NOTES)
+            field_item = self.table.item(row, COL_FIELDS)
             if item is None or note_item is None:
                 continue
             layer_plan = by_layer.get(str(item.data(LAYER_ROLE)))
@@ -279,6 +332,14 @@ class PublishDialog(QDialog):
             lines = list(layer_plan.problems()) + list(layer_plan.notes())
             note_item.setText(" ".join(lines))
             note_item.setToolTip("\n\n".join(lines))
+            if field_item is not None:
+                # The counts fit in a cell; the mapping itself does not, and it is the
+                # part worth reading. See LayerPlan.mapping_lines for why it is shown at
+                # all rather than trusted.
+                field_item.setText(layer_plan.mapping_summary())
+                field_item.setToolTip(
+                    "\n".join(layer_plan.mapping_lines()) or "Choose a class first."
+                )
 
     def _render_damage(self, plan: PublishPlan) -> None:
         damaged = plan.damaged_name_count()
@@ -292,10 +353,14 @@ class PublishDialog(QDialog):
             "authoritative in the new system."
         )
         self.damage_label.setText(
-            f"<b>{damaged} feature(s) carry a name that has lost its final character.</b> "
-            "Six of the seven source layers declare UTF-7 and the encoder never flushed "
-            "its final escape run, so 数据中心 is stored as 数据中X8. The lost bits are "
-            f"gone; nothing can recover them from these files. {fate}"
+            f"<b>Up to {damaged} feature(s) carry a name that has lost its final "
+            "character.</b> Six of the seven source layers declare UTF-7 and the encoder "
+            "never flushed its final escape run, so 数据中心 is stored as 数据中X8. The "
+            "lost bits are gone; nothing can recover them from these files. "
+            "<b>That number is an upper bound:</b> the residue of a cut escape run is "
+            "arbitrary, so a two-character site designator after a Chinese character "
+            "(数据中心B2) cannot be told apart from damage, and omitting it would destroy "
+            f"an intact name. {fate}"
         )
 
     def _render_coverage(self, plan: PublishPlan) -> None:
@@ -309,8 +374,10 @@ class PublishDialog(QDialog):
             + ".</b> This publish records WHAT was found, not WHERE ANYONE LOOKED. Ground "
             "outside a declared exhaustive extent is <i>unknown</i> to the export pipeline, "
             "never negative - and it cannot be reconstructed later, because the knowledge "
-            "is in the surveyor's memory. Tick the extent box only where the layer really "
-            "is a complete sweep."
+            "is in the surveyor's memory. Choose <i>exhaustive</i> only where the layer "
+            "really is a complete sweep of its whole bounding box; <i>partial</i> records "
+            "that you looked without licensing anything inside it to be sampled as "
+            "background."
         )
 
     def _render_summary(self, plan: PublishPlan) -> None:

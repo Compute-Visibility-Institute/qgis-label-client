@@ -65,11 +65,10 @@ DEFAULTS: dict[str, Any] = {
     "history_collection": "",
     # Warn this many minutes before the signed URLs expire.
     "expiry_warning_minutes": 30,
-    # Features per POST when publishing local layers. A FeatureCollection body turns 1,246
-    # round trips into a couple of dozen; set it to 1 against a server that only accepts a
-    # single Feature per create. Failures fall back to one at a time either way, so this is
-    # a speed setting and never a correctness one.
-    "publish_batch_size": 50,
+    # There is deliberately no publish batch size. Publishing local layers sends one
+    # feature per request, always: a save is not atomic, there is no If-Match, and identity
+    # is server-assigned, so a batch that failed ambiguously cannot be retried without
+    # risking a duplicate in the founding dataset. See qgis_label_client.publish._send.
 }
 
 

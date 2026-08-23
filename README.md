@@ -226,7 +226,18 @@ DSN, on the grounds that an analyst will never run one.
 **Nothing is sent until the preview is confirmed.** The dialog lists each layer with its
 feature count, geometry type, CRS and a checkbox, and a class combo populated from the live
 registry. Classes are guessed from the layer name and are always overridable; an ambiguous
-guess is reported as ambiguous rather than resolved arbitrarily.
+guess is reported as ambiguous rather than resolved arbitrarily. The *Fields* column shows
+where every source column would go, in full, on hover — the matcher is structural, so it
+maps a column onto whichever declared attribute its concept is a subset of and cannot know
+that a column is wrong for reasons outside the schema. `Compounds.Area` is the standing
+example: it matches an area attribute perfectly, and any value in it was computed in
+EPSG:4326 and is therefore square degrees. Reading the mapping is the check.
+
+A layer with **no valid CRS** — a shapefile with no `.prj` beside it — cannot be published
+at all, and the preview says so. QGIS builds a coordinate transform that silently does
+nothing when it does not know the source CRS, `label.geom` has no range check, and
+`ST_GeometryType` still matches the class, so projected metres would land as degrees of
+longitude looking exactly like valid data.
 
 Two things the dialog says out loud, because both are silent failures otherwise:
 
@@ -238,9 +249,13 @@ Two things the dialog says out loud, because both are silent failures otherwise:
 - **Missing survey coverage.** If a class is being published with no `labeled_extent`
   declared for it, the dialog says so in the terms above: the publish records *what was
   found*, not *where anyone looked*. An extent can be created from the layer's bounding
-  box, and that box is **unticked by default** — a bounding box is a claim about where
-  somebody swept, and only a human can make that claim honestly. When it is ticked, the
-  extent is written with a caveat recording that it came from a bounding box.
+  box, and the choice is a `completeness` **value**, not a tick: *declare nothing* (the
+  default), *partial*, or *exhaustive*. Only `exhaustive` licenses the export pipeline to
+  treat unlabeled ground inside the polygon as negative, so a tool that picks it whenever a
+  box is ticked has answered that question rather than asked it. Whichever is chosen, the
+  row carries a caveat recording that the polygon is a bounding box and that it names no
+  imagery capture, and the extent is refused outright if the run did not earn it — nothing
+  published, or, for `exhaustive`, any feature that did not reach the database.
 
 What happens per feature:
 
@@ -257,10 +272,20 @@ What happens per feature:
 - **no identity is invented.** The source `id` column is 0% populated and `label_id` is
   `uuid DEFAULT gen_random_uuid()`. Identity is the server's.
 
-The run happens in a `QgsTask` with progress and cancellation, POSTs are batched, and a
-rejected batch is retried one feature at a time so a failure names a row. Each published
-layer is stamped with a `cvi/published` custom property; publishing it again warns first,
-because the server assigns identity and therefore nothing here can recognise a repeat.
+The run happens in a `QgsTask` with progress and cancellation. **One feature per request,
+and nothing is ever sent twice.** A save is not atomic — one HTTP request is one edit, and
+the first rejection aborts the rest — there is no `ETag`/`If-Match` anywhere, and identity
+is assigned by the server, so nothing on this side can ask "did that one land?". Retrying
+an ambiguous failure would therefore duplicate rows in the founding dataset with distinct
+`label_id`s that nothing afterwards can tell apart. Round trips are cheaper than that. A
+`429` is the one exception, and it is not a retry of an unknown outcome: the auth edge caps
+writes per principal and says how long its bucket needs, so the client waits and offers the
+same feature again. Every refusal names its row, by name where the feature has one and by
+position otherwise.
+
+Each published layer is stamped with a `cvi/published` custom property and the project is
+marked dirty so the stamp survives closing QGIS; publishing it again warns first, because
+the server assigns identity and therefore nothing here can recognise a repeat.
 
 ---
 
