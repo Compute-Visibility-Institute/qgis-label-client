@@ -108,7 +108,11 @@ def refresh_sources(
         # Log the object path, never the signed URL -- it is the access grant.
         log_url(f"Re-pointing {rewrite.layer_name!r} ({rewrite.matched_by})", rewrite.new_source)
         if repoint_raster(layer, rewrite.new_source):
-            layer.setCustomProperty(ASSET_KEY_PROPERTY, rewrite.asset.key)
+            # Only stamp a key that identifies one scene. An asset the backend sent
+            # without a stac_id has none, and writing a placeholder would bind this layer
+            # to whichever unnamed asset happens to sort first on the next refresh.
+            if rewrite.asset.key:
+                layer.setCustomProperty(ASSET_KEY_PROPERTY, rewrite.asset.key)
             applied += 1
 
     for layer_ref in unmatched:

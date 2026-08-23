@@ -114,6 +114,56 @@ def test_asset_key_pairs_scene_and_derivative():
     assert assets[0].key == "26APR21034014-S2AS-EXAMPLE_01_P001:visual"
 
 
+def test_the_stac_flavoured_key_and_href_spelling_is_also_accepted():
+    """The backend serves each asset under two vocabularies at once.
+
+    Its capture rows are STAC-shaped, where an asset is a map key plus an ``href``;
+    this client reads a list where each entry names its own ``asset`` and ``url``. An
+    entry carrying only the STAC spelling has no role and no URL as far as
+    :func:`parse_signed_assets` is concerned, so it is dropped -- and dropping every
+    entry raises "response contained no usable assets", an error naming neither field.
+    Accepting both spellings is what keeps that failure impossible.
+    """
+    assets, _ = parse_signed_assets(
+        {
+            "assets": [
+                {
+                    "key": "visual",
+                    "href": SIGNED,
+                    "stac_id": "26APR21034014-S2AS-EXAMPLE_01_P001",
+                    "expires_at": "2026-08-23T18:00:00Z",
+                }
+            ]
+        }
+    )
+    assert [a.role for a in assets] == ["visual"]
+    assert assets[0].key == "26APR21034014-S2AS-EXAMPLE_01_P001:visual"
+
+
+def test_an_asset_with_no_scene_id_has_no_key_and_never_collides():
+    # Regression. A key of ":visual" would be the same string for every unnamed capture,
+    # so two of them would collide in the lookup and a layer stamped with it would bind
+    # to whichever sorted first on the next refresh -- the wrong scene under the right
+    # layer name. No key at all is correct; matching then falls back to the object path.
+    assets, _ = parse_signed_assets(
+        {
+            "assets": [
+                {"asset": "visual", "url": "https://storage.googleapis.com/b/one_visual.tif?s=1"},
+                {"asset": "visual", "url": "https://storage.googleapis.com/b/two_visual.tif?s=2"},
+            ]
+        }
+    )
+    assert [a.key for a in assets] == [None, None]
+
+    layers = [
+        RasterLayerRef(layer_id="L1", name="One", source="gs://b/one_visual.tif"),
+        RasterLayerRef(layer_id="L2", name="Two", source="gs://b/two_visual.tif"),
+    ]
+    rewrites, unmatched = plan_rewrites(layers, assets)
+    assert not unmatched
+    assert [r.new_source for r in rewrites] == [a.source() for a in assets]
+
+
 def test_bare_array_response_is_accepted():
     assets, expiry = parse_signed_assets(RESPONSE["assets"])
     assert len(assets) == 2

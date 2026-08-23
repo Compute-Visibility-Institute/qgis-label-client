@@ -23,28 +23,38 @@ from __future__ import annotations
 
 import os
 from collections.abc import Sequence
+from datetime import datetime, timezone
 from typing import Any
 
 from qgis.core import Qgis, QgsFeedback, QgsProject
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QIcon
-from qgis.PyQt.QtWidgets import QAction, QInputDialog, QLineEdit, QMessageBox
+from qgis.PyQt.QtWidgets import QAction, QDialog, QInputDialog, QLineEdit, QMessageBox
 
 from . import auth, client, imagery, qa
 from . import layers as layer_tools
+from . import publish as publish_tools
 from .core.asof import AsOfMechanism, describe
 from .core.collections import Collection
 from .core.errors import LabelClientError
+from .core.publish import PublishPlan, PublishReport
 from .core.registry import ClassRegistry
 from .core.teardown import Teardown
 from .dockwidget import LabelClientDock
 from .historydialog import HistoryDialog
 from .log import log, log_error, log_warning
+from .publishdialog import PublishDialog, PublishReportDialog
 from .settings import PluginSettings
 from .tasks import TaskRunner
 
 MENU_NAME = "&CVI Label Client"
 PLUGIN_DIR = os.path.dirname(__file__)
+
+#: How many recorded beliefs one history request asks for. A cap rather than paging
+#: because the dialog is a read, not a browser -- but a silent cap would present a
+#: truncated history as a complete one, so :meth:`LabelClientPlugin._on_history` says
+#: when it has been hit.
+HISTORY_LIMIT = 200
 
 
 class LabelClientPlugin:
@@ -59,6 +69,10 @@ class LabelClientPlugin:
         self.dock: LabelClientDock | None = None
         self.registry: ClassRegistry | None = None
         self.collections: list[Collection] = []
+        # A publish in flight. Guarded rather than merely discouraged: the menu entry and
+        # the panel button both reach it, and two concurrent runs would double the data
+        # with nothing able to tell afterwards which copy is which.
+        self.publishing = False
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -89,6 +103,17 @@ class LabelClientPlugin:
             lambda: self.iface.removePluginMenu(MENU_NAME, self.refresh_action),
         )
 
+        self.publish_action = QAction(icon, "Publish local layers…", self.iface.mainWindow())
+        self.publish_action.setToolTip(
+            "Send the vector layers open in this project to the backend as new labels."
+        )
+        self.publish_action.triggered.connect(self.publish_local_layers)
+        self.iface.addPluginToMenu(MENU_NAME, self.publish_action)
+        self.teardown.add(
+            "menu: publish local layers",
+            lambda: self.iface.removePluginMenu(MENU_NAME, self.publish_action),
+        )
+
         self._connect_dock_signals()
         self._restore_settings()
         log("Plugin loaded.")
@@ -103,6 +128,7 @@ class LabelClientPlugin:
         self.dock = None
         self.registry = None
         self.collections = []
+        self.publishing = False
         log("Plugin unloaded.")
 
     def _detach_dock(self) -> None:
@@ -126,6 +152,12 @@ class LabelClientPlugin:
         """
         if self.dock is None:
             return
+        # Keep the toolbar toggle honest about the panel's actual state. Closing the dock
+        # with its own X does not change the action, so without this the button stays
+        # checked over a hidden panel and the next click unchecks it instead of
+        # reopening it -- "the button does nothing", twice.
+        self.dock.visibilityChanged.connect(self.panel_action.setChecked)
+
         self.dock.connectRequested.connect(self.connect_backend)
         self.dock.signInRequested.connect(self.sign_in)
         self.dock.signOutRequested.connect(self.sign_out)
@@ -134,6 +166,7 @@ class LabelClientPlugin:
         self.dock.asOfApplied.connect(self.apply_as_of)
         self.dock.historyRequested.connect(self.show_history)
         self.dock.coverageRequested.connect(self.check_coverage)
+        self.dock.publishRequested.connect(self.publish_local_layers)
 
     def _restore_settings(self) -> None:
         if self.dock is None:
@@ -361,6 +394,29 @@ class LabelClientPlugin:
         self.dock.set_imagery_status(
             f"{applied} layer(s) re-pointed from {len(assets)} signed URL(s).{expiry}{note}"
         )
+        self._warn_if_expiring(expires_at)
+
+    def _warn_if_expiring(self, expires_at) -> None:
+        """Say so when the freshly minted URLs are already close to death.
+
+        Worth saying out loud rather than only printing the timestamp: an expired signed
+        URL does not blank the map. GDAL keeps serving what it has cached, so the raster
+        looks right for a while and then starts failing mid-pan, which reads as a QGIS
+        problem rather than as "refresh the imagery".
+        """
+        if expires_at is None:
+            return
+        minutes = int(self.settings.get("expiry_warning_minutes"))
+        if minutes <= 0:
+            return
+        remaining = (expires_at - datetime.now(timezone.utc)).total_seconds() / 60
+        if remaining <= minutes:
+            self._message(
+                f"These signed imagery URLs expire in {int(remaining)} minute(s). "
+                "Refresh again before they do; an expired URL fails silently from "
+                "GDAL's cache rather than blanking the layer.",
+                Qgis.MessageLevel.Warning,
+            )
 
     # ------------------------------------------------------------------------ QA
 
@@ -404,7 +460,13 @@ class LabelClientPlugin:
 
         def work(feedback: QgsFeedback):
             return client.fetch_history(
-                url, collection, str(label_id), authcfg, field, feedback=feedback
+                url,
+                collection,
+                str(label_id),
+                authcfg,
+                field,
+                limit=HISTORY_LIMIT,
+                feedback=feedback,
             )
 
         self.tasks.run(
@@ -415,21 +477,31 @@ class LabelClientPlugin:
         )
 
     def _ask_history_collection(self) -> str:
-        """Ask which collection carries the audit trail, rather than assuming a name.
+        return self._ask_collection(
+            "History collection", "Which collection serves the label audit trail?"
+        )
+
+    def _ask_collection(self, title: str, question: str) -> str:
+        """Ask which collection serves a purpose, rather than assuming a name.
 
         Collection ids are a deployment's choice. Guessing one and failing produces a
         404 that reads like an outage; asking once and remembering costs a dialog.
         """
         choices = [c.collection_id for c in self.collections] or [""]
         value, accepted = QInputDialog.getItem(
-            self.iface.mainWindow(),
-            "History collection",
-            "Which collection serves the label audit trail?",
-            choices,
-            0,
-            False,
+            self.iface.mainWindow(), title, question, choices, 0, False
         )
         return value if accepted else ""
+
+    def _collection_setting(self, key: str, title: str, question: str) -> str:
+        """A remembered collection id, asked for once."""
+        stored = str(self.settings.get(key)).strip()
+        if stored:
+            return stored
+        chosen = self._ask_collection(title, question).strip()
+        if chosen:
+            self.settings.set(key, chosen)
+        return chosen
 
     def _on_history(self, label_id: str, entries) -> None:
         if self.dock is None:
@@ -438,6 +510,13 @@ class LabelClientPlugin:
         if not entries:
             self._message(f"No history recorded for {label_id}.")
             return
+        if len(entries) >= HISTORY_LIMIT:
+            # An audit trail silently cut off at the limit reads as the whole story.
+            self._message(
+                f"Showing the {HISTORY_LIMIT} most recent recorded beliefs for this "
+                "label. There may be older ones.",
+                Qgis.MessageLevel.Warning,
+            )
         HistoryDialog(label_id, entries, self.iface.mainWindow()).exec()
 
     def check_coverage(self) -> None:
@@ -472,8 +551,162 @@ class LabelClientPlugin:
             QMessageBox.information(
                 self.iface.mainWindow(),
                 "No survey extent declared",
-                "These classes have labels but no exhaustive labeled_extent anywhere:\n\n"
+                "These classes have labels here but no exhaustive labeled_extent among "
+                "the extents checked:\n\n"
                 + "\n".join(f"  - {class_id}" for class_id in report.classes_without_extents)
                 + "\n\nThat ground is UNKNOWN to the export pipeline, not negative. "
-                "Recording where you swept cannot be reconstructed later.",
+                "Recording where you swept cannot be reconstructed later.\n\n"
+                # The extent layer is fetched with the canvas restriction on, so this is
+                # a statement about the current view, not about the whole deployment.
+                "Scoped to the current map extent: an extent declared elsewhere in the "
+                "country is not counted here.",
             )
+
+    # ----------------------------------------------------------------- bootstrap
+
+    def publish_local_layers(self) -> None:
+        """Send the vector layers open in this project to the backend as new labels.
+
+        The bootstrap path, and the one the analyst's whole existing workflow has to pass
+        through once: 1,246 features in dated folders of shapefiles, becoming the founding
+        dataset of a system that finally has identity and history. Everything is previewed
+        first, because the server assigns identity and therefore nothing here can
+        recognise a second run as a repeat.
+        """
+        if self.dock is None:
+            return
+        if self.publishing:
+            self._message(
+                "A publish is already running. Wait for it, or cancel it from the task "
+                "manager in the status bar.",
+                Qgis.MessageLevel.Warning,
+            )
+            return
+        url = self._persist_url()
+        if not url:
+            self._fail("Enter the API URL first.")
+            return
+        if not self.registry:
+            self._fail("Connect first: the class registry is what the layers are mapped onto.")
+            return
+
+        sources = publish_tools.describe_layers()
+        if not sources:
+            self._message(
+                "No local vector layers in this project. Layers loaded from the backend "
+                "are excluded - they are already there, and QGIS's OAPIF provider edits "
+                "them in place.",
+                Qgis.MessageLevel.Warning,
+            )
+            return
+
+        dialog = PublishDialog(sources, self.registry, self.iface.mainWindow())
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        plan = dialog.plan()
+        selected = list(plan.selected())
+        if not selected:
+            return
+        if not self._confirm_republish(plan):
+            return
+
+        collection = self._collection_setting(
+            "label_collection", "Label collection", "Which collection holds the labels?"
+        )
+        if not collection:
+            self._fail("No collection chosen. Nothing was published.")
+            return
+
+        extent_collection = ""
+        if any(layer_plan.choice.declare_extent for layer_plan in selected):
+            extent_collection = self._collection_setting(
+                "extent_collection",
+                "Survey extent collection",
+                "Which collection holds the survey extents (labeled_extent)?",
+            )
+
+        try:
+            # Main thread: builds the thread-safe feature sources and transforms the
+            # worker will use. See publish.prepare for why this cannot happen in run().
+            prepared = publish_tools.prepare(selected)
+        except LabelClientError as exc:
+            self._fail(str(exc))
+            return
+
+        request = publish_tools.PublishRequest(
+            base_url=url,
+            collection_id=collection,
+            authcfg=self.settings.authcfg,
+            layers=prepared,
+            extent_collection=extent_collection,
+            fields=self.registry.fields,
+            batch_size=int(self.settings.get("publish_batch_size")),
+        )
+
+        self.publishing = True
+        self.publish_action.setEnabled(False)
+        self.dock.set_busy(True)
+        self.dock.set_publish_status(
+            f"Publishing {plan.total_features()} feature(s) to {collection}…"
+        )
+
+        def work(feedback: QgsFeedback) -> PublishReport:
+            # Worker thread. Nothing here may touch widgets, iface or QgsProject.
+            return publish_tools.publish(request, feedback)
+
+        def failed(message: str) -> None:
+            self._end_publish()
+            self._fail(message)
+
+        self.tasks.run(
+            "Publish local layers",
+            work,
+            lambda report: self._on_published(selected, collection, report),
+            failed,
+            # A cancelled publish is not a discarded read: part of it is already on the
+            # server, and the user needs the summary saying which part.
+            deliver_when_cancelled=True,
+        )
+
+    def _end_publish(self) -> None:
+        self.publishing = False
+        self.publish_action.setEnabled(True)
+
+    def _confirm_republish(self, plan: PublishPlan) -> bool:
+        """Make a second publish of the same layer a deliberate act.
+
+        The plugin cannot deduplicate: identity is the server's, so it has no way to ask
+        "is this feature already there?". What it can do is remember that it sent this
+        layer once and refuse to let the second send be an accident.
+        """
+        repeats = plan.republished()
+        if not repeats:
+            return True
+        answer = QMessageBox.warning(
+            self.iface.mainWindow(),
+            "These layers have been published before",
+            "\n\n".join(
+                f"{layer_plan.source.name}: {layer_plan.source.previous.describe()}"
+                for layer_plan in repeats
+                if layer_plan.source.previous
+            )
+            + "\n\nPublishing again adds a second copy of every feature. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _on_published(self, plans, collection_id: str, report: PublishReport) -> None:
+        self._end_publish()
+        if self.dock is None:
+            return
+        self.dock.set_busy(False)
+        # Stamped on the main thread, after the fact, and after a partial run too: "some
+        # of this is already up there" is exactly what a cancelled run leaves behind.
+        publish_tools.stamp_published(plans, report, collection_id)
+
+        self.dock.set_publish_status(report.summary())
+        level = Qgis.MessageLevel.Success if report.clean else Qgis.MessageLevel.Warning
+        self._message(report.summary(), level)
+        log(report.summary())
+        PublishReportDialog(report, self.iface.mainWindow()).exec()

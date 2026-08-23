@@ -60,6 +60,7 @@ class LabelClientDock(QDockWidget):
     asOfApplied = pyqtSignal()
     historyRequested = pyqtSignal()
     coverageRequested = pyqtSignal()
+    publishRequested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("CVI Label Client", parent)
@@ -67,6 +68,8 @@ class LabelClientDock(QDockWidget):
         # Set before the groups are built: _build_vocabulary_group connects a signal that
         # can fire during construction.
         self._registry: ClassRegistry | None = None
+        # Remembered so set_busy can re-enable only what set_connected allows.
+        self._connected = False
         self.setAllowedAreas(
             Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
         )
@@ -79,6 +82,7 @@ class LabelClientDock(QDockWidget):
 
         layout.addWidget(self._build_connection_group(container))
         layout.addWidget(self._build_collections_group(container))
+        layout.addWidget(self._build_bootstrap_group(container))
         layout.addWidget(self._build_imagery_group(container))
         layout.addWidget(self._build_asof_group(container))
         layout.addWidget(self._build_qa_group(container))
@@ -153,6 +157,32 @@ class LabelClientDock(QDockWidget):
         self.load_button = QPushButton("Load checked collections", group)
         self.load_button.clicked.connect(self._emit_load_layers)
         layout.addWidget(self.load_button)
+        return group
+
+    def _build_bootstrap_group(self, parent: QWidget) -> QWidget:
+        group = QgsCollapsibleGroupBox("Bootstrap", parent)
+        layout = QVBoxLayout(group)
+
+        hint = QLabel(
+            "One-time: send the vector layers already open in this project to the backend "
+            "as the founding dataset. Everything is previewed first, and the server - not "
+            "this plugin - assigns each feature its permanent identity.",
+            group,
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.publish_button = QPushButton("Publish local layers…", group)
+        self.publish_button.setToolTip(
+            "Reads the local vector layers in this project, guesses a class for each from "
+            "the registry, and shows you the mapping before anything is sent."
+        )
+        self.publish_button.clicked.connect(self.publishRequested)
+        layout.addWidget(self.publish_button)
+
+        self.publish_status = QLabel("", group)
+        self.publish_status.setWordWrap(True)
+        layout.addWidget(self.publish_status)
         return group
 
     def _build_imagery_group(self, parent: QWidget) -> QWidget:
@@ -270,8 +300,10 @@ class LabelClientDock(QDockWidget):
     # --- view state -----------------------------------------------------------
 
     def set_connected(self, connected: bool) -> None:
+        self._connected = connected
         for widget in (
             self.load_button,
+            self.publish_button,
             self.refresh_imagery_button,
             self.apply_asof_button,
             self.history_button,
@@ -281,6 +313,10 @@ class LabelClientDock(QDockWidget):
 
     def set_busy(self, busy: bool) -> None:
         self.connect_button.setEnabled(not busy)
+        # Publishing is the one action that must not be startable twice. A second run
+        # while the first is in flight doubles the data, and the server assigns identity
+        # so nothing can recognise the repeat afterwards.
+        self.publish_button.setEnabled(self._connected and not busy)
         self.setCursor(Qt.CursorShape.BusyCursor if busy else Qt.CursorShape.ArrowCursor)
 
     def set_status(self, message: str) -> None:
@@ -294,6 +330,9 @@ class LabelClientDock(QDockWidget):
 
     def set_qa_result(self, message: str) -> None:
         self.qa_result.setText(message)
+
+    def set_publish_status(self, message: str) -> None:
+        self.publish_status.setText(message)
 
     def api_url(self) -> str:
         return self.url_edit.text().strip()

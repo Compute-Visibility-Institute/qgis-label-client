@@ -4,7 +4,7 @@ A QGIS 3.44 plugin for a bitemporal geospatial labeling backend that speaks
 **OGC API - Features** (Parts 1, 2 and 4).
 
 It is deliberately thin. QGIS's native OAPIF provider already reads *and* writes vector
-features with no plugin code at all, so this plugin covers only the five things QGIS
+features with no plugin code at all, so this plugin covers only the six things QGIS
 cannot do on its own.
 
 ---
@@ -18,6 +18,7 @@ cannot do on its own.
 | **Collections and class vocabulary** — read from the backend at connect time | Categories, styles, attribute schemas and form order live in the server's class registry. Anything compiled into the plugin would drift from the web UI the first time someone adds a class |
 | **As-of date** — pins layers to one instant of *valid* time | QGIS's Temporal Controller can drive `datetime`, but choosing the mechanism, formatting the instant and re-pointing every layer is plumbing QGIS leaves to the caller |
 | **QA** — a label's edit history, and a survey-coverage check | Both are questions about the backend's schema, not about the map |
+| **Bootstrap** — publishes the local vector layers already open in the project as the founding dataset | The provider edits a collection it is already connected to. It has no concept of a shapefile that has never been part of one, and no way to map a decade of ad-hoc column names onto a class registry |
 
 Everything else — feature reading, paging, bbox filtering, the attribute table, digitising,
 create/update/delete — is stock QGIS.
@@ -77,8 +78,14 @@ configurable paths so a deployment can mount them anywhere.
 |---|---|---|
 | `GET {api}/collections` | OAPIF Part 1 | Collection discovery |
 | `GET {api}/collections/{id}/items` | OAPIF Parts 1 and 4 | Everything QGIS's provider does, plus history queries |
-| `GET {api}/classes` | no | The class registry |
-| `GET {api}/imagery/signed-urls` | no | Minting short-lived signed URLs |
+| `GET {api}/v1/classes` | no | The class registry |
+| `GET {api}/v1/imagery/signed-urls` | no | Minting short-lived signed URLs |
+
+The two non-standard paths are settings, not constants — a deployment may mount them
+anywhere. The `v1/` prefix in the defaults is the reference backend's own namespace:
+everything outside it is proxied to the feature service, so a class-registry request
+without the prefix comes back as an OAPIF error about an unknown collection, which
+points at the wrong component entirely.
 
 ### Class registry
 
@@ -89,7 +96,7 @@ configurable paths so a deployment can mount them anywhere.
     {
       "class_id": "example_class",           // snake_case, matches label_class.class_id
       "geom_type": "MultiPolygon",
-      "label_en": "Example class",
+      "label_en": "Example class",           // or "labels": {"en": …, "zh": …}
       "label_zh": "示例",
       "description": "…",
       "attr_schema": { "type": "object", "additionalProperties": true,
@@ -106,9 +113,17 @@ configurable paths so a deployment can mount them anywhere.
 A bare JSON array, or a GeoJSON `FeatureCollection` carrying the rows in `properties`,
 is also accepted.
 
-**No class name, attribute name or enum value appears anywhere in this plugin.** Adding an
-attribute is a row update on the server; the QGIS forms, the renderer legend and the web UI
-all pick it up without a release. That property is asserted by the test suite.
+**No class name or attribute name appears anywhere in this plugin.** Adding an attribute is
+a row update on the server; the QGIS forms, the renderer legend and the web UI all pick it
+up without a release.
+
+`tests/test_repo_hygiene.py::test_no_class_or_attribute_name_is_compiled_into_the_plugin`
+holds that line: it walks the package's AST and fails if any string *constant* equals a
+class id or attribute name from the vocabulary. Comparing whole constants via the AST is
+what lets a comment explain why cooling units matter while a dictionary key that reaches
+into `attrs` by name still fails the build. It is a deny list, so it cannot know about a
+term added after it was written — but the regression it catches is the one that actually
+happens.
 
 ### Signed imagery URLs
 
@@ -119,8 +134,8 @@ all pick it up without a release. That property is asserted by the test suite.
     {
       "capture_id": "…",
       "stac_id": "…",             // the scene stem
-      "asset": "visual",          // derivative role: visual, nir, analysis, …
-      "url": "https://storage.googleapis.com/…?X-Goog-Signature=…",
+      "asset": "visual",          // derivative role: visual, nir, analysis, … ("key" also accepted)
+      "url": "https://storage.googleapis.com/…?X-Goog-Signature=…",   // "href" also accepted
       "gs_uri": "gs://…/scene_visual.tif",
       "expires_at": "…"           // optional per-asset override
     }
@@ -167,6 +182,14 @@ against `valid_from` / `valid_to` and rides on a first-class parameter of the QG
 URI, so it cannot be silently discarded. If your as-of view looks suspiciously like the
 current state, switch mechanisms — that is the symptom.
 
+> **What the `filter` parameter actually takes.** Not CQL2. The QGIS OAPIF provider parses
+> it with `QgsExpression` and does the CQL2 conversion itself, so the plugin sends a QGIS
+> expression — `"valid_from" <= '2026-01-01T00:00:00Z' AND …` — and QGIS turns it into
+> `filter=("valid_from" <= TIMESTAMP('2026-01-01T00:00:00.000Z'))…&filter-lang=cql2-text`.
+> Writing literal CQL2 there does not degrade gracefully: an expression QGIS cannot parse
+> makes the layer **invalid**, so you get no data rather than unfiltered data. Verified
+> against QGIS 3.44.
+
 ---
 
 ## Survey coverage QA
@@ -186,6 +209,58 @@ because nobody will remember which sites were swept for which classes a year fro
 
 A label that falls only inside a `partial` extent is reported too: a qualified sweep does
 not license treating its surroundings as negative either.
+
+---
+
+## Publishing local layers (the one-time bootstrap)
+
+**Plugins → CVI Label Client → Publish local layers…**, or the button in the panel's
+*Bootstrap* group.
+
+The first deployment starts with an empty backend and a folder of Esri Shapefiles that has
+been version-controlled by being copied and dated. This action reads the vector layers open
+in the project — excluding the ones this plugin loaded, which are already on the server —
+and creates them as labels. It replaces a command-line loader that ran against a PostgreSQL
+DSN, on the grounds that an analyst will never run one.
+
+**Nothing is sent until the preview is confirmed.** The dialog lists each layer with its
+feature count, geometry type, CRS and a checkbox, and a class combo populated from the live
+registry. Classes are guessed from the layer name and are always overridable; an ambiguous
+guess is reported as ambiguous rather than resolved arbitrarily.
+
+Two things the dialog says out loud, because both are silent failures otherwise:
+
+- **Damaged names.** Six of the seven source `.cpg` files declare UTF-7 and the writer
+  never flushed its final escape run, so at least 52% of the Chinese names have lost their
+  last character — `数据中心` stored as `数据中X8`. The count is shown before anything is
+  sent. The default is to publish them anyway, because `Name_en` often survives where
+  `Name:ch` did not, but the alternative is one checkbox away and the choice is visible.
+- **Missing survey coverage.** If a class is being published with no `labeled_extent`
+  declared for it, the dialog says so in the terms above: the publish records *what was
+  found*, not *where anyone looked*. An extent can be created from the layer's bounding
+  box, and that box is **unticked by default** — a bounding box is a claim about where
+  somebody swept, and only a human can make that claim honestly. When it is ticked, the
+  extent is written with a caveat recording that it came from a bounding box.
+
+What happens per feature:
+
+- legacy columns are matched onto the class's own `attr_schema`, so `No. Cooler` and
+  `No. Coolim` converge on one attribute and `No. transf`/`No. Transf` on another, without
+  this plugin containing any of those names;
+- `Name:ch` / `Name_en` / `Name` become `names` as `{"zh": …, "en": …}`, with an unmarked
+  column filed by content;
+- empty values are omitted rather than written as nulls — only four columns in the source
+  have any data at all, and `{"…": null}` would claim somebody looked and found nothing;
+- single-part geometries are promoted to the multi-part type the class declares, anything
+  outside EPSG:4326 is reprojected, and invalid geometries are skipped and reported rather
+  than sent for the server to reject;
+- **no identity is invented.** The source `id` column is 0% populated and `label_id` is
+  `uuid DEFAULT gen_random_uuid()`. Identity is the server's.
+
+The run happens in a `QgsTask` with progress and cancellation, POSTs are batched, and a
+rejected batch is retried one feature at a time so a failure names a row. Each published
+layer is stamped with a `cvi/published` custom property; publishing it again warns first,
+because the server assigns identity and therefore nothing here can recognise a repeat.
 
 ---
 
@@ -213,6 +288,9 @@ qgis_label_client/
 │   ├── coverage.py      survey-coverage classification
 │   ├── fields.py        names of the stable core columns
 │   ├── history.py       audit-trail parsing
+│   ├── legacy.py        legacy column names -> the registry's vocabulary
+│   ├── names.py         label.names, and the UTF-7 truncation signature
+│   ├── publish.py       the bootstrap plan, feature drafting and its report
 │   ├── registry.py      the class vocabulary
 │   ├── styling.py       registry style block -> QGIS symbol properties
 │   ├── teardown.py      the undo stack that makes unload() correct
@@ -227,6 +305,8 @@ qgis_label_client/
 ├── layers.py        OAPIF layer creation and registry-driven configuration
 ├── imagery.py       raster source re-pointing
 ├── qa.py            coverage check
+├── publish.py       local-layer reading, reprojection and the publish task
+├── publishdialog.py the preview, and the results summary
 └── historydialog.py
 ```
 
@@ -246,7 +326,9 @@ These are not style preferences. Each one has cost somebody an afternoon.
   `requests`. Only the QGIS stack inherits the user's proxy config, SSL exceptions and the
   authentication database — which is where the token lives.
 - **`QgsTask.run()` is a worker thread.** No Qt widgets, no `iface`, no `QgsProject`. Only
-  `finished()` is back on the main thread.
+  `finished()` is back on the main thread. A `QgsVectorLayer` is off limits there too:
+  build a `QgsVectorLayerFeatureSource` from it on the main thread and iterate *that*,
+  which is what the Processing framework does and what `publish.prepare()` does here.
 - **An exception escaping `run()` is swallowed silently** — a no-op, not a traceback. The
   task wrapper catches everything and formats the traceback on the worker thread.
 - **Hold a Python reference to every `QgsTask`** or it is garbage collected mid-flight and

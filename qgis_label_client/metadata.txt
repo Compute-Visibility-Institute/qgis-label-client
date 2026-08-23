@@ -20,7 +20,10 @@ about=Connects QGIS to a labeling platform that serves OGC API - Features (Parts
     * an as-of-date control on valid time, sent as the OGC datetime parameter or as a CQL2
       filter;
     * QA: a label's edit history, and a check for labels drawn outside any declared
-      exhaustive survey extent.
+      exhaustive survey extent;
+    * a one-time bootstrap that publishes the vector layers already open in the project as
+      the founding dataset, previewing the class mapping, the damaged names and the missing
+      survey coverage before anything is sent.
     .
     Licensed under GPL v2 or later, as required for QGIS plugins. No credentials, imagery or
     deployment hostnames are distributed with this plugin - the backend URL is a user setting.

@@ -123,20 +123,27 @@ def plugin_layers(project: QgsProject | None = None) -> list[QgsVectorLayer]:
 
 
 def find_layer_with_fields(
-    required: Iterable[str], project: QgsProject | None = None
+    required: Iterable[str],
+    project: QgsProject | None = None,
+    excluding: Iterable[str] = (),
 ) -> QgsVectorLayer | None:
-    """First plugin layer carrying all of `required`.
+    """First plugin layer carrying all of `required` and none of `excluding`.
 
     Layers are identified by the fields they expose, not by collection name. A deployment
     is free to call its collections whatever it likes, and this way the QA tools keep
     working when it does -- the field names themselves come from the registry, so even
     those are not compiled in.
+
+    `excluding` exists because "carries these fields" is not always discriminating on its
+    own; see :func:`find_label_layer`.
     """
     wanted = {name for name in required if name}
+    unwanted = {name for name in excluding if name}
     if not wanted:
         return None
     for layer in plugin_layers(project):
-        if wanted.issubset({field.name() for field in layer.fields()}):
+        names = {field.name() for field in layer.fields()}
+        if wanted.issubset(names) and not (unwanted & names):
             return layer
     return None
 
@@ -144,8 +151,21 @@ def find_layer_with_fields(
 def find_label_layer(
     registry: ClassRegistry, project: QgsProject | None = None
 ) -> QgsVectorLayer | None:
-    """The layer holding labels: it has both an identity and a class."""
-    return find_layer_with_fields((registry.fields.label_id, registry.fields.class_id), project)
+    """The layer holding labels: it has both an identity and a class.
+
+    The audit collection has both too -- ``label_history`` is keyed on the same
+    ``label_id`` and carries the ``class_id`` of each superseded state -- so identity and
+    class alone do not tell the two apart, and ``QgsProject.mapLayers()`` returns them in
+    an order nobody controls. Picking the audit layer would silently run the coverage
+    check over every historical revision of every label, counting a label once per edit
+    and classifying geometry that is no longer on the map. Excluding the transaction-time
+    columns is what makes the choice deterministic.
+    """
+    return find_layer_with_fields(
+        (registry.fields.label_id, registry.fields.class_id),
+        project,
+        excluding=(registry.fields.history_id, registry.fields.operation),
+    )
 
 
 def find_extent_layer(
