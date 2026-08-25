@@ -48,6 +48,37 @@ def encode_datasource_uri(params: Mapping[str, object]) -> str:
     return " ".join(parts)
 
 
+#: URI parameter prefix the WFS/OAPIF provider reads extra request headers from. One key
+#: per header: ``http-header:X-Track='production'``.
+HTTP_HEADER_PREFIX = "http-header:"
+
+
+def header_params(headers: Mapping[str, str] | None) -> dict[str, str]:
+    """Render a header mapping as ``http-header:`` URI parameters.
+
+    WHY A HEADER GOES IN THE URI AT ALL
+
+    Because the native OAPIF provider makes the requests, not this plugin -- including the
+    Part 4 writes -- so anything that has to ride on every one of them must be somewhere
+    the *provider* will look. There are exactly two such places: the ``authcfg``
+    credential, and these.
+
+    That matters for history tracks specifically. The track has to reach the auth edge on
+    every read and every write, and putting it here means it is part of the layer's own
+    data source: a layer cannot be pointed at the wrong track by a stale setting, and a
+    saved ``.qgz`` reopens on the track it was saved on rather than on whatever the person
+    who opens it happens to have selected.
+
+    Empty values are dropped rather than sent blank -- a blank ``X-Track`` is not "no
+    track", it is a header the edge has to decide what to do with.
+    """
+    return {
+        f"{HTTP_HEADER_PREFIX}{name}": value
+        for name, value in (headers or {}).items()
+        if name and value
+    }
+
+
 def build_oapif_uri(
     *,
     landing_url: str,
@@ -56,6 +87,7 @@ def build_oapif_uri(
     page_size: int | None = None,
     restrict_to_request_bbox: bool = True,
     cql_filter: str | None = None,
+    headers: Mapping[str, str] | None = None,
 ) -> str:
     """Build the data-source URI for one OGC API - Features collection.
 
@@ -77,6 +109,9 @@ def build_oapif_uri(
         :mod:`.asof` for the specific trap.
     ``authcfg``
         reference into ``qgis-auth.db``. Never a token.
+    ``http-header:*``
+        extra request headers, one parameter each -- see :func:`header_params`. This is
+        how the history track reaches the auth edge on the provider's own requests.
     """
     if not collection_id:
         raise ValueError("collection_id is required")
@@ -87,6 +122,9 @@ def build_oapif_uri(
             "restrictToRequestBBOX": restrict_to_request_bbox,
             "pageSize": page_size if page_size and page_size > 0 else None,
             "filter": cql_filter or None,
+            # Before authcfg, so the credential stays the last thing on the line and is
+            # easy to find by eye in the layer properties dialog.
+            **header_params(headers),
             "authcfg": authcfg or None,
         }
     )

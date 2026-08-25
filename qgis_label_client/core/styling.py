@@ -26,6 +26,9 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from .expressions import identifier, literal
+from .fields import DEFAULT_FIELDS, CoreFields
+
 #: QGIS parses "r,g,b,a" unambiguously in every symbol-layer property.
 _TRANSPARENT = "0,0,0,0"
 
@@ -33,6 +36,16 @@ _DEFAULT_STROKE = "#e0e0e0"
 _DEFAULT_FILL = "#00000000"
 _DEFAULT_WIDTH = 1.0
 _DEFAULT_RADIUS = 3.0
+
+#: Stroke colour for a belief that has since ended -- deleted, or corrected into something
+#: else. An alert colour rather than a class colour, because "we no longer think this" is
+#: not a property of the class and reading it as one would be the whole point missed.
+SUPERSEDED_STROKE = "#a4243b"
+
+#: Opacity of a whole historical layer. One call on the layer rather than a per-symbol
+#: alpha: it survives any renderer, reads as "ghost" at any zoom, and cannot be undone by
+#: a class whose own style block sets an opaque fill.
+HISTORICAL_OPACITY = 0.55
 
 
 def _try_parse_color(text: str) -> tuple[int, int, int, int] | None:
@@ -110,7 +123,7 @@ def _is_opaque_enough_to_draw(colour: str) -> bool:
     return not colour.endswith(",0")
 
 
-def fill_symbol_properties(style: Mapping[str, Any]) -> dict[str, str]:
+def fill_symbol_properties(style: Mapping[str, Any], historical: bool = False) -> dict[str, str]:
     """Simple-fill properties for a polygon class."""
     fill = qgis_color(style.get("fill"), _DEFAULT_FILL)
     stroke = qgis_color(style.get("stroke"), _DEFAULT_STROKE)
@@ -133,10 +146,12 @@ def fill_symbol_properties(style: Mapping[str, Any]) -> dict[str, str]:
         properties["use_custom_dash"] = "1"
         properties["customdash"] = dash
         properties["customdash_unit"] = "Pixel"
+    if historical:
+        properties["outline_style"] = "dash"
     return properties
 
 
-def line_symbol_properties(style: Mapping[str, Any]) -> dict[str, str]:
+def line_symbol_properties(style: Mapping[str, Any], historical: bool = False) -> dict[str, str]:
     """Simple-line properties for a linear class."""
     properties: dict[str, str] = {
         "line_color": qgis_color(style.get("stroke"), _DEFAULT_STROKE),
@@ -151,13 +166,15 @@ def line_symbol_properties(style: Mapping[str, Any]) -> dict[str, str]:
         properties["use_custom_dash"] = "1"
         properties["customdash"] = dash
         properties["customdash_unit"] = "Pixel"
+    if historical:
+        properties["line_style"] = "dash"
     return properties
 
 
-def marker_symbol_properties(style: Mapping[str, Any]) -> dict[str, str]:
+def marker_symbol_properties(style: Mapping[str, Any], historical: bool = False) -> dict[str, str]:
     """Simple-marker properties for a point class."""
     radius = _number(style, "radius", _DEFAULT_RADIUS)
-    return {
+    properties = {
         "name": "circle",
         "color": qgis_color(style.get("fill"), _DEFAULT_STROKE),
         "outline_color": qgis_color(style.get("stroke"), _DEFAULT_STROKE),
@@ -167,6 +184,9 @@ def marker_symbol_properties(style: Mapping[str, Any]) -> dict[str, str]:
         "size": f"{radius * 2:g}",
         "size_unit": "Pixel",
     }
+    if historical:
+        properties["outline_style"] = "dash"
+    return properties
 
 
 #: Which symbol builder a class's ``geom_type`` needs. Keyed on the values
@@ -186,11 +206,42 @@ def symbol_kind(geom_type: str) -> str:
     return GEOMETRY_KIND.get(geom_type, "fill")
 
 
-def symbol_properties(geom_type: str, style: Mapping[str, Any]) -> dict[str, str]:
-    """Symbol properties appropriate to the class's geometry type."""
+def symbol_properties(
+    geom_type: str, style: Mapping[str, Any], historical: bool = False
+) -> dict[str, str]:
+    """Symbol properties appropriate to the class's geometry type.
+
+    `historical` dashes the stroke, and nothing else. A dashed boundary is the strongest
+    "not editable" convention in GIS and it costs one property; the class colours stay
+    exactly as they are, because a historical layer is still a labels layer and the colours
+    are how people read it. Changing them would make the two layers harder to compare,
+    which is the entire reason both are open at once.
+    """
     kind = symbol_kind(geom_type)
     if kind == "marker":
-        return marker_symbol_properties(style)
+        return marker_symbol_properties(style, historical)
     if kind == "line":
-        return line_symbol_properties(style)
-    return fill_symbol_properties(style)
+        return line_symbol_properties(style, historical)
+    return fill_symbol_properties(style, historical)
+
+
+def superseded_stroke_expression(
+    style: Mapping[str, Any], fields: CoreFields = DEFAULT_FIELDS
+) -> str:
+    """A QGIS expression colouring a stroke by whether the belief has since ended.
+
+    Applied as a DATA-DEFINED PROPERTY on the ordinary categorized symbols rather than by
+    rebuilding the class categories as sub-rules of a rule-based renderer. Two reasons, and
+    the first is the one that decides it: data-defined properties are plain QGIS symbology,
+    so they survive the ``exportNamedStyle``/``importNamedStyle`` round trip
+    :func:`..layers.repoint_layer` performs on every re-point -- a track switch or an as-of
+    change would otherwise silently strip the distinction. The second is that a rule-based
+    renderer would mean rebuilding every category as a pair of rules, which is a great deal
+    more code for the same three visual states.
+
+    The class colour is passed through unchanged, so a class that is retired or restyled on
+    the server keeps looking like itself here.
+    """
+    stroke = qgis_color(style.get("stroke"), _DEFAULT_STROKE)
+    alert = qgis_color(SUPERSEDED_STROKE, _DEFAULT_STROKE)
+    return f"if({identifier(fields.superseded)}, {literal(alert)}, {literal(stroke)})"
