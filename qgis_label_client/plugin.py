@@ -35,7 +35,6 @@ from . import auth, client, imagery, qa
 from . import layers as layer_tools
 from . import publish as publish_tools
 from .core import recorded
-from .validtime import register_functions, unregister_functions
 from .core.asof import AsOfMechanism, describe
 from .core.collections import Collection
 from .core.errors import LabelClientError
@@ -50,6 +49,7 @@ from .log import log, log_error, log_warning
 from .publishdialog import PublishDialog, PublishReportDialog
 from .settings import PluginSettings
 from .tasks import TaskRunner
+from .validtime import register_functions, unregister_functions
 
 MENU_NAME = "&CVI Label Client"
 PLUGIN_DIR = os.path.dirname(__file__)

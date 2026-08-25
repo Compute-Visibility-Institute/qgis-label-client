@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
 from qgis_label_client.core.validtime import (
     MEMORY_LIMIT,
     RECENT_LIMIT,
@@ -177,7 +175,7 @@ def test_reverting_an_override_goes_back_to_the_scene() -> None:
 
 
 def test_reverting_with_no_dated_imagery_says_so_rather_than_pretending() -> None:
-    """"Attempts to auto find it" -- and it can fail. A button that silently does nothing is worse."""
+    """ "Attempts to auto find it" -- and it can fail. A button that silently does nothing is worse."""
     stack = RasterStack.of([basemap()])
     memory = remember(None, resolve(stack), MARCH)
     _, resolved = revert_override(memory, stack)

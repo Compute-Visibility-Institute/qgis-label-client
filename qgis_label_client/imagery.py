@@ -120,9 +120,7 @@ def refresh_sources(
             # date belonging to the scene this layer USED to show would produce a
             # confidently wrong default rather than an absent one.
             if rewrite.asset.captured_at is not None:
-                layer.setCustomProperty(
-                    CAPTURED_AT_PROPERTY, rewrite.asset.captured_at.isoformat()
-                )
+                layer.setCustomProperty(CAPTURED_AT_PROPERTY, rewrite.asset.captured_at.isoformat())
             else:
                 layer.removeCustomProperty(CAPTURED_AT_PROPERTY)
             applied += 1

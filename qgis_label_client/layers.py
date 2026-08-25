@@ -78,7 +78,6 @@ from .core import asof, recorded, styling
 from .core import tracks as track_tools
 from .core.asof import AsOfMechanism
 from .core.errors import BackendError
-from .validtime import install_default
 from .core.expressions import all_of, identifier
 from .core.fields import DEFAULT_FIELDS
 from .core.registry import ClassRegistry, LabelClass
@@ -87,6 +86,7 @@ from .core.uri import build_oapif_uri
 from .core.urls import normalise_base_url, with_query
 from .log import log, log_warning
 from .settings import PluginSettings
+from .validtime import install_default
 
 #: Marks a layer as created by this plugin, and records which collection it shows.
 COLLECTION_PROPERTY = "cvi/collection_id"
