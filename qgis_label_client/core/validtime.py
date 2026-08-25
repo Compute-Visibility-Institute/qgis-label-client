@@ -143,10 +143,7 @@ class RasterStack:
         is being traced, so it must change the fingerprint even though the same two
         layers are loaded.
         """
-        parts = [
-            f"{layer.layer_id}@{_iso(layer.captured_at) or '-'}"
-            for layer in self.layers
-        ]
+        parts = [f"{layer.layer_id}@{_iso(layer.captured_at) or '-'}" for layer in self.layers]
         return "|".join(parts)
 
 
@@ -289,9 +286,7 @@ def remember(
     overridden = baseline is None or not _same_instant(chosen, baseline)
 
     entries = [
-        (key, decision)
-        for key, decision in memory.by_stack
-        if key != resolution.fingerprint
+        (key, decision) for key, decision in memory.by_stack if key != resolution.fingerprint
     ]
     entries.insert(0, (resolution.fingerprint, Decision(chosen, overridden)))
 
@@ -315,9 +310,7 @@ def revert_override(memory: Memory | None, stack: RasterStack) -> tuple[Memory, 
     """
     memory = memory or Memory()
     fingerprint = stack.fingerprint()
-    kept = tuple(
-        (key, decision) for key, decision in memory.by_stack if key != fingerprint
-    )
+    kept = tuple((key, decision) for key, decision in memory.by_stack if key != fingerprint)
     pruned = Memory(by_stack=kept, recent=memory.recent)
     return pruned, resolve(stack, pruned)
 
@@ -411,9 +404,7 @@ def _push_recent(
     """Most-recent-first, de-duplicated by instant, bounded."""
     out = [value]
     for item in recent:
-        if not _same_instant(item, value) and not any(
-            _same_instant(item, seen) for seen in out
-        ):
+        if not _same_instant(item, value) and not any(_same_instant(item, seen) for seen in out):
             out.append(item)
     return tuple(out[:limit])
 

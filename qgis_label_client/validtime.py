@@ -158,9 +158,7 @@ def revert(project: QgsProject | None = None) -> Resolution:
     return resolution
 
 
-def install_default(
-    layer: QgsVectorLayer, fields: CoreFields = DEFAULT_FIELDS
-) -> bool:
+def install_default(layer: QgsVectorLayer, fields: CoreFields = DEFAULT_FIELDS) -> bool:
     """Make new features arrive with ``valid_from`` already proposed.
 
     ``applyOnUpdate=False`` is load-bearing. With it true the expression would re-evaluate
@@ -207,7 +205,7 @@ def _valid_from_function():  # pragma: no cover - requires a running QGIS
     from qgis.core import qgsfunction
 
     @qgsfunction(args=0, group="CVI", register=False, usesGeometry=False)
-    def cvi_valid_from(values, feature, parent):  # noqa: ARG001
+    def cvi_valid_from(values, feature, parent):
         """When the label being drawn was true on the ground.
 
         Defaults to the acquisition time of the topmost visible imagery, carries the
