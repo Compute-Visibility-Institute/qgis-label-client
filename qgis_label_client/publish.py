@@ -379,12 +379,18 @@ def stamp_published(
     report: PublishReport,
     collection_id: str,
     project: QgsProject | None = None,
+    track: str = "",
 ) -> None:
     """Record on each layer that it has been published. Main thread only.
 
     Written after the run rather than before, and written even for a partial run, because
     the warning it produces next time is "some of this is already up there" -- which is
     exactly the state a partial run leaves behind.
+
+    The track is recorded with it, because "already published" is only a warning about a
+    duplicate when the second publish would go to the same dataset. Publishing the same
+    shapefile into a test track and then into the analysts' track is not a duplicate, it
+    is the normal way a test dataset gets populated.
 
     The project is marked dirty afterwards. A custom property is in memory until the
     project file is saved, and QGIS does not treat a plugin setting one as a change worth
@@ -406,7 +412,12 @@ def stamp_published(
         layer: QgsMapLayer | None = project.mapLayer(plan.source.layer_id)
         if layer is None:
             continue
-        previous = plan.source.previous.feature_count if plan.source.previous else 0
+        # Only counts published to the SAME track accumulate. A layer sent to a test
+        # track and then to the analysts' track has not been published twice into either,
+        # and adding the two would make the next preview warn about a duplicate that does
+        # not exist -- which is how a warning stops being read.
+        previous = plan.source.previous
+        carried = previous.feature_count if previous and not previous.on_another_track(track) else 0
         layer.setCustomProperty(
             PUBLISHED_PROPERTY,
             format_record(
@@ -414,7 +425,8 @@ def stamp_published(
                     published_at=published_at,
                     collection_id=collection_id,
                     class_id=outcome.class_id,
-                    feature_count=previous + outcome.published,
+                    feature_count=carried + outcome.published,
+                    track=track or report.track,
                 )
             ),
         )
@@ -439,6 +451,18 @@ class PublishRequest:
     layers: list[PreparedLayer] = field(default_factory=list)
     extent_collection: str = ""
     fields: CoreFields = field(default_factory=CoreFields)
+    #: History track name, sent as ``X-Track`` on every request this run makes.
+    #:
+    #: A NAME, never a ``track_id`` in the feature body. ``label.track_id`` defaults to
+    #: ``app.writable_track_id()``, resolved server-side from this header, and the write
+    #: policy would refuse a client-supplied value anyway. Sending a name asks; sending an
+    #: id would be a client asserting which dataset a row joins, which is exactly the
+    #: decision row-level security exists to take away from it.
+    #:
+    #: Empty means "name no track", which the edge refuses for a write with 403 NoTrack --
+    #: correctly. :func:`publish` refuses first, so the refusal is a sentence rather than
+    #: 1,246 identical HTTP errors.
+    track: str = ""
     #: How many times one feature is re-offered after the edge asks us to slow down.
     #: Only a 429 is retried; see :func:`_send_one`.
     max_throttle_retries: int = 6
@@ -501,7 +525,12 @@ def _send_one(
             return 0, None
         try:
             client.create_feature(
-                request.base_url, request.collection_id, feature, request.authcfg, feedback
+                request.base_url,
+                request.collection_id,
+                feature,
+                request.authcfg,
+                feedback,
+                track=request.track,
             )
         except BackendError as exc:
             if feedback is not None and feedback.isCanceled():
@@ -658,7 +687,12 @@ def _declare_extent(
     }
     try:
         client.create_feature(
-            request.base_url, request.extent_collection, feature, request.authcfg, feedback
+            request.base_url,
+            request.extent_collection,
+            feature,
+            request.authcfg,
+            feedback,
+            track=request.track,
         )
     except BackendError as exc:
         return False, f"the survey extent was refused by the server: {exc}"
@@ -779,8 +813,17 @@ def publish(request: PublishRequest, feedback: QgsFeedback | None = None) -> Pub
         raise ConfigurationError("No backend URL configured.")
     if not request.collection_id:
         raise ConfigurationError("No collection chosen to publish into.")
+    if not request.track:
+        # Refused here as well as in the preview, and the reason is the same one that put
+        # the URL and collection checks here: this function is reachable without the
+        # dialog. The alternative is 1,246 identical 403s, each of which has already
+        # cost a round trip, and a report that reads like a backend outage.
+        raise ConfigurationError(
+            "No history track selected, so there is no way to say which dataset these "
+            "features would join. Choose a track in the panel before publishing."
+        )
 
-    report = PublishReport()
+    report = PublishReport(track=request.track)
     progress = _Progress(total=request.total_features(), feedback=feedback)
     for prepared in request.layers:
         # The extent POST is inside the same guard as the features, because it has the

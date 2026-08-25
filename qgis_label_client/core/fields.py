@@ -38,6 +38,17 @@ class CoreFields:
     label_id: str = "label_id"
     class_id: str = "class_id"
 
+    # --- history track ---------------------------------------------------------
+    # The THIRD axis, and as much a part of the stable core as label_id is: valid time
+    # says when a thing was true, transaction time says when we believed it, and this
+    # says which "we". Server-assigned from app.writable_track_id() and immutable -- a
+    # label cannot be moved between tracks, because its label_id is what every
+    # label_history row is keyed on and moving it would merge two audit chains.
+    #
+    # Readable rather than hidden, for exactly the reason label_id is: a client that
+    # cannot see the value cannot notice when it is wrong.
+    track_id: str = "track_id"
+
     # --- flexible metadata containers -----------------------------------------
     # The containers are fixed; their contents are not. Nothing below indexes into them.
     attrs: str = "attrs"
@@ -62,6 +73,32 @@ class CoreFields:
     reason: str = "reason"
     recorded_from: str = "recorded_from"
     recorded_to: str = "recorded_to"
+
+    # --- v_label_asof: the transaction-time view --------------------------------
+    # The historical-view collection (:mod:`.recorded`) mirrors the live label view and
+    # adds these. They are named here, not in .recorded, because a deployment renames a
+    # view column by sending a `fields` block -- the same escape hatch every other column
+    # above has, and a historical layer is exactly as much a deployment's own shape.
+    #
+    # asof_id is the OAPIF feature id of that collection and IS a property there, unlike
+    # the live collection's surrogate id: as-of rows come from the live table UNION the
+    # history table, two id spaces that would collide, so identity is `label_id` plus the
+    # start of the valid range.
+    asof_id: str = "asof_id"
+    # Transaction-time bounds. TEXT on the wire rather than timestamps, and that is a
+    # correctness requirement rather than a formatting choice -- see .recorded and
+    # docs/read-path.md: QGIS's Part 1 filter compiler decides whether to emit `datetime=`
+    # from the FIELD'S TYPE, so a subset filter on a DateTime-typed transaction-time column
+    # would compile to `datetime=` and be applied by the server to VALID time. Wrong axis,
+    # silently, with a plausible result.
+    belief_from: str = "belief_from"
+    belief_to: str = "belief_to"
+    # True where the belief has since ended -- deleted OR corrected. What the historical
+    # layer's styling keys on.
+    superseded: str = "superseded"
+    # The instant the view actually resolved at, echoed on every row. The canary: see
+    # .recorded.canary_filter.
+    recorded_at: str = "recorded_at"
 
     # --- labeled_extent ---------------------------------------------------------
     extent_id: str = "extent_id"

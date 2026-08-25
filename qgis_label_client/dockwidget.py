@@ -17,15 +17,16 @@ pairing visible in one place.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from datetime import date
+from datetime import date, datetime, timezone
 
 from qgis.gui import QgsCollapsibleGroupBox
-from qgis.PyQt.QtCore import QDate, Qt, pyqtSignal
+from qgis.PyQt.QtCore import QDate, QDateTime, Qt, QTime, pyqtSignal
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDateEdit,
+    QDateTimeEdit,
     QDockWidget,
     QFormLayout,
     QHBoxLayout,
@@ -40,17 +41,39 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
 )
 
+from .core import recorded
 from .core.asof import AsOfMechanism
 from .core.collections import Collection
 from .core.registry import ClassRegistry
+from .core.tracks import Track
 from .settings import PLACEHOLDER_API_URL
 
 #: Item data role carrying a collection id on a list row.
 COLLECTION_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 
 
+def _as_qdatetime(moment: datetime) -> QDateTime:
+    """A ``QDateTime`` whose displayed components are `moment`'s UTC ones.
+
+    Deliberately built with no time spec, so the widget holds a plain wall-clock value that
+    is *labelled* UTC rather than a UTC-aware value Qt might convert on display. Two
+    reasons: :meth:`LabelClientDock.recorded_at` reads the components straight back, so a
+    conversion in either direction could only introduce an offset; and Qt 6.9 deprecated
+    the time-spec form of this constructor in favour of one taking a ``QTimeZone``, which
+    Qt 5 does not have -- this plugin has to build against both.
+    """
+    utc = moment.astimezone(timezone.utc)
+    return QDateTime(QDate(utc.year, utc.month, utc.day), QTime(utc.hour, utc.minute, utc.second))
+
+
 class LabelClientDock(QDockWidget):
-    """Connection, collections, imagery, as-of and QA, in one persistent panel."""
+    """Connection, collections, imagery, both time axes and QA, in one persistent panel.
+
+    THE TWO TIME CONTROLS ARE TWO BOXES, and that is a design decision rather than a
+    layout one. "As-of date (valid time)" asks what was true on the ground; "Historical
+    view (transaction time)" asks what the team believed. Merging them into one control
+    with a mode switch would hide the single most important thing about the pair.
+    """
 
     connectRequested = pyqtSignal()
     signInRequested = pyqtSignal()
@@ -58,9 +81,14 @@ class LabelClientDock(QDockWidget):
     loadLayersRequested = pyqtSignal(list)
     refreshImageryRequested = pyqtSignal()
     asOfApplied = pyqtSignal()
+    #: The transaction-time axis. Carries the rendered wire instant rather than a QDateTime
+    #: so that the conversion happens exactly once, in core.recorded.instant, and the panel
+    #: and the layer cannot disagree about what was asked for.
+    recordedViewRequested = pyqtSignal(str)
     historyRequested = pyqtSignal()
     coverageRequested = pyqtSignal()
     publishRequested = pyqtSignal()
+    trackChanged = pyqtSignal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("CVI Label Client", parent)
@@ -68,6 +96,11 @@ class LabelClientDock(QDockWidget):
         # Set before the groups are built: _build_vocabulary_group connects a signal that
         # can fire during construction.
         self._registry: ClassRegistry | None = None
+        self._tracks: list[Track] = []
+        # Guards the track combo the same way _refreshing guards the publish dialog:
+        # repopulating it emits currentIndexChanged, and letting that reach the controller
+        # would re-point every layer as a side effect of a refresh.
+        self._loading_tracks = False
         # Remembered so set_busy can re-enable only what set_connected allows.
         self._connected = False
         self.setAllowedAreas(
@@ -81,10 +114,26 @@ class LabelClientDock(QDockWidget):
         layout.setContentsMargins(8, 8, 8, 8)
 
         layout.addWidget(self._build_connection_group(container))
+        # Above Collections, because it scopes everything below it. A collection list read
+        # without knowing which dataset it belongs to is a list of names.
+        layout.addWidget(self._build_track_group(container))
         layout.addWidget(self._build_collections_group(container))
         layout.addWidget(self._build_bootstrap_group(container))
         layout.addWidget(self._build_imagery_group(container))
         layout.addWidget(self._build_asof_group(container))
+        # Immediately below, and never inside it. Two time axes, two boxes -- see
+        # _build_recorded_group.
+        layout.addWidget(self._build_recorded_group(container))
+
+        # Directly under both time controls, because it is about both of them.
+        self.axes_label = QLabel("", container)
+        self.axes_label.setWordWrap(True)
+        self.axes_label.setToolTip(
+            "Valid time is when a label was true on the ground. Transaction time is when "
+            "the team believed it. Both are always in force, so both are always named."
+        )
+        layout.addWidget(self.axes_label)
+
         layout.addWidget(self._build_qa_group(container))
         layout.addWidget(self._build_vocabulary_group(container))
 
@@ -136,6 +185,42 @@ class LabelClientDock(QDockWidget):
         self.sign_out_button.clicked.connect(self.signOutRequested)
         self.connect_button.clicked.connect(self.connectRequested)
         return group
+
+    def _build_track_group(self, parent: QWidget) -> QWidget:
+        """The dataset selector, and the banner that keeps saying which one it is.
+
+        NOT COLLAPSIBLE-BY-DEFAULT, and the banner is outside the combo rather than being
+        the combo's own text. Both for the same reason: the track is the piece of state
+        that is most expensive to be wrong about and least visible while you are drawing.
+        An annotator spends an afternoon in the map canvas, not in this panel, and the
+        thing they need on screen is not a control -- it is an answer.
+        """
+        group = QgsCollapsibleGroupBox("History track", parent)
+        layout = QVBoxLayout(group)
+
+        hint = QLabel(
+            "An isolated dataset. Labels drawn on one track are invisible from another, "
+            "and the database enforces that - this panel only chooses which one you are "
+            "in. Track names come from the backend; none is built into the plugin.",
+            group,
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.track_combo = QComboBox(group)
+        self.track_combo.currentIndexChanged.connect(self._emit_track_changed)
+        layout.addWidget(self.track_combo)
+
+        self.track_banner = QLabel("Not connected.", group)
+        self.track_banner.setWordWrap(True)
+        self.track_banner.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(self.track_banner)
+        return group
+
+    def _emit_track_changed(self) -> None:
+        if self._loading_tracks:
+            return
+        self.trackChanged.emit(self.selected_track())
 
     def _build_collections_group(self, parent: QWidget) -> QWidget:
         group = QgsCollapsibleGroupBox("Collections", parent)
@@ -251,6 +336,85 @@ class LabelClientDock(QDockWidget):
         self.asof_mechanism.setEnabled(False)
         return group
 
+    def _build_recorded_group(self, parent: QWidget) -> QWidget:
+        """The transaction-time control: what the team BELIEVED at a chosen instant.
+
+        A SECOND, SEPARATE BOX, never a mode of the one above it. The two answer different
+        questions -- "what was true on the ground" and "what did we think" -- and a single
+        control with a mode switch would make the most important thing about this feature
+        (that they are different) into the least visible thing about it.
+
+        The vocabulary is kept disjoint for the same reason. This box says **believed**; the
+        box above says **as-of**. If both said "as of", a screenshot of the panel would not
+        say which axis produced the map.
+
+        IT ADDS A LAYER; it does not re-point the ones already loaded, unlike the as-of
+        control. That is the whole use case: the live layer and a historical one open at
+        once, and two historical ones at different instants if you want to compare beliefs.
+        """
+        group = QgsCollapsibleGroupBox("Historical view (transaction time)", parent)
+        layout = QVBoxLayout(group)
+
+        hint = QLabel(
+            "Adds a layer showing the labels <i>as the team believed them</i> at one "
+            "instant - including labels deleted since, and the geometry of labels edited "
+            "since. This is transaction time; the box above is valid time, which is a "
+            "different question.",
+            group,
+        )
+        hint.setWordWrap(True)
+        hint.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(hint)
+
+        self.recorded_enabled = QCheckBox("Pin a historical layer to an instant", group)
+        layout.addWidget(self.recorded_enabled)
+
+        form = QFormLayout()
+        self.recorded_datetime = QDateTimeEdit(group)
+        self.recorded_datetime.setCalendarPopup(True)
+        # Seconds shown, because the wire format has them and a picker that hides them
+        # would let two different instants look identical in the UI.
+        self.recorded_datetime.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self.recorded_datetime.setToolTip(
+            "UTC. An instant in the future is refused: the belief set at a future time is "
+            "simply the current one, so the layer would be full of features under a "
+            "caption asserting something nobody has ever believed."
+        )
+        form.addRow("Instant (UTC)", self.recorded_datetime)
+        layout.addLayout(form)
+
+        self.add_recorded_button = QPushButton("Add historical layer", group)
+        self.add_recorded_button.clicked.connect(self._emit_recorded_view)
+        layout.addWidget(self.add_recorded_button)
+
+        note = QLabel(
+            "<b>Read-only.</b> A past belief is a record, not a draft, so QGIS greys the "
+            "pencil out on this layer - that is not a fault. Adds a layer; it does not "
+            "change the layers you already have.",
+            group,
+        )
+        note.setWordWrap(True)
+        note.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(note)
+
+        self.recorded_floor_label = QLabel("", group)
+        self.recorded_floor_label.setWordWrap(True)
+        layout.addWidget(self.recorded_floor_label)
+
+        self.recorded_enabled.toggled.connect(self.recorded_datetime.setEnabled)
+        self.recorded_enabled.toggled.connect(self._sync_recorded_button)
+        self.recorded_datetime.setEnabled(False)
+        self.add_recorded_button.setEnabled(False)
+        return group
+
+    def _sync_recorded_button(self) -> None:
+        self.add_recorded_button.setEnabled(self._connected and self.recorded_enabled.isChecked())
+
+    def _emit_recorded_view(self) -> None:
+        moment = self.recorded_at()
+        if moment:
+            self.recordedViewRequested.emit(moment)
+
     def _build_qa_group(self, parent: QWidget) -> QWidget:
         group = QgsCollapsibleGroupBox("QA", parent)
         layout = QVBoxLayout(group)
@@ -310,6 +474,10 @@ class LabelClientDock(QDockWidget):
             self.coverage_button,
         ):
             widget.setEnabled(connected)
+        # Gated on the checkbox as well as the connection: it is the one button here that
+        # adds a layer rather than changing one, and it sits next to "Apply to loaded
+        # layers" on the other axis.
+        self._sync_recorded_button()
 
     def set_busy(self, busy: bool) -> None:
         self.connect_button.setEnabled(not busy)
@@ -359,6 +527,74 @@ class LabelClientDock(QDockWidget):
         if index >= 0:
             self.asof_mechanism.setCurrentIndex(index)
 
+    # --- the transaction-time axis --------------------------------------------
+
+    def recorded_at(self) -> str:
+        """The picked instant in wire form, or ``""`` when the control is off.
+
+        Rendered here and nowhere else in the UI, so the header, the canary and the layer
+        name all descend from one conversion. The widget's components are *read as UTC*,
+        which is what the field label promises -- see :func:`_as_qdatetime` for why the
+        widget itself is left in local time.
+        """
+        if not self.recorded_enabled.isChecked():
+            return ""
+        value = self.recorded_datetime.dateTime()
+        day, clock = value.date(), value.time()
+        try:
+            moment = datetime(
+                int(day.year()),
+                int(day.month()),
+                int(day.day()),
+                int(clock.hour()),
+                int(clock.minute()),
+                int(clock.second()),
+                tzinfo=timezone.utc,
+            )
+        except ValueError:
+            return ""
+        return recorded.instant(moment)
+
+    def set_recorded_default(self, moment: str) -> None:
+        """Open the picker on a remembered instant. Does NOT arm the control.
+
+        A remembered default, never a restored state: a ticked box on startup would say a
+        historical layer is in play when none is. The instant a layer is actually a view of
+        lives on that layer, not here.
+        """
+        parsed = recorded.parse_instant(moment) or datetime.now(timezone.utc)
+        self.recorded_datetime.setDateTime(_as_qdatetime(parsed))
+
+    def set_recorded_bounds(self, earliest: str = "", track_name: str = "") -> None:
+        """Constrain the picker to instants the backend can actually answer.
+
+        The ceiling is now: a future instant resolves to the *current* belief set, which is
+        a full layer under a caption asserting something nobody has ever believed.
+
+        The floor is the track's earliest recorded belief, when the backend publishes one.
+        Not because an earlier instant is an error -- "nothing was believed yet" is a
+        correct answer -- but because an empty layer and a broken one look identical, and
+        the cheapest fix is to make the case hard to reach and explain it when it is not.
+        """
+        now = datetime.now(timezone.utc)
+        self.recorded_datetime.setMaximumDateTime(_as_qdatetime(now))
+        floor = recorded.parse_rfc3339(earliest)
+        where = f" on track {track_name}" if track_name else ""
+        if floor is None:
+            self.recorded_floor_label.setText(
+                f"The backend did not say how far back the record{where} goes, so the "
+                "picker has no floor. An instant before the data existed is a valid "
+                "question; the answer is an empty layer."
+            )
+            return
+        self.recorded_datetime.setMinimumDateTime(_as_qdatetime(floor))
+        shown = recorded.display_instant(recorded.instant(floor))
+        self.recorded_floor_label.setText(f"The record{where} starts at {shown}.")
+
+    def set_axes(self, message: str) -> None:
+        """The line that always names both time axes. Composed by the controller."""
+        self.axes_label.setText(message)
+
     def set_collections(
         self, collections: Sequence[Collection], checked: Iterable[str] = ()
     ) -> None:
@@ -389,6 +625,44 @@ class LabelClientDock(QDockWidget):
             for row in range(self.collection_list.count())
             if self.collection_list.item(row).checkState() == Qt.CheckState.Checked
         ]
+
+    def set_tracks(self, tracks: Sequence[Track], selected: str = "") -> None:
+        """Populate the track combo, preserving the selection where it still exists.
+
+        A stored track that the backend no longer offers is **not** silently replaced by
+        the default. It is shown as missing, with nothing selected, because answering a
+        request for one dataset from another is the contamination failure in reverse: you
+        would conclude the track you asked for was empty.
+        """
+        self._tracks = list(tracks)
+        self._loading_tracks = True
+        try:
+            self.track_combo.clear()
+            for track in self._tracks:
+                self.track_combo.addItem(track.describe(), track.name)
+                tooltip = [f"name: {track.name}"]
+                if track.track_id:
+                    tooltip.append(f"track_id: {track.track_id}")
+                if track.description:
+                    tooltip.append(track.description)
+                if track.warning():
+                    tooltip.append(track.warning())
+                self.track_combo.setItemData(
+                    self.track_combo.count() - 1,
+                    "\n".join(tooltip),
+                    int(Qt.ItemDataRole.ToolTipRole),
+                )
+            index = self.track_combo.findData(selected) if selected else -1
+            self.track_combo.setCurrentIndex(index)
+        finally:
+            self._loading_tracks = False
+
+    def selected_track(self) -> str:
+        return str(self.track_combo.currentData() or "")
+
+    def set_track_banner(self, message: str) -> None:
+        """The persistent "you are here" line. Set by the controller, never derived here."""
+        self.track_banner.setText(message)
 
     def set_registry(self, registry: ClassRegistry | None) -> None:
         # Assign before clearing: clear() emits currentIndexChanged, and _show_class_help

@@ -88,3 +88,15 @@ def collection_url(base_url: str, collection_id: str) -> str:
 def items_url(base_url: str, collection_id: str) -> str:
     """Items endpoint for one collection."""
     return join_segments(base_url, "collections", collection_id, "items")
+
+
+def tracks_url(base_url: str, tracks_path: str) -> str:
+    """The backend's history-track list.
+
+    Not an OGC endpoint -- "which isolated datasets does this deployment hold?" is not a
+    features question -- so the path is a setting, exactly like the class registry's, and
+    lives under the backend's own ``v1/`` namespace. Everything outside that prefix is
+    proxied verbatim to the feature service, so a path without it comes back as an OAPIF
+    error about an unknown collection and points at the wrong component entirely.
+    """
+    return join_path(base_url, tracks_path)

@@ -44,16 +44,29 @@ class HistoryDialog(QDialog):
         label_id: str,
         entries: Sequence[HistoryEntry],
         parent: QWidget | None = None,
+        track: str = "",
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Label history")
+        # The track is in the title, because an audit trail read from the wrong dataset is
+        # the most convincing wrong answer this plugin can give: the rows look exactly
+        # like an audit trail, and their absence looks exactly like a label nobody edited.
+        self.setWindowTitle(f"Label history - track {track}" if track else "Label history")
         self.setMinimumSize(820, 400)
 
         layout = QVBoxLayout(self)
 
+        # Three dimensions, named in one sentence, because this dialog is where they are
+        # most easily confused: `recorded` is when we believed it, `valid` is when it was
+        # true, and the track is WHICH "we" -- and label_history is scoped to one track by
+        # row-level security, so this list is that track's beliefs and no other's.
+        where = (
+            f" on history track <b>{track}</b>"
+            if track
+            else " on the deployment's default history track"
+        )
         heading = QLabel(
             f"<b>{len(entries)}</b> recorded belief(s) for label "
-            f"<code>{label_id}</code>.<br/>"
+            f"<code>{label_id}</code>{where}.<br/>"
             "<i>Recorded to</i> is empty for the belief currently in force. "
             "This is transaction time - when we believed it - not when it was true on "
             "the ground."

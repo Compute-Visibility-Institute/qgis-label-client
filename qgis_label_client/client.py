@@ -10,10 +10,21 @@ Only two of these are not standard OGC API - Features:
   creates, both also spoken by QGIS's native provider;
 * the class registry, which has no OGC equivalent because "here is the JSON Schema for
   each class" is not a features question;
+* the history-track list, likewise: "which isolated datasets does this deployment hold?"
+  is not one either;
 * signed imagery URLs, likewise.
 
-The two custom endpoints are configurable paths rather than constants, so a deployment
+The three custom endpoints are configurable paths rather than constants, so a deployment
 can mount them wherever it likes.
+
+EVERY CALL TAKES A TRACK, AND SENDS IT
+
+``track`` is threaded through to :func:`~.network.request_json` and
+:func:`~.network.post_json`, which set ``X-Track``. Empty means "name no track", which the
+edge answers from the deployment default -- correct for a read, and refused for a write,
+which is the edge's decision rather than this module's. The two calls that are shared
+between tracks by design (the class registry, signed imagery URLs) take it anyway, so that
+the audit line on the edge can say who asked for what while working on which dataset.
 
 The creates at the bottom exist for the bootstrap publish only. Ordinary editing goes
 through the native provider's Part 4 support, where QGIS already owns the edit buffer,
@@ -34,15 +45,32 @@ from .core.assets import SignedAsset, parse_signed_assets
 from .core.collections import Collection, parse_collections
 from .core.history import HistoryEntry, parse_history
 from .core.registry import ClassRegistry, parse_registry
+from .core.tracks import Track, parse_tracks
 from .network import post_json, request_json
 
 
 def fetch_collections(
-    base_url: str, authcfg: str, feedback: QgsFeedback | None = None
+    base_url: str, authcfg: str, feedback: QgsFeedback | None = None, track: str = ""
 ) -> list[Collection]:
     """List the collections the backend serves."""
     url = urls.collections_url(base_url)
-    return parse_collections(request_json(url, authcfg=authcfg, feedback=feedback))
+    return parse_collections(request_json(url, authcfg=authcfg, feedback=feedback, track=track))
+
+
+def fetch_tracks(
+    base_url: str,
+    tracks_path: str,
+    authcfg: str,
+    feedback: QgsFeedback | None = None,
+) -> list[Track]:
+    """List the history tracks this deployment holds.
+
+    Deliberately sends no ``X-Track``: this is the call that asks *which tracks exist*, and
+    scoping it to one would be circular. The edge answers it from the principal's own
+    permissions.
+    """
+    url = urls.tracks_url(base_url, tracks_path)
+    return parse_tracks(request_json(url, authcfg=authcfg, feedback=feedback))
 
 
 def fetch_registry(
@@ -50,10 +78,18 @@ def fetch_registry(
     registry_path: str,
     authcfg: str,
     feedback: QgsFeedback | None = None,
+    track: str = "",
 ) -> ClassRegistry:
-    """Fetch and parse the class registry."""
+    """Fetch and parse the class registry.
+
+    The registry is SHARED between tracks and must stay that way: the same vocabulary
+    describes both datasets, and two registries would drift -- which is the exact defect
+    this platform exists to fix. The track is sent for attribution, not for scoping.
+    """
     url = urls.join_path(base_url, registry_path)
-    return parse_registry(request_json(url, authcfg=authcfg, feedback=feedback), source_url=url)
+    return parse_registry(
+        request_json(url, authcfg=authcfg, feedback=feedback, track=track), source_url=url
+    )
 
 
 def fetch_signed_assets(
@@ -62,6 +98,7 @@ def fetch_signed_assets(
     authcfg: str,
     feedback: QgsFeedback | None = None,
     capture_ids: list[str] | None = None,
+    track: str = "",
 ) -> tuple[list[SignedAsset], Any]:
     """Mint fresh signed imagery URLs.
 
@@ -71,7 +108,10 @@ def fetch_signed_assets(
     url = urls.join_path(base_url, signed_urls_path)
     if capture_ids:
         url = urls.with_query(url, {"capture_id": ",".join(capture_ids)})
-    return parse_signed_assets(request_json(url, authcfg=authcfg, feedback=feedback))
+    # Imagery is shared between tracks -- the same 1.1 GB GeoTIFF serves both, because a
+    # capture is a fact about the world and a track is a body of belief about it. Sent for
+    # the edge's audit line only.
+    return parse_signed_assets(request_json(url, authcfg=authcfg, feedback=feedback, track=track))
 
 
 def fetch_history(
@@ -82,6 +122,7 @@ def fetch_history(
     fields_label_id: str,
     limit: int = 200,
     feedback: QgsFeedback | None = None,
+    track: str = "",
 ) -> list[HistoryEntry]:
     """Fetch the audit trail for one label.
 
@@ -94,7 +135,7 @@ def fetch_history(
         urls.items_url(base_url, history_collection),
         {fields_label_id: label_id, "limit": limit},
     )
-    return parse_history(request_json(url, authcfg=authcfg, feedback=feedback))
+    return parse_history(request_json(url, authcfg=authcfg, feedback=feedback, track=track))
 
 
 def fetch_features(
@@ -103,10 +144,11 @@ def fetch_features(
     authcfg: str,
     query: Mapping[str, Any] | None = None,
     feedback: QgsFeedback | None = None,
+    track: str = "",
 ) -> Any:
     """Fetch a raw FeatureCollection. Used by the coverage check for survey extents."""
     url = urls.with_query(urls.items_url(base_url, collection_id), query or {})
-    return request_json(url, authcfg=authcfg, feedback=feedback)
+    return request_json(url, authcfg=authcfg, feedback=feedback, track=track)
 
 
 def create_feature(
@@ -115,6 +157,7 @@ def create_feature(
     feature: Mapping[str, Any],
     authcfg: str,
     feedback: QgsFeedback | None = None,
+    track: str = "",
 ) -> Any:
     """Create one feature. OGC API - Features Part 4: POST a Feature to ``/items``.
 
@@ -122,12 +165,19 @@ def create_feature(
     the surrogate OAPIF id is ``GENERATED ALWAYS AS IDENTITY``; both are the server's to
     assign, and the source data's own ``id`` column is 0% populated across all 1,246
     features -- it is the defect being fixed, not a fallback.
+
+    No ``track_id`` is sent either, for the same reason and with the same force: the
+    column's server-side default is ``app.writable_track_id()``, resolved from the
+    ``X-Track`` header this call sends. A client-supplied track_id would be a client
+    asserting which dataset a row belongs to, which is precisely what row-level security
+    exists to take away from it -- and the write policy would refuse it anyway.
     """
     return post_json(
         urls.items_url(base_url, collection_id),
         dict(feature),
         authcfg=authcfg,
         feedback=feedback,
+        track=track,
     )
 
 

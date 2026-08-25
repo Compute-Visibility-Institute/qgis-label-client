@@ -15,7 +15,7 @@ Three properties are worth more than the rest, and each has a failure mode that 
 from __future__ import annotations
 
 import pytest
-from snapshot_fixtures import REGISTRY, SEED_CLASSES, SNAPSHOT_LAYERS
+from snapshot_fixtures import REGISTRY, SEED_CLASSES, SNAPSHOT_LAYERS, TRACK
 
 from qgis_label_client.core.fields import CoreFields
 from qgis_label_client.core.legacy import map_fields
@@ -269,7 +269,7 @@ def test_an_explicit_class_choice_overrides_the_guess():
 def test_selecting_a_layer_with_no_class_is_a_blocking_problem():
     source = _source("Roads")
     plan = build_plan(
-        [source], REGISTRY, {source.layer_id: LayerChoice(source.layer_id, publish=True)}
+        [source], REGISTRY, {source.layer_id: LayerChoice(source.layer_id, publish=True)}, TRACK
     )
     assert plan.problems() and "no class chosen" in plan.problems()[0]
 
@@ -283,6 +283,7 @@ def test_a_retired_class_cannot_be_published_into():
         [source],
         registry,
         {source.layer_id: LayerChoice(source.layer_id, publish=True, class_id="compound")},
+        TRACK,
     )
     assert "retired" in plan.problems()[0]
 
@@ -293,6 +294,7 @@ def test_an_empty_layer_is_a_blocking_problem():
         [source],
         REGISTRY,
         {source.layer_id: LayerChoice(source.layer_id, publish=True, class_id="compound")},
+        TRACK,
     )
     assert "no features" in plan.problems()[0]
 
@@ -323,6 +325,7 @@ def test_a_layer_with_no_valid_crs_cannot_be_published_at_all():
         [source],
         REGISTRY,
         {source.layer_id: LayerChoice(source.layer_id, publish=True, class_id="compound")},
+        TRACK,
     )
     assert plan.problems() and ".prj" in plan.problems()[0]
     assert source.needs_reprojection is False

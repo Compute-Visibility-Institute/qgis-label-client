@@ -6,8 +6,11 @@ The backend is bitemporal. **Valid time** is when a thing was true on the ground
 **transaction time** is when we believed it. OGC API - Features has a standard parameter
 for the first (``datetime``) and none at all for the second, so this control is
 explicitly a valid-time control and says so in the UI. Reproducing a training set --
-"the world as we understood it in January" -- is a transaction-time question and is
-answered server-side, not here.
+"the world as we understood it in January" -- is a transaction-time question, and it is
+answered by :mod:`.recorded`, which is a separate module for exactly this reason. The two
+keep disjoint vocabulary: this one says **as-of** and never "believed"; that one says
+**believed** and never "as of". A control that said "as of" and meant the other axis is
+the single likeliest source of the confusion the split exists to prevent.
 
 TWO MECHANISMS, BECAUSE ONE OF THEM DEPENDS ON SERVER BEHAVIOUR
 
@@ -17,10 +20,21 @@ query parameter -- the provider builds its item requests from the links the serv
 returns, so a server that emits absolute ``items`` hrefs without propagating query
 parameters will drop it.
 
-``cql2`` is the fallback for exactly that case. ``filter`` *is* a first-class parameter
-of the QGIS OAPIF URI and is appended to every items request as
-``filter=...&filter-lang=cql2-text``, so it always survives. It expresses the same
-question directly against the valid-time columns.
+``cql2`` is the fallback for exactly that case, and what it actually does is **not** what
+this docstring claimed before ``docs/read-path.md`` read the provider source. ``filter``
+*is* a first-class parameter of the QGIS OAPIF URI and does reach every items request, so
+the clause is never silently dropped -- that much holds. But it does not travel as
+``filter=...&filter-lang=cql2-text``: QGIS only enables its CQL2 path when the server
+advertises the two ``ogcapi-features-3`` filter conformance classes, and pygeoapi 0.24.0
+advertises neither. The provider therefore falls back to its **Part 1** compiler, which
+translates the first conjunct of :func:`cql2_filter` into a ``datetime=`` range and leaves
+the ``OR`` conjunct to be evaluated client-side (``translationState = PARTIAL``).
+
+The practical consequences: the answer stays semantically right, it over-fetches, and the
+name of this mechanism describes the expression's dialect rather than the wire format.
+Both mechanisms are still here, and which one a deployment uses is a setting rather than a
+patch, because the failure they guard against -- a dropped parameter -- is real and
+differs between servers.
 
 THE TRAP IN THAT SECOND MECHANISM, AND WHY :func:`cql2_filter` LOOKS THE WAY IT DOES
 
@@ -44,9 +58,17 @@ QGIS knows *and* can compile may appear -- ``to_datetime()`` parses but does not
 which silently downgrades the filter to client-side evaluation and downloads the whole
 collection.
 
-Both mechanisms are here, and which one a deployment uses is a setting rather than a
-patch. That is the honest resolution: the standard mechanism first, a mechanism that
-cannot silently no-op second.
+That is the honest resolution: the standard mechanism first, a mechanism that cannot
+silently no-op second.
+
+ONE MORE THING WORTH KNOWING BEFORE EDITING EITHER MECHANISM
+
+The Temporal Controller does not drive ``datetime`` and cannot be made to. Its filter is
+built as ``make_datetime(...)`` -- a function node where the Part 1 compiler requires a
+literal -- and every temporal mode wraps its comparison in ``OR <field> IS NULL``, a
+top-level ``OR`` the compiler will not walk. So the controller filters entirely on the
+client. That is why this control exists at all, and it is also why a controller sliding
+over a :mod:`.recorded` layer is harmless: the two axes never share a code path.
 """
 
 from __future__ import annotations
@@ -54,6 +76,7 @@ from __future__ import annotations
 from datetime import date, datetime, time, timezone
 from enum import Enum
 
+from .expressions import identifier, literal
 from .fields import DEFAULT_FIELDS, CoreFields
 
 
@@ -107,19 +130,9 @@ def cql2_filter(value: date | datetime, fields: CoreFields = DEFAULT_FIELDS) -> 
     -- writing CQL2 here fails the layer outright.
     """
     moment = instant(value)
-    lo, hi = _identifier(fields.valid_from), _identifier(fields.valid_to)
-    literal = _literal(moment)
-    return f"{lo} <= {literal} AND ({hi} IS NULL OR {hi} > {literal})"
-
-
-def _identifier(name: str) -> str:
-    """Quote a column name as a QGIS expression column reference."""
-    return '"' + name.replace('"', '""') + '"'
-
-
-def _literal(text: str) -> str:
-    """Quote a value as a QGIS expression string literal."""
-    return "'" + text.replace("'", "''") + "'"
+    lo, hi = identifier(fields.valid_from), identifier(fields.valid_to)
+    at = literal(moment)
+    return f"{lo} <= {at} AND ({hi} IS NULL OR {hi} > {at})"
 
 
 def describe(value: date | datetime | None, mechanism: AsOfMechanism) -> str:
