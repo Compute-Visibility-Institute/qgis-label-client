@@ -30,11 +30,11 @@ from __future__ import annotations
 import json
 
 import pytest
-from snapshot_fixtures import REGISTRY, SNAPSHOT_LAYERS
+from snapshot_fixtures import REGISTRY, SNAPSHOT_LAYERS, TRACK
 
 from qgis_label_client import client
 from qgis_label_client import publish as publish_tools
-from qgis_label_client.core.errors import BackendError
+from qgis_label_client.core.errors import BackendError, ConfigurationError
 from qgis_label_client.core.fields import COMPLETENESS_EXHAUSTIVE, COMPLETENESS_PARTIAL
 from qgis_label_client.core.legacy import map_fields
 from qgis_label_client.core.publish import LayerChoice, LayerPlan, SourceLayer
@@ -107,13 +107,18 @@ class Recorder:
         self.sent: list[dict] = []
         self.extents: list[dict] = []
         self.attempts: list[str] = []
+        #: Every track name the worker asked for, one per attempt. A publish that sent a
+        #: single feature to a track the run was not pinned to would be invisible in the
+        #: counts and permanent in the data, so it is recorded rather than assumed.
+        self.tracks: list[str] = []
         self._refuse = refuse
         #: How many times each feature is answered with a 429 before it is accepted. A
         #: negative number means "always", which is how the give-up path is reached.
         self._throttle = throttle
         self._throttled: dict[str, int] = {}
 
-    def create_feature(self, base_url, collection_id, feature, authcfg, feedback=None):
+    def create_feature(self, base_url, collection_id, feature, authcfg, feedback=None, track=""):
+        self.tracks.append(track)
         if collection_id == "extent":
             self.extents.append(_serialisable(feature))
             return None
@@ -178,6 +183,10 @@ def _prepared(features, *, completeness: str = "", transform=None, extent=None, 
 
 
 def _request(prepared, **kwargs) -> publish_tools.PublishRequest:
+    # A track is required, not defaulted: publish() refuses without one, because 1,246
+    # identical 403s from the edge is not a report anybody can act on. Every test here
+    # supplies it so that the refusal itself stays testable in one place.
+    kwargs.setdefault("track", TRACK.name)
     return publish_tools.PublishRequest(
         base_url="https://api.example.org/oapif",
         collection_id="label",
@@ -498,3 +507,39 @@ def test_a_cancelled_run_never_claims_a_completed_sweep(recorder):
     assert recorder.extents == []
     assert report.outcomes[0].extent_declared is False
     assert "cancelled" in report.outcomes[0].extent_problem
+
+
+# --- the history track ------------------------------------------------------
+
+
+def test_every_request_names_the_track_including_the_survey_extent(recorder):
+    """The extent matters as much as the features and is easier to lose.
+
+    A survey extent is a claim made *inside* a dataset. One landing on the wrong track
+    tells the export pipeline it may sample unlabeled ground there as background -- the
+    poisoning labeled_extent exists to prevent, one dataset over, and invisible because
+    nobody can see an extent on a map.
+    """
+    prepared = _prepared(
+        _features(3), completeness=COMPLETENESS_EXHAUSTIVE, extent=MULTIPOLYGON_EXTENT
+    )
+    publish_tools.publish(_request(prepared, extent_collection="extent"))
+    assert recorder.extents, "the extent was not declared, so this proves nothing"
+    assert set(recorder.tracks) == {TRACK.name}
+
+
+def test_a_run_with_no_track_is_refused_before_anything_is_sent(recorder):
+    """1,246 identical 403s is not a report anybody can act on.
+
+    The edge refuses an untracked write, correctly. Discovering that one round trip at a
+    time would spend the whole bootstrap to learn something knowable before the first one.
+    """
+    with pytest.raises(ConfigurationError, match="No history track selected"):
+        publish_tools.publish(_request(_prepared(_features(3)), track=""))
+    assert recorder.sent == []
+
+
+def test_the_report_carries_the_track_the_run_actually_used(recorder):
+    report = publish_tools.publish(_request(_prepared(_features(2))))
+    assert report.track == TRACK.name
+    assert f"on track {TRACK.name}" in report.summary()

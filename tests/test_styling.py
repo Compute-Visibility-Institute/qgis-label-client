@@ -108,3 +108,82 @@ def test_symbol_properties_dispatches():
     assert "size" in symbol_properties("Point", {"radius": 2})
     assert "line_color" in symbol_properties("MultiLineString", {})
     assert "outline_color" in symbol_properties("MultiPolygon", {})
+
+
+# --- the historical variant --------------------------------------------------
+#
+# Three visual states have to be distinguishable at a glance, because two of the layers
+# they appear on look otherwise identical:
+#
+#   live                              solid stroke, full opacity, class colour
+#   believed, still true today        dashed stroke, 55% opacity, class colour
+#   believed, since deleted/corrected dashed stroke in the alert colour
+#
+# The class colours stay put in all three. A historical layer is still a labels layer, and
+# the colours are how people read it -- changing them would make the two layers harder to
+# compare, which is the whole reason both are open at once.
+
+from qgis_label_client.core.fields import CoreFields  # noqa: E402
+from qgis_label_client.core.styling import (  # noqa: E402
+    HISTORICAL_OPACITY,
+    SUPERSEDED_STROKE,
+    superseded_stroke_expression,
+)
+
+
+def test_a_historical_polygon_is_dashed_but_keeps_its_class_colour():
+    # A dashed boundary is the strongest "not editable" convention in GIS, and it costs
+    # one property.
+    style = {"fill": "#4f9dde66", "stroke": "#e8c547", "stroke_width": 2}
+    live = fill_symbol_properties(style)
+    believed = fill_symbol_properties(style, historical=True)
+    assert live["outline_style"] == "solid"
+    assert believed["outline_style"] == "dash"
+    assert believed["outline_color"] == live["outline_color"]
+    assert believed["color"] == live["color"]
+
+
+def test_a_historical_line_and_marker_are_dashed_too():
+    assert line_symbol_properties({"stroke": "#f2f2f2"}, historical=True)["line_style"] == "dash"
+    assert marker_symbol_properties({"radius": 3}, historical=True)["outline_style"] == "dash"
+
+
+def test_a_class_that_is_already_dashed_stays_dashed():
+    # A style block with its own dash array wins on the pattern; the historical flag must
+    # not undo it or fight it.
+    properties = fill_symbol_properties({"dash": [6, 3]}, historical=True)
+    assert properties["outline_style"] == "dash"
+    assert properties["customdash"] == "6;3"
+
+
+def test_symbol_properties_passes_the_flag_through():
+    assert symbol_properties("MultiPolygon", {}, True)["outline_style"] == "dash"
+    assert symbol_properties("MultiLineString", {}, True)["line_style"] == "dash"
+    assert symbol_properties("Point", {}, True)["outline_style"] == "dash"
+    assert symbol_properties("MultiPolygon", {})["outline_style"] == "solid"
+
+
+def test_a_belief_that_has_since_ended_is_coloured_by_a_data_defined_expression():
+    """A data-defined property on the ordinary symbol, not a rule-based renderer.
+
+    The deciding reason is survival: every re-point exports the style to a QDomDocument and
+    re-imports it, and data-defined properties are plain QGIS symbology that survives that
+    round trip. A track switch would otherwise silently strip the distinction between a
+    label the team still believes and one it deleted.
+    """
+    expression = superseded_stroke_expression({"stroke": "#e8c547"})
+    assert expression.startswith('if("superseded", ')
+    # The alert colour and the class colour, both in the unambiguous r,g,b,a form.
+    assert qgis_color(SUPERSEDED_STROKE) in expression
+    assert "232,197,71,255" in expression
+
+
+def test_the_superseded_expression_honours_server_supplied_field_names():
+    fields = CoreFields().merged({"superseded": "belief_ended"})
+    assert superseded_stroke_expression({}, fields).startswith('if("belief_ended", ')
+
+
+def test_a_historical_layer_reads_as_a_ghost_without_becoming_invisible():
+    # One call on the layer rather than a per-symbol alpha: it survives any renderer and
+    # cannot be undone by a class whose own style block sets an opaque fill.
+    assert 0.3 < HISTORICAL_OPACITY < 0.8

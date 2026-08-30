@@ -16,7 +16,9 @@ cannot do on its own.
 | **Authentication** — stores an API token in `QgsAuthManager` and puts its seven-character id in every layer URI | QGIS can hold the credential, but something has to put it there and reference it. Doing this properly is what keeps tokens out of `.qgz` files that get emailed |
 | **Imagery credentials** — fetches fresh signed object-storage URLs and re-points raster layer sources | **The clearest reason this plugin exists.** Signed URLs expire, and there is no way to write "a URL, but fetch it fresh" into a project file. A `.qgz` saved on Monday has dead raster layers on Tuesday |
 | **Collections and class vocabulary** — read from the backend at connect time | Categories, styles, attribute schemas and form order live in the server's class registry. Anything compiled into the plugin would drift from the web UI the first time someone adds a class |
-| **As-of date** — pins layers to one instant of *valid* time | QGIS's Temporal Controller can drive `datetime`, but choosing the mechanism, formatting the instant and re-pointing every layer is plumbing QGIS leaves to the caller |
+| **As-of date** — pins layers to one instant of *valid* time | The Temporal Controller cannot drive `datetime`: its filter is a function node the Part 1 compiler refuses, so it filters client-side and downloads the whole collection. Sending the instant server-side is a plugin job |
+| **Historical view** — adds a read-only layer showing what the team *believed* at a chosen instant | Transaction time has no OGC parameter at all. It travels as a per-layer request header, which is also the only transport that reaches the `OPTIONS` probe QGIS uses to decide whether a layer is editable |
+| **History tracks** — chooses which isolated dataset you are working in, and puts it in every request | The isolation is row-level security in the database. QGIS has no concept of it, and the native provider makes its own requests, so the track has to be in each layer's own data source or it is never sent |
 | **QA** — a label's edit history, and a survey-coverage check | Both are questions about the backend's schema, not about the map |
 | **Bootstrap** — publishes the local vector layers already open in the project as the founding dataset | The provider edits a collection it is already connected to. It has no concept of a shapefile that has never been part of one, and no way to map a decade of ad-hoc column names onto a class registry |
 
@@ -60,26 +62,86 @@ Open the **CVI Label Client** panel from the toolbar, then:
    The first credential you ever store makes QGIS ask you to set a **master password**,
    which is **unrecoverable if forgotten**. That is why signing in is an explicit button
    and not a side effect of loading a layer.
-3. **Connect** — lists the collections and loads the class registry.
-4. Tick the collections you want and **Load checked collections**.
-5. **Refresh imagery URLs** at the start of each session.
+3. **Connect** — lists the collections, the history tracks and the class registry.
+4. **History track** — pick which dataset you are working in. See below; this is the one
+   setting whose being wrong produces data that looks entirely correct.
+5. Tick the collections you want and **Load checked collections**.
+6. **Refresh imagery URLs** at the start of each session.
 
-Nothing is stored anywhere except `QgsSettings` (URLs, page size, as-of state) and
-`qgis-auth.db` (the token). No credential is written to a project file.
+Nothing is stored anywhere except `QgsSettings` (URLs, page size, as-of state, the
+selected track) and `qgis-auth.db` (the tokens). No credential is written to a project
+file.
+
+---
+
+## History tracks
+
+A **track** is an isolated dataset sharing one deployment — one for kicking the tyres, one
+the analysts build for real. Labels drawn on one are invisible from the other.
+
+**The plugin does not implement that isolation and cannot weaken it.** It is row-level
+security in the database, keyed on a session variable the auth edge sets from an
+`X-Track` header. What the plugin does is much smaller, and it exists because every
+failure in this area produces data that looks completely correct:
+
+- **It says which track you are on**, in the panel banner, in the publish preview, on the
+  Publish button itself, in the confirmation, in the results dialog and in the history
+  dialog's title. A polygon drawn into the wrong dataset is indistinguishable from a
+  correct one, so the defence is visibility rather than validation.
+- **It puts the track in each layer's own data source**, as an `X-Track` request header in
+  the URI and in the credential the layer names. That is where it has to be: QGIS's native
+  OAPIF provider makes the reads *and* the Part 4 writes itself, so anything not attached
+  to the layer is not sent. It also means a layer cannot be redirected by a stale setting,
+  and a `.qgz` reopens on the track it was saved on — with the panel saying so when that
+  disagrees with your own selection.
+- **It carries a canary.** Track-scoped layers also get a `"track_id" = '<uuid>'` clause in
+  their filter. Under row-level security that is redundant; if the track ever stops
+  reaching the database, `app.track()` falls back to the deployment's *default* track and
+  answers with somebody else's polygons. With the clause, the layer goes **empty** instead,
+  and empty-and-wrong is enormously better than populated-and-wrong. A second check
+  compares the first returned feature's `track_id` against the track you asked for and
+  warns in the message bar if they differ.
+
+Some things follow from that and are worth knowing before they surprise you:
+
+- **Track names are data**, exactly like class names. None appears anywhere in this
+  repository, and the panel's list comes from `GET {api}/v1/tracks` at runtime.
+- **Switching tracks is refused while any plugin layer has unsaved edits.** Switching
+  re-points every layer, and `setDataSource` on a dirty layer discards the edit buffer with
+  no prompt and no undo.
+- **A stored track the backend no longer offers resolves to nothing, not to the default.**
+  Answering a request for one dataset from another is the contamination failure in reverse:
+  you would conclude your track was empty. The panel says so and every write is refused.
+- **An archived track is readable and not writable.** The panel marks it, and publishing
+  into one is blocked before the preview opens rather than discovered one refused feature
+  at a time.
+- **Reads with no track selected fall back to the deployment default; writes do not.** A
+  browser with no opinion should see something; a write is the contaminating operation.
+- **Credentials are stored one per track** (same token, plus the `X-Track` header), and one
+  more that names no track. Signing in happens *before* Connect — you need a credential to
+  discover what tracks exist — so a first sign-in stores only the un-tracked entry and
+  signing in again after connecting fans it out. Either way the track travels in the layer
+  URI, so nothing breaks in between. Signing out removes all of them.
 
 ---
 
 ## What the backend has to provide
 
-Four endpoints. Two are standard OGC API - Features; two are not, and both of those are
-configurable paths so a deployment can mount them anywhere.
+Five endpoints. Two are standard OGC API - Features; three are not, and all three of those
+are configurable paths so a deployment can mount them anywhere.
 
 | Endpoint | Standard? | Used for |
 |---|---|---|
 | `GET {api}/collections` | OAPIF Part 1 | Collection discovery |
 | `GET {api}/collections/{id}/items` | OAPIF Parts 1 and 4 | Everything QGIS's provider does, plus history queries |
 | `GET {api}/v1/classes` | no | The class registry |
+| `GET {api}/v1/tracks` | no | The history-track list |
 | `GET {api}/v1/imagery/signed-urls` | no | Minting short-lived signed URLs |
+
+A backend with no `/v1/tracks` (404) is treated as a deployment with no history tracks:
+the panel shows an empty list, reads work, and every write is refused. A response that is
+*not* a track list is an error, because "the plugin could not read the track list" must
+never look like "this deployment has no tracks".
 
 The two non-standard paths are settings, not constants — a deployment may mount them
 anywhere. The `v1/` prefix in the defaults is the reference backend's own namespace:
@@ -190,6 +252,101 @@ current state, switch mechanisms — that is the symptom.
 > makes the layer **invalid**, so you get no data rather than unfiltered data. Verified
 > against QGIS 3.44.
 
+> **The Temporal Controller does not drive `datetime`, and cannot be made to.** Its filter
+> is built as `make_datetime(...)` — a function node where QGIS's Part 1 compiler requires a
+> literal — and every temporal mode wraps its comparison in `OR <field> IS NULL`, a
+> top-level `OR` the compiler will not walk. So the controller filters entirely on the
+> client. That is why this control exists at all. It is also why sliding the controller over
+> a historical layer is harmless: the two axes never share a code path.
+
+---
+
+## The historical view, and why the layer is read-only
+
+The other axis. **Transaction time** is when the team *believed* something, as distinct from
+when it was true on the ground. Ticking **Pin a historical layer to an instant** in the
+panel's *Historical view (transaction time)* box and pressing **Add historical layer** gives
+you a layer showing the labels as the team believed them at that instant — **including
+labels deleted since, and the superseded geometry of labels edited since**.
+
+Two properties are worth stating plainly, because both are deliberate:
+
+- **It adds a layer. It does not re-point the ones you have.** Unlike the as-of control
+  above, which re-points everything. The whole use case is having the live layer and a
+  historical one open at once — and two historical ones at different instants if you are
+  comparing beliefs.
+- **The layer is read-only, and QGIS greys the pencil out by itself.** Editing a past belief
+  is incoherent: it would mean editing what you used to think. This is enforced rather than
+  documented, in four places, and the first of them is not this plugin.
+
+### Why a header, and not a query parameter
+
+The instant travels as an **`X-Recorded-At` request header**, attached per layer through the
+OAPIF URI's `http-header:` vocabulary — exactly where `X-Track` already goes. Two facts
+about QGIS's provider make that the only workable transport:
+
+| Fact | Consequence |
+|---|---|
+| `sendOPTIONS` installs the URI's `http-header:` parameters | The instant **is** on the editability probe, so the server can answer it without `POST` in `Allow`, and QGIS disables editing on its own |
+| `computeCapabilities` — which builds that probe — appends **no** query parameters, unlike `init()`, `featureCount()` and `addFeatures()` | A landing-URL query parameter is **absent** from the probe |
+
+So a query-only pin can never grey the pencil out, and what follows is the worst failure
+available here: the probe reports the collection writable, QGIS enables editing, and an
+annotator moves a vertex on what they believe is January's map. Whether that write carries
+the parameter then depends on which provider method built the request — so the edit lands on
+the **live** row. Editing the present while looking at the past, silently.
+
+`?recorded_at=` is still accepted by the backend for curl and for bug reports — a
+header-only interface is untestable by hand — and is never used by a layer.
+
+### What you see
+
+The layer is named so it cannot be mistaken for the live one in a tree that truncates from
+the right:
+
+```
+[BELIEVED 2026-01-15 08:00Z] Labels — read-only        the historical layer
+Labels                                                 the live, editable one
+```
+
+**BELIEVED**, never *as-of*: the box above says "as of" and means the other axis, and if
+both said it a screenshot would not tell you which question produced the map. Three visual
+states, with the class colours unchanged in all three so the two layers stay comparable:
+
+| State | How it draws |
+|---|---|
+| live | solid stroke, full opacity, class colour |
+| believed, still true today | dashed stroke, 55% opacity, class colour |
+| believed, since deleted or corrected | dashed stroke in an alert colour |
+
+Hovering a superseded feature adds one line to the map tip: *believed until …* — which is
+the question a historical layer exists to answer.
+
+The status line under both boxes always names **both** axes, even when one of them is off:
+
+```
+Believed: 2026-01-15 08:00Z (fixed)  ·  Valid: Temporal Controller (client-side)
+```
+
+Each control on its own reads as "the" time control. Naming both means neither can be read
+as the only one in play.
+
+### The canary, and what an empty layer means
+
+The view echoes the instant it actually resolved at on every row, and the layer filter
+compares that against what was asked for. Redundant when everything works — and that is the
+point: the backing view falls back to `now()` when no instant reaches it, so a header lost
+to a proxy would answer a January request with **today's** data. With the canary the layer
+comes back **empty** instead. Empty-and-wrong is enormously better than
+populated-and-wrong, because somebody notices it.
+
+Which means an empty historical layer has two possible causes, and the panel says which:
+either nothing was believed to exist at that instant — a perfectly valid answer, reported
+with the earliest instant the track has a record of — or something is broken. An instant in
+the future is refused outright, by the picker and by the backend: the belief set at a future
+time is simply the current one, so the layer would be *full* under a caption asserting
+something nobody has ever believed.
+
 ---
 
 ## Survey coverage QA
@@ -210,6 +367,10 @@ because nobody will remember which sites were swept for which classes a year fro
 A label that falls only inside a `partial` extent is reported too: a qualified sweep does
 not license treating its surroundings as negative either.
 
+The result names the history track it checked, because both layers are scoped to one and
+"all labels are inside an exhaustive extent" is a different fact about a test dataset than
+about the analysts' one — the sentence alone cannot tell them apart.
+
 ---
 
 ## Publishing local layers (the one-time bootstrap)
@@ -223,9 +384,24 @@ in the project — excluding the ones this plugin loaded, which are already on t
 and creates them as labels. It replaces a command-line loader that ran against a PostgreSQL
 DSN, on the grounds that an analyst will never run one.
 
-**Nothing is sent until the preview is confirmed.** The dialog lists each layer with its
-feature count, geometry type, CRS and a checkbox, and a class combo populated from the live
-registry. Classes are guessed from the layer name and are always overridable; an ambiguous
+**The first thing the preview says is which history track these features would join** —
+above the table, in the window title, and in the Publish button's own text. That placement
+is deliberate. Every other warning on that screen appears only when there is something to
+warn about, so a clean preview would otherwise say nothing at all about *where* 1,246
+permanent features are going — and "where" is the one decision on the screen that was made
+in another panel, minutes earlier, possibly by whoever saved the project rather than by the
+person clicking now. Publishing with no track selected, or into an archived track, is
+**blocked**: unlike the survey-extent warning, there is no defensible version of "into a
+dataset nobody named".
+
+Publishing the same shapefile into a *second* track is not a duplicate — it is how a test
+dataset gets populated — so it stays pre-selected and gets its own sentence rather than the
+"you have published this before" warning, which would otherwise train people to click
+through the warning that catches the real duplicate.
+
+**Nothing else is sent until the preview is confirmed.** The dialog lists each layer with
+its feature count, geometry type, CRS and a checkbox, and a class combo populated from the
+live registry. Classes are guessed from the layer name and are always overridable; an ambiguous
 guess is reported as ambiguous rather than resolved arbitrarily. The *Fields* column shows
 where every source column would go, in full, on hover — the matcher is structural, so it
 maps a column onto whichever declared attribute its concept is a subset of and cannot know
@@ -283,9 +459,11 @@ writes per principal and says how long its bucket needs, so the client waits and
 same feature again. Every refusal names its row, by name where the feature has one and by
 position otherwise.
 
-Each published layer is stamped with a `cvi/published` custom property and the project is
-marked dirty so the stamp survives closing QGIS; publishing it again warns first, because
-the server assigns identity and therefore nothing here can recognise a repeat.
+Each published layer is stamped with a `cvi/published` custom property — recording the
+track it went to, alongside the collection, class and count — and the project is marked
+dirty so the stamp survives closing QGIS. Publishing it again *into the same track* warns
+first, because the server assigns identity and therefore nothing here can recognise a
+repeat. Counts accumulate per track, not across them.
 
 ---
 
@@ -316,9 +494,12 @@ qgis_label_client/
 │   ├── legacy.py        legacy column names -> the registry's vocabulary
 │   ├── names.py         label.names, and the UTF-7 truncation signature
 │   ├── publish.py       the bootstrap plan, feature drafting and its report
+│   ├── recorded.py      transaction-time instants: the other axis, one file each
 │   ├── registry.py      the class vocabulary
+│   ├── expressions.py   QGIS-expression quoting, shared by asof and tracks
 │   ├── styling.py       registry style block -> QGIS symbol properties
 │   ├── teardown.py      the undo stack that makes unload() correct
+│   ├── tracks.py        history tracks: parsing, resolution and the canary
 │   ├── uri.py           QgsDataSourceUri construction
 │   └── urls.py          backend URL assembly
 ├── plugin.py        initGui / unload, and all the wiring

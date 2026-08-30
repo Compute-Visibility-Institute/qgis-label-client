@@ -19,6 +19,7 @@ from qgis.PyQt.QtXml import QDomDocument
 
 from .core.assets import (
     ASSET_KEY_PROPERTY,
+    CAPTURED_AT_PROPERTY,
     RasterLayerRef,
     Rewrite,
     SignedAsset,
@@ -113,6 +114,15 @@ def refresh_sources(
             # to whichever unnamed asset happens to sort first on the next refresh.
             if rewrite.asset.key:
                 layer.setCustomProperty(ASSET_KEY_PROPERTY, rewrite.asset.key)
+            # The acquisition instant, stamped for core.validtime to read back off
+            # the layer tree. Only written when the backend actually sent one --
+            # clearing it otherwise, rather than leaving a stale value, because a
+            # date belonging to the scene this layer USED to show would produce a
+            # confidently wrong default rather than an absent one.
+            if rewrite.asset.captured_at is not None:
+                layer.setCustomProperty(CAPTURED_AT_PROPERTY, rewrite.asset.captured_at.isoformat())
+            else:
+                layer.removeCustomProperty(CAPTURED_AT_PROPERTY)
             applied += 1
 
     for layer_ref in unmatched:

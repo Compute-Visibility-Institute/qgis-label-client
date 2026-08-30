@@ -8,14 +8,25 @@ undone by re-running, and a name published with its final character missing beco
 authoritative name. Every one of those is cheap to prevent here and expensive to unpick
 afterwards, which is the entire argument for making the user look at a table first.
 
-THE THREE THINGS THIS SCREEN EXISTS TO SAY OUT LOUD
+THE FOUR THINGS THIS SCREEN EXISTS TO SAY OUT LOUD
 
+* **which history track these features join** -- the dataset, named at the top of the
+  dialog and again in the button, because it is the one thing on this screen that is
+  chosen somewhere else and therefore the one thing nobody thinks to check;
 * **which class each layer becomes** -- guessed from the layer name, never applied without
   being shown, and always overridable from a combo populated from the live registry;
 * **how many names are already damaged** -- with the count, and a choice about them that
   defaults to publishing because ``Name_en`` often survives where ``Name:ch`` did not;
 * **that nothing here records where anyone looked** -- the one omission that cannot be
   reconstructed later and that silently poisons every model trained on the export.
+
+The track is *first* and it is above the table rather than below it, which is a deliberate
+inversion of how the other three are laid out. The damaged names and the missing survey
+extent are properties of the data in the table, so they belong under it. The track is a
+property of the whole publish and is not visible anywhere in the table at all -- and it was
+selected minutes ago, in a different panel, possibly by somebody else who saved the
+project. A warning at the bottom of a scrolled dialog is a warning nobody reads before
+clicking the button they were already reaching for.
 
 The dialog is a view. It reads a plan, renders it, and hands back
 :class:`~.core.publish.LayerChoice` objects; it makes no network call, touches no layer and
@@ -45,6 +56,7 @@ from qgis.PyQt.QtWidgets import (
 from .core.fields import COMPLETENESS_EXHAUSTIVE, COMPLETENESS_PARTIAL
 from .core.publish import LayerChoice, PublishPlan, PublishReport, SourceLayer, build_plan
 from .core.registry import ClassRegistry
+from .core.tracks import Track
 
 _COLUMNS = (
     "Publish",
@@ -78,18 +90,29 @@ class PublishDialog(QDialog):
         sources: Sequence[SourceLayer],
         registry: ClassRegistry,
         parent: QWidget | None = None,
+        track: Track | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Publish local layers")
-        self.setMinimumSize(1000, 520)
+        # The track is in the WINDOW TITLE as well, because a modal dialog's title bar is
+        # the one piece of chrome that stays visible while the person scrolls the table,
+        # and because a screenshot in a support thread then carries it too.
+        self.setWindowTitle(
+            f"Publish local layers to track: {track.name}" if track else "Publish local layers"
+        )
+        self.setMinimumSize(1000, 560)
 
         self._sources = list(sources)
         self._registry = registry
+        self._track = track
         # Set before the table is built: building it connects signals that fire while the
         # rows are being populated, and a refresh mid-build would read half a table.
         self._refreshing = True
 
         layout = QVBoxLayout(self)
+        self.track_label = QLabel("", self)
+        self.track_label.setWordWrap(True)
+        self.track_label.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(self.track_label)
         layout.addWidget(self._build_heading())
 
         self.table = self._build_table()
@@ -292,7 +315,7 @@ class PublishDialog(QDialog):
 
     def plan(self) -> PublishPlan:
         """The plan as currently configured."""
-        return build_plan(self._sources, self._registry, self.choices())
+        return build_plan(self._sources, self._registry, self.choices(), self._track)
 
     # --- rendering ------------------------------------------------------------
 
@@ -310,12 +333,40 @@ class PublishDialog(QDialog):
         self._refreshing = True
         try:
             plan = self.plan()
+            self._render_track(plan)
             self._render_rows(plan)
             self._render_damage(plan)
             self._render_coverage(plan)
             self._render_summary(plan)
         finally:
             self._refreshing = False
+
+    def _render_track(self, plan: PublishPlan) -> None:
+        """Name the dataset, above everything else, whether or not anything is wrong.
+
+        Rendered unconditionally, which no other label on this screen is. The damaged-name
+        and survey-extent warnings appear only when there is something to warn about, so a
+        clean preview says nothing at all about where the features are going -- and "where"
+        is the one decision on this screen that was made in another panel, at another time,
+        possibly by the person who saved the project rather than the person clicking now.
+        """
+        problems = plan.track_problems()
+        if problems:
+            self.track_label.setText("<b>" + "<br/>".join(problems) + "</b>")
+            return
+        claim = plan.track_claim()
+        elsewhere = plan.republished_elsewhere()
+        if elsewhere:
+            # Not a duplicate warning. Sending the same shapefile into a second track is
+            # how a test dataset is populated, and calling it a duplicate would teach
+            # people to click through the warning that catches the real one.
+            claim += (
+                "<br/><br/>"
+                + ", ".join(sorted(p.source.name for p in elsewhere))
+                + " was last published to a <i>different</i> track, so this is a first "
+                "publish here rather than a second copy."
+            )
+        self.track_label.setText(f"<b>Track:</b> {claim}")
 
     def _render_rows(self, plan: PublishPlan) -> None:
         """Re-render the two cells that depend on which class the row is set to."""
@@ -388,6 +439,11 @@ class PublishDialog(QDialog):
         ok = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
         if ok is not None:
             ok.setEnabled(bool(plan.selected()) and not problems)
+            # The track goes in the button text, not only in the banner. This is the last
+            # thing the eye lands on before an irreversible bulk write, and a button that
+            # says which dataset it writes into is the cheapest possible check on the one
+            # decision that was made somewhere else.
+            ok.setText(f"Publish to {plan.track_name}" if plan.track_name else "Publish")
 
 
 class PublishReportDialog(QDialog):
@@ -400,7 +456,9 @@ class PublishReportDialog(QDialog):
 
     def __init__(self, report: PublishReport, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Publish results")
+        self.setWindowTitle(
+            f"Publish results - track {report.track}" if report.track else "Publish results"
+        )
         self.setMinimumSize(820, 460)
 
         layout = QVBoxLayout(self)
