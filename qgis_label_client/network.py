@@ -25,6 +25,7 @@ from qgis.PyQt.QtCore import QByteArray, QUrl
 from qgis.PyQt.QtNetwork import QNetworkRequest
 
 from .core.errors import BackendError
+from .core.tracks import TRACK_HEADER
 
 #: Sent on every request so the auth edge can attribute traffic, and so a support
 #: conversation can start from a server log line.
@@ -32,6 +33,12 @@ USER_AGENT = "qgis-label-client"
 
 #: Media type of an OGC API - Features Part 4 create request body.
 GEOJSON_MEDIA_TYPE = "application/geo+json"
+
+# TRACK_HEADER is imported rather than defined: it is set here on the plugin's own
+# requests, and QGIS's OAPIF provider makes its own -- which this module never sees --
+# carrying the same header from the layer URI and the credential instead (see
+# :mod:`.layers`). Both routes end at the same header on the same edge, so there is one
+# definition, in :mod:`.core.tracks`.
 
 
 @dataclass(frozen=True)
@@ -131,10 +138,15 @@ def _retry_after(reply: Any) -> float | None:
     return seconds if seconds >= 0 else None
 
 
-def _prepare(url: str, accept: str, authcfg: str) -> tuple[QNetworkRequest, Any]:
+def _prepare(url: str, accept: str, authcfg: str, track: str = "") -> tuple[QNetworkRequest, Any]:
     request = QNetworkRequest(QUrl(url))
     request.setRawHeader(b"Accept", accept.encode("ascii"))
     request.setRawHeader(b"User-Agent", USER_AGENT.encode("ascii"))
+    if track:
+        # Empty means "name no track", which the edge answers from the deployment
+        # default. A blank header would not: it is a header the edge has to decide what
+        # to do with, and "decide" is where a wrong answer comes from.
+        request.setRawHeader(TRACK_HEADER.encode("ascii"), track.encode("utf-8"))
 
     fetcher = QgsBlockingNetworkRequest()
     if authcfg:
@@ -174,13 +186,14 @@ def request_json(
     authcfg: str = "",
     feedback: QgsFeedback | None = None,
     accept: str = "application/json",
+    track: str = "",
 ) -> Any:
     """GET `url` and parse the response as JSON. Call only from a worker thread.
 
     `feedback` is threaded through so a cancelled task actually aborts the socket rather
     than finishing the download and discarding it.
     """
-    request, fetcher = _prepare(url, accept, authcfg)
+    request, fetcher = _prepare(url, accept, authcfg, track)
     # forceRefresh=True: signed URLs and as-of views must never come from the HTTP cache.
     # A cached class registry is merely stale; a cached signed URL is expired.
     error = fetcher.get(request, True, feedback)
@@ -195,6 +208,7 @@ def post_json(
     feedback: QgsFeedback | None = None,
     content_type: str = GEOJSON_MEDIA_TYPE,
     accept: str = "application/json",
+    track: str = "",
 ) -> Any:
     """POST `payload` as JSON and parse whatever comes back. Worker thread only.
 
@@ -214,7 +228,7 @@ def post_json(
     the only repair for a refusal that did not happen is to publish it a second time.
     A non-2xx status still raises, in :func:`_read`, before any of this.
     """
-    request, fetcher = _prepare(url, accept, authcfg)
+    request, fetcher = _prepare(url, accept, authcfg, track)
     request.setRawHeader(b"Content-Type", content_type.encode("ascii"))
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 

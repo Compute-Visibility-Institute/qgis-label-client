@@ -18,6 +18,7 @@ plugin; the plugin reads the registry from the backend at runtime.
 from __future__ import annotations
 
 from qgis_label_client.core.registry import parse_registry
+from qgis_label_client.core.tracks import STATUS_ARCHIVED, Track
 
 _STATUS = {
     "type": "string",
@@ -158,6 +159,32 @@ SEED_CLASSES = [
 ]
 
 REGISTRY = parse_registry({"classes": SEED_CLASSES})
+
+#: A history track for the tests that need one.
+#:
+#: The NAME is arbitrary and is deliberately unlike any deployment's. Tracks are data,
+#: exactly as classes are, and a plausible-looking name here would be the beginning of a
+#: second copy of the deployment's vocabulary living in the test suite.
+TRACK = Track(
+    name="fixture_track",
+    track_id="44444444-4444-4444-8444-444444444444",
+    label_en="Fixture track",
+)
+
+#: A second one, for the tests that are about the boundary between two.
+OTHER_TRACK = Track(
+    name="fixture_other_track",
+    track_id="55555555-5555-4555-8555-555555555555",
+    label_en="Other fixture track",
+)
+
+#: An archived track: readable forever, writable never.
+ARCHIVED_TRACK = Track(
+    name="fixture_archived_track",
+    track_id="66666666-6666-4666-8666-666666666666",
+    label_en="Archived fixture track",
+    status=STATUS_ARCHIVED,
+)
 
 #: The seven shapefile layers, with the columns each actually carries.
 #: docs/current-labeling-practice.md, "Inventory".

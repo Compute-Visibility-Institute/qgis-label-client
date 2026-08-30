@@ -1,0 +1,142 @@
+"""Reading the layer tree: which imagery the analyst is actually tracing.
+
+The rules are tested in ``test_validtime.py`` without QGIS. What is tested here is the
+one thing that file cannot reach — turning a project's layer tree into the stack those
+rules run against — because getting *this* wrong produces a default that is confidently
+derived from a scene nobody is looking at.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from qgis.core import Qgis
+
+from qgis_label_client.core.assets import ASSET_KEY_PROPERTY, CAPTURED_AT_PROPERTY
+from qgis_label_client.validtime import current_stack
+
+APRIL = datetime(2026, 4, 21, 3, 40, 14, tzinfo=timezone.utc)
+OCTOBER = datetime(2026, 10, 3, 3, 12, 0, tzinfo=timezone.utc)
+
+
+class FakeLayer:
+    def __init__(self, layer_id, name, captured_at=None, raster=True):
+        self._id = layer_id
+        self._name = name
+        self._type = Qgis.LayerType.Raster if raster else Qgis.LayerType.Vector
+        self.properties = {}
+        if captured_at is not None:
+            self.properties[CAPTURED_AT_PROPERTY] = captured_at.isoformat()
+            self.properties[ASSET_KEY_PROPERTY] = f"{layer_id}:visual"
+
+    def id(self):
+        return self._id
+
+    def name(self):
+        return self._name
+
+    def type(self):
+        return self._type
+
+    def customProperty(self, key, default=""):  # noqa: N802 - Qt naming
+        return self.properties.get(key, default)
+
+
+class FakeNode:
+    def __init__(self, layer, visible=True):
+        self._layer = layer
+        self._visible = visible
+
+    def layer(self):
+        return self._layer
+
+    def isVisible(self):  # noqa: N802 - Qt naming
+        return self._visible
+
+
+class FakeRoot:
+    def __init__(self, nodes):
+        self._nodes = nodes
+
+    def findLayers(self):  # noqa: N802 - Qt naming
+        return self._nodes
+
+    def layerOrder(self):  # noqa: N802 - Qt naming
+        return [node.layer() for node in self._nodes]
+
+
+class FakeProject:
+    def __init__(self, nodes):
+        self._root = FakeRoot(nodes)
+
+    def layerTreeRoot(self):  # noqa: N802 - Qt naming
+        return self._root
+
+
+def test_the_topmost_visible_raster_supplies_the_date() -> None:
+    project = FakeProject(
+        [
+            FakeNode(FakeLayer("october", "WV03 03OCT26", OCTOBER)),
+            FakeNode(FakeLayer("april", "WV03 26APR21", APRIL)),
+        ]
+    )
+    assert current_stack(project).top_dated().captured_at == OCTOBER
+
+
+def test_an_unchecked_layer_does_not_vote() -> None:
+    """A raster that is loaded but not drawn is not being traced from.
+
+    Letting it win would make the default follow a scene nobody is looking at — the
+    same failure the whole mechanism exists to prevent, reached by another route.
+    """
+    project = FakeProject(
+        [
+            FakeNode(FakeLayer("october", "WV03 03OCT26", OCTOBER), visible=False),
+            FakeNode(FakeLayer("april", "WV03 26APR21", APRIL)),
+        ]
+    )
+    assert current_stack(project).top_dated().captured_at == APRIL
+
+
+def test_vector_layers_are_not_imagery() -> None:
+    project = FakeProject(
+        [
+            FakeNode(FakeLayer("labels", "Labels", raster=False)),
+            FakeNode(FakeLayer("april", "WV03 26APR21", APRIL)),
+        ]
+    )
+    stack = current_stack(project)
+    assert [ref.layer_id for ref in stack.layers] == ["april"]
+
+
+def test_an_undated_raster_is_kept_but_carries_no_date() -> None:
+    """It is still part of what is on screen, so it belongs in the fingerprint.
+
+    Dropping it would make toggling a basemap invisible to stickiness, which is right,
+    but it would also make two genuinely different stacks fingerprint identically.
+    """
+    project = FakeProject(
+        [
+            FakeNode(FakeLayer("basemap", "OpenStreetMap")),
+            FakeNode(FakeLayer("april", "WV03 26APR21", APRIL)),
+        ]
+    )
+    stack = current_stack(project)
+    assert len(stack.layers) == 2
+    assert stack.top_dated().layer_id == "april"
+
+
+def test_an_unparseable_stamp_is_ignored_rather_than_raised() -> None:
+    """This runs on the path that installs the form default.
+
+    Raising costs the analyst the default entirely — worse than falling through to the
+    layer below, which is merely less specific.
+    """
+    broken = FakeLayer("broken", "Corrupt stamp")
+    broken.properties[CAPTURED_AT_PROPERTY] = "not-a-date"
+    project = FakeProject([FakeNode(broken), FakeNode(FakeLayer("april", "A", APRIL))])
+    assert current_stack(project).top_dated().captured_at == APRIL
+
+
+def test_an_empty_project_is_not_an_error() -> None:
+    assert current_stack(FakeProject([])).layers == ()

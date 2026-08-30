@@ -40,6 +40,15 @@ from .errors import BackendError
 #: Set by the project file in the private repo; read here.
 ASSET_KEY_PROPERTY = "cvi/asset_key"
 
+#: Layer custom property holding the scene's acquisition instant, ISO 8601.
+#:
+#: Stamped during the signed-URL refresh because that is the only moment the plugin
+#: holds both the layer and the capture metadata at once. Everything downstream reads
+#: it off the layer instead of re-querying: a label's default ``valid_from`` is the
+#: acquisition time of whatever imagery is on top, and resolving that must not require
+#: a network round trip every time the analyst starts a polygon.
+CAPTURED_AT_PROPERTY = "cvi/captured_at"
+
 #: GDAL's HTTP range-request virtual filesystem. QGIS streams COGs through it with no
 #: tile server in the path at all.
 VSICURL_PREFIX = "/vsicurl/"
@@ -60,6 +69,18 @@ class SignedAsset:
     url: str
     gs_uri: str | None = None
     expires_at: datetime | None = None
+    #: When the sensor recorded this scene -- STAC ``datetime``, from the IMD
+    #: ``earliestAcqTime``, and NOT when it was delivered or ingested.
+    #:
+    #: This is the honest default for a label's ``valid_from``: a polygon traced
+    #: over this imagery is a claim about the ground AT THIS INSTANT. See
+    #: :mod:`..core.validtime` for what is done with it, and for the defect that
+    #: exists when it is missing -- a compound digitised from the April scene
+    #: recorded as a claim about an afternoon in August.
+    #:
+    #: ``None`` for a backend too old to send it. The plugin then has no default
+    #: and says so, rather than substituting ``now()``.
+    captured_at: datetime | None = None
 
     @property
     def key(self) -> str | None:
@@ -215,6 +236,10 @@ def parse_signed_assets(document: Any) -> tuple[list[SignedAsset], datetime | No
                 url=url,
                 gs_uri=str(raw["gs_uri"]) if raw.get("gs_uri") else None,
                 expires_at=expiry,
+                # Same RFC 3339 parse as the expiry: one instant format on this
+                # wire, and a value that fails to parse becomes None rather than
+                # a wrong date.
+                captured_at=_parse_expiry(raw.get("captured_at")),
             )
         )
     if not assets:

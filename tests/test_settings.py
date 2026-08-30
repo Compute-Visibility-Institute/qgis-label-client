@@ -112,3 +112,73 @@ def test_is_configured_tracks_the_url_only():
     assert settings.is_configured() is False
     settings.set("api_base_url", "https://host")
     assert settings.is_configured() is True
+
+
+# --- credentials, one per history track -------------------------------------
+
+
+def test_a_profile_written_before_tracks_keeps_working():
+    """The upgrade path, and the reason the legacy key still exists.
+
+    Reading an old `authcfg` as "no credentials" would sign the analyst out on upgrade --
+    in a plugin whose sign-in flow sets an unrecoverable master password. The old value
+    means exactly "a credential that names no track", so that is where it is promoted.
+    """
+    settings = PluginSettings()
+    settings.set("authcfg", "abc1234")
+    assert settings.authcfg_by_track == {"": "abc1234"}
+    assert settings.authcfg_for("anything") == "abc1234"
+
+
+def test_the_promotion_is_a_read_and_does_not_rewrite_the_old_setting():
+    # So downgrading the plugin leaves the profile working.
+    settings = PluginSettings()
+    settings.set("authcfg", "abc1234")
+    settings.authcfg_by_track  # noqa: B018 - the read is the thing under test
+    assert settings.get("authcfg") == "abc1234"
+
+
+def test_a_track_with_its_own_credential_uses_it():
+    settings = PluginSettings()
+    settings.set_authcfg_by_track({"": "default1", "alpha": "alpha12"})
+    assert settings.authcfg_for("alpha") == "alpha12"
+    assert settings.authcfg_for("beta") == "default1"
+
+
+def test_storing_a_map_clears_the_legacy_single_value():
+    # Otherwise the promotion could resurrect a credential that was signed out of.
+    settings = PluginSettings()
+    settings.set("authcfg", "old1234")
+    settings.set_authcfg_by_track({"": "new1234"})
+    assert settings.get("authcfg") == ""
+    assert settings.authcfg_by_track == {"": "new1234"}
+
+
+def test_signing_out_leaves_nothing_behind():
+    settings = PluginSettings()
+    settings.set_authcfg_by_track({"": "a", "alpha": "b"})
+    settings.set_authcfg_by_track({})
+    assert settings.authcfg_by_track == {}
+    assert settings.authcfg == ""
+
+
+def test_a_corrupt_credential_map_is_treated_as_none_rather_than_raising():
+    # A settings file somebody edited must not make the plugin unloadable.
+    settings = PluginSettings()
+    settings.set("authcfg_by_track", "{not json")
+    assert settings.authcfg_by_track == {}
+
+
+def test_no_track_name_is_a_default_anywhere_in_settings():
+    # Tracks are data, exactly like classes. A default here would be the beginning of a
+    # second copy of the deployment's vocabulary.
+    assert DEFAULTS["track"] == ""
+    assert PluginSettings().track == ""
+
+
+def test_the_tracks_endpoint_sits_under_the_backend_namespace():
+    assert DEFAULTS["tracks_path"] == "v1/tracks"
+
+
+def test_the_credential_map_still_holds_no_secret():
+    assert DEFAULTS["authcfg_by_track"] == ""

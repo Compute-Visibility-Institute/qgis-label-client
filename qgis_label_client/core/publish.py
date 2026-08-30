@@ -17,7 +17,7 @@ loudly on the next request; a feature published under the wrong class, or with a
 missing its final character, or without a survey extent, is indistinguishable from a
 correct one the moment it lands.
 
-THE THREE CLAIMS A PUBLISH MAKES
+THE FOUR CLAIMS A PUBLISH MAKES
 
 1. **These features are of this class.** Guessed from the layer name, confirmed by a human,
    never inferred silently -- see :mod:`.legacy`.
@@ -29,6 +29,13 @@ THE THREE CLAIMS A PUBLISH MAKES
    no ``labeled_extent`` the export pipeline cannot tell "none here" from "nobody looked",
    and every unlabeled unit at those 187 sites becomes supervised background. The plan
    states this claim explicitly so it is refused deliberately rather than by omission.
+4. **This is the dataset they belong in.** The newest one, and the only one of the four
+   whose failure the annotator can see coming: a publish into the wrong history track puts
+   1,246 features into the dataset the analysts are building, or -- worse, because nobody
+   would look -- into the one somebody was kicking the tyres with. Neither can be undone:
+   identity is server-assigned, so nothing here can find those rows again. So the track is
+   in the plan, in the preview, in the confirmation and on the stamp, and a plan with no
+   track selected is *blocking* rather than merely worrying.
 
 Nothing here invents an identity. ``label.label_id`` is ``uuid DEFAULT gen_random_uuid()``
 and the server assigns it; the source's own ``id`` column is 0% populated across all 1,246
@@ -55,6 +62,7 @@ from .legacy import (
 )
 from .names import NameSet, build_names
 from .registry import ClassRegistry, LabelClass
+from .tracks import Track
 
 #: Layer custom property recording that this layer has already been published, and what
 #: was sent. Lives on the layer rather than in settings so it travels with the project
@@ -115,16 +123,34 @@ class PublishRecord:
     collection_id: str = ""
     class_id: str = ""
     feature_count: int = 0
+    #: The history track it went to. Empty on a record written before tracks existed, and
+    #: that emptiness is honest: nobody recorded it, so nothing here may claim one.
+    track: str = ""
 
     def describe(self) -> str:
         when = self.published_at or "at an unrecorded time"
         where = f" to {self.collection_id}" if self.collection_id else ""
+        # The track goes in the same sentence as the count, not in a footnote. A second
+        # publish is only obviously wrong when you can see it would land somewhere else --
+        # and "already published, 872 features" reads as reassurance until you notice the
+        # dataset named is not the one you have selected.
+        track = f" on track {self.track!r}" if self.track else ""
         return (
-            f"Already published{where} {when}: {self.feature_count} feature(s)"
+            f"Already published{where}{track} {when}: {self.feature_count} feature(s)"
             f"{f' as {self.class_id}' if self.class_id else ''}. Publishing again "
             "creates a SECOND copy - the server assigns identity, so nothing here can "
             "recognise the first."
         )
+
+    def on_another_track(self, track: str) -> bool:
+        """True when this layer was last published somewhere other than `track`.
+
+        Not a problem in itself -- publishing the same shapefile into two tracks is a
+        perfectly reasonable thing to do, and is exactly what setting up a test dataset
+        looks like. It is worth *saying*, because the "you have published this before"
+        warning otherwise implies a duplicate that would not actually be one.
+        """
+        return bool(self.track) and self.track != track
 
 
 def parse_record(raw: Any) -> PublishRecord | None:
@@ -150,6 +176,10 @@ def parse_record(raw: Any) -> PublishRecord | None:
         collection_id=str(document.get("collection_id") or ""),
         class_id=str(document.get("class_id") or ""),
         feature_count=int(count) if isinstance(count, (int, float)) else 0,
+        # Absent in a record written before tracks existed. Read as "" rather than as the
+        # current track: nobody recorded which dataset those features went to, and
+        # inventing an answer here would be a claim the data cannot support.
+        track=str(document.get("track") or ""),
     )
 
 
@@ -161,6 +191,7 @@ def format_record(record: PublishRecord) -> str:
             "collection_id": record.collection_id,
             "class_id": record.class_id,
             "feature_count": record.feature_count,
+            "track": record.track,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -638,6 +669,9 @@ class PublishPlan:
 
     layers: tuple[LayerPlan, ...] = ()
     registry: ClassRegistry | None = None
+    #: Which history track everything below would land in. ``None`` means the plugin does
+    #: not know, which is blocking -- see :meth:`track_problems`.
+    track: Track | None = None
 
     def __len__(self) -> int:
         return len(self.layers)
@@ -682,8 +716,75 @@ class PublishPlan:
             )
         )
 
+    @property
+    def track_name(self) -> str:
+        return self.track.name if self.track else ""
+
+    def track_problems(self) -> tuple[str, ...]:
+        """Reasons this publish must not start at all, on track grounds. Blocking.
+
+        Blocking rather than advisory, which is a departure from how this module treats
+        every other *claim*: a missing survey extent is a warning, an unrecoverable one,
+        and still only a warning. The difference is that the extent warning describes
+        something the publish fails to say, and this describes the publish saying it in
+        the wrong place. There is no version of "publish these 1,246 features into a
+        dataset nobody has named" that is a defensible choice, and the person clicking
+        cannot tell afterwards which one it went to -- so the button is off.
+        """
+        if self.track is None:
+            return (
+                "No history track is selected, so there is no way to say which dataset "
+                "these features would join. Connect, then choose a track in the panel.",
+            )
+        if self.track.archived:
+            return (
+                f"Track {self.track.name!r} is archived. The database refuses every write "
+                "to an archived track, so this publish would fail feature by feature "
+                "after the first request. Choose an active track.",
+            )
+        return ()
+
+    def republished_elsewhere(self) -> tuple[LayerPlan, ...]:
+        """Selected layers last published to a *different* track.
+
+        Split out from :meth:`republished` because the two need opposite sentences. A
+        second publish to the same track duplicates rows; a first publish to a different
+        track is how you seed a test dataset, and calling it a duplicate would train
+        people to click through the warning that catches the real one.
+        """
+        return tuple(
+            plan
+            for plan in self.selected()
+            if plan.source.previous is not None
+            and plan.source.previous.on_another_track(self.track_name)
+        )
+
     def problems(self) -> tuple[str, ...]:
-        return tuple(problem for plan in self.layers for problem in plan.problems())
+        return self.track_problems() + tuple(
+            problem for plan in self.layers for problem in plan.problems()
+        )
+
+    def track_claim(self) -> str:
+        """The sentence naming the dataset this publish would create rows in.
+
+        Rendered whether or not anything is wrong, and that is the point: the survey and
+        damaged-name warnings appear only when there is something to warn about, so a
+        clean preview has nothing on it that says where the features are going. This
+        always does.
+        """
+        if self.track is None:
+            return ""
+        chosen = self.selected()
+        count = self.total_features()
+        where = self.track.describe()
+        if not chosen:
+            return f"Nothing selected. The track these would join is {where}."
+        return (
+            f"{count} feature(s) will be created on history track {where}. "
+            "They join that dataset and no other, and this cannot be undone: the server "
+            "assigns each one its identity, so nothing here can find them again to move "
+            "or remove them."
+        )
 
     def summary(self) -> str:
         """One sentence stating what is about to happen."""
@@ -691,9 +792,10 @@ class PublishPlan:
         if not chosen:
             return "Nothing selected. No features will be published."
         classes = sorted({plan.class_id for plan in chosen})
+        where = f" on track {self.track_name}" if self.track_name else ""
         return (
             f"{self.total_features()} feature(s) from {len(chosen)} layer(s), "
-            f"as {len(classes)} class(es): {', '.join(classes)}."
+            f"as {len(classes)} class(es): {', '.join(classes)}{where}."
         )
 
 
@@ -701,23 +803,32 @@ def build_plan(
     sources: Iterable[SourceLayer],
     registry: ClassRegistry,
     choices: Mapping[str, LayerChoice] | None = None,
+    track: Track | None = None,
 ) -> PublishPlan:
     """Build the plan the preview dialog renders and the task executes.
 
     Where the caller has made no choice, the class is guessed from the layer name and the
     layer is pre-selected -- except when it has been published before, which flips the
     default off. The user has to reach for the checkbox to publish a second copy.
+
+    A layer previously published to a *different* track keeps its pre-selection: sending
+    the same shapefile into a second dataset is not a duplicate, it is how a test track
+    gets populated. It is still announced -- see :meth:`PublishPlan.republished_elsewhere`.
     """
     decisions = dict(choices or {})
     plans: list[LayerPlan] = []
 
+    track_name = track.name if track else ""
     for source in sources:
         choice = decisions.get(source.layer_id)
         guess = guess_class(source.name, registry)
         if choice is None:
+            already_here = source.previous is not None and not source.previous.on_another_track(
+                track_name
+            )
             choice = LayerChoice(
                 layer_id=source.layer_id,
-                publish=source.previous is None and guess.confident,
+                publish=not already_here and guess.confident,
                 class_id=guess.class_id,
             )
         label_class = registry.get(choice.class_id) if choice.class_id else None
@@ -732,7 +843,7 @@ def build_plan(
             )
         )
 
-    return PublishPlan(layers=tuple(plans), registry=registry)
+    return PublishPlan(layers=tuple(plans), registry=registry, track=track)
 
 
 # ---------------------------------------------------------------------------
@@ -869,6 +980,11 @@ class PublishReport:
     cancelled: bool = False
     #: Classes published in this run with no ``labeled_extent`` declared for them.
     classes_without_extent: tuple[str, ...] = ()
+    #: The history track everything in this run went to. Carried on the report rather than
+    #: looked up afterwards: by the time this is read the panel's selection may have
+    #: changed, and the question the report answers is where these features actually
+    #: landed, not where the next publish would go.
+    track: str = ""
     #: Set when the run stopped on an error nobody anticipated. The counts above are still
     #: what reached the server, which is the only reason this is a field and not an
     #: exception: an unhandled failure on row 900 has already written 899 rows, and the
@@ -900,21 +1016,32 @@ class PublishReport:
     def clean(self) -> bool:
         return not self.failed and not self.skipped and not self.cancelled and not self.error
 
+    @property
+    def _where(self) -> str:
+        """The ``on track X`` clause, or empty. Appended to every count this report states.
+
+        A partial run is the case this matters for. "Cancelled after publishing 400
+        feature(s)" leaves somebody deciding whether to re-run, and that decision is
+        different depending on which dataset the 400 are in -- so the answer travels with
+        the number rather than sitting in a different dialog.
+        """
+        return f" on track {self.track}" if self.track else ""
+
     def summary(self) -> str:
         if self.error:
             return (
                 f"Stopped by an unexpected error after publishing {self.published} "
-                f"feature(s): {self.error} What was already sent is on the server; "
-                "re-running publishes the rest AND a second copy of these, because the "
-                "server assigns identity."
+                f"feature(s){self._where}: {self.error} What was already sent is on the "
+                "server; re-running publishes the rest AND a second copy of these, because "
+                "the server assigns identity."
             )
         if self.cancelled:
             return (
-                f"Cancelled after publishing {self.published} feature(s). What was already "
-                "sent is on the server; re-running publishes the rest AND a second copy of "
-                "these, because the server assigns identity."
+                f"Cancelled after publishing {self.published} feature(s){self._where}. What "
+                "was already sent is on the server; re-running publishes the rest AND a "
+                "second copy of these, because the server assigns identity."
             )
-        bits = [f"{self.published} feature(s) published"]
+        bits = [f"{self.published} feature(s) published{self._where}"]
         if self.failed:
             bits.append(f"{self.failed} rejected by the server")
         if self.skipped:
@@ -940,8 +1067,10 @@ class PublishReport:
         """
         if not self.classes_without_extent:
             return ""
+        where = f" on track {self.track}" if self.track else ""
         return (
-            "These classes were published with no labeled_extent declared for them:\n  - "
+            f"These classes were published{where} with no labeled_extent declared for "
+            "them:\n  - "
             + "\n  - ".join(self.classes_without_extent)
             + "\n\nYou have recorded WHAT was found. Nothing yet records WHERE ANYONE "
             "LOOKED, and those are different facts. Ground outside a declared exhaustive "
