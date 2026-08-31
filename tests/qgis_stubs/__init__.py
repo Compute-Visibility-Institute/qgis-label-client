@@ -15,7 +15,14 @@ anything real, and each of those is real because a test depends on it:
 * ``QgsSettings`` -- an in-memory store, so settings round-tripping can be tested;
 * ``QgsTask`` / ``QgsApplication.taskManager`` -- enough to check that the runner holds a
   reference and cancels on shutdown;
-* ``pyqtSignal`` -- real connect/emit, so signal wiring is exercised rather than mocked.
+* ``pyqtSignal`` -- real connect/emit, so signal wiring is exercised rather than mocked;
+* ``QgsAuthMethodConfig`` / ``QgsApplication.authManager`` -- enough of the credential
+  store to assert **which values end up in a config map and which do not**. That is a
+  security property rather than a convenience: the ``APIHeader`` method emits every key in
+  the map as an outgoing HTTP header, so the map is the difference between the history
+  track reaching the server (required) and the OAuth refresh token reaching it too
+  (never). It is also where the hourly token rotation is checked to reuse config ids, on
+  which every saved ``.qgz`` and every loaded layer depends.
 
 If a test starts needing more than that, it is probably a test that belongs against a
 real QGIS instead.
@@ -257,16 +264,144 @@ class _TaskManager:
 _TASK_MANAGER = _TaskManager()
 
 
+class QgsAuthMethodConfig(Stub):
+    """A credential entry: id, name, method, version and the header map.
+
+    Hand-written because the header map is the thing worth asserting about
+    :mod:`qgis_label_client.auth`. Under the ``APIHeader`` method every key in it becomes
+    an outgoing HTTP request header, so what is in the map and what is merely *near* it
+    decides whether a long-lived refresh token is transmitted on every request.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__()
+        self._id = ""
+        self._name = ""
+        self._method = ""
+        self._version = 0
+        self._config: dict[str, str] = {}
+
+    def id(self) -> str:
+        return self._id
+
+    def setId(self, value: str) -> None:  # noqa: N802 - Qt naming
+        self._id = value
+
+    def name(self) -> str:
+        return self._name
+
+    def setName(self, value: str) -> None:  # noqa: N802
+        self._name = value
+
+    def method(self) -> str:
+        return self._method
+
+    def setMethod(self, value: str) -> None:  # noqa: N802
+        self._method = value
+
+    def version(self) -> int:
+        return self._version
+
+    def setVersion(self, value: int) -> None:  # noqa: N802
+        self._version = value
+
+    def configMap(self) -> dict[str, str]:  # noqa: N802
+        return dict(self._config)
+
+    def setConfigMap(self, mapping: dict[str, str]) -> None:  # noqa: N802
+        # Replaces the whole map, exactly as the real one does. Anything less would hide
+        # the bug where a rotated credential keeps the previous track's header.
+        self._config = dict(mapping)
+
+    def clone(self) -> QgsAuthMethodConfig:
+        """A detached copy, because the real manager hands back copies, not references."""
+        copy = QgsAuthMethodConfig()
+        copy._id = self._id
+        copy._name = self._name
+        copy._method = self._method
+        copy._version = self._version
+        copy._config = dict(self._config)
+        return copy
+
+
+class _AuthManager:
+    """Enough of ``QgsAuthManager`` to exercise storing, rotating and signing out.
+
+    Deliberately keeps auth *settings* in a separate dictionary from the config maps,
+    because that separation is the point: settings are encrypted at rest and never
+    attached to a request, config maps are emitted as headers.
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.configs: dict[str, QgsAuthMethodConfig] = {}
+        self.settings: dict[str, tuple[Any, bool]] = {}
+        #: ids passed to clearCachedConfig. An hourly rotation that does not clear the
+        #: cache writes a fresh token QGIS never sends, which looks identical to no
+        #: rotation at all -- so the test asserts the call happened.
+        self.cleared: list[str] = []
+        self.disabled = False
+        self.master_password_set = True
+        self._ids = itertools.count(1)
+
+    def isDisabled(self) -> bool:  # noqa: N802
+        return self.disabled
+
+    def masterPasswordIsSet(self) -> bool:  # noqa: N802
+        return self.master_password_set
+
+    def setMasterPassword(self, verify: bool = False) -> bool:  # noqa: N802
+        self.master_password_set = True
+        return True
+
+    def configIds(self) -> list[str]:  # noqa: N802
+        return list(self.configs)
+
+    def storeAuthenticationConfig(self, config, overwrite=False):  # noqa: N802
+        if not config.id():
+            config.setId(f"cvi{next(self._ids):04d}")
+        self.configs[config.id()] = config.clone()
+        return True, config
+
+    def loadAuthenticationConfig(self, authcfg, config, full=False):  # noqa: N802
+        stored = self.configs.get(authcfg)
+        if stored is None:
+            return False, config
+        # A copy, like the real one: the caller mutates what it gets back, and handing out
+        # the stored object would make every edit take effect before it was stored.
+        return True, stored.clone()
+
+    def removeAuthenticationConfig(self, authcfg) -> bool:  # noqa: N802
+        return self.configs.pop(authcfg, None) is not None
+
+    def clearCachedConfig(self, authcfg) -> None:  # noqa: N802
+        self.cleared.append(authcfg)
+
+    def storeAuthSetting(self, key, value, encrypt=False) -> bool:  # noqa: N802
+        self.settings[key] = (value, bool(encrypt))
+        return True
+
+    def authSetting(self, key, default="", decrypt=False):  # noqa: N802
+        entry = self.settings.get(key)
+        return default if entry is None else entry[0]
+
+    def removeAuthSetting(self, key) -> bool:  # noqa: N802
+        return self.settings.pop(key, None) is not None
+
+
+_AUTH_MANAGER = _AuthManager()
+
+
 class QgsApplication(Stub):
     @staticmethod
     def taskManager() -> _TaskManager:  # noqa: N802 - Qt naming
         return _TASK_MANAGER
 
     @staticmethod
-    def authManager():  # noqa: N802 - Qt naming
-        # None means "auth system unavailable", which is the honest answer without QGIS
-        # and makes auth.auth_manager() raise its explanatory ConfigurationError.
-        return None
+    def authManager() -> _AuthManager:  # noqa: N802 - Qt naming
+        return _AUTH_MANAGER
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +426,7 @@ def _make_module(name: str, explicit: dict[str, Any] | None = None) -> types.Mod
 
 
 _CORE_EXPLICIT = {
+    "QgsAuthMethodConfig": QgsAuthMethodConfig,
     "QgsSettings": QgsSettings,
     "QgsMessageLog": QgsMessageLog,
     "QgsFeedback": QgsFeedback,
@@ -341,8 +477,14 @@ def install() -> None:
             setattr(sys.modules[parent_name], child, module)
 
 
+def auth_manager() -> _AuthManager:
+    """The stub credential store, so a test can inspect or preload it."""
+    return _AUTH_MANAGER
+
+
 def reset() -> None:
     """Clear the state the behaviour-bearing stubs accumulate between tests."""
     QgsSettings.reset()
     QgsMessageLog.records.clear()
     _TASK_MANAGER.tasks.clear()
+    _AUTH_MANAGER.reset()

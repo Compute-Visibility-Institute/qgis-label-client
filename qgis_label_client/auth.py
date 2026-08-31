@@ -2,12 +2,22 @@
 
 WHY THE TOKEN GOES IN qgis-auth.db AND NOWHERE ELSE
 
-The `api` service authenticates desktop clients with bearer tokens (IAP is cookie-based
-and awkward outside a browser). A token in a ``.qgz`` travels with the project the first
-time someone emails it; a token in ``QGIS3.ini`` ends up in a support bundle; a token in
-this repository would be in a public GitHub repo forever. ``QgsAuthManager`` encrypts it
-in ``qgis-auth.db`` and hands out a seven-character id, and that id is the only thing
-that appears in project files, settings and layer URIs.
+The `api` service authenticates desktop clients with a bearer token -- a Google ID token,
+obtained by :mod:`..oauth_flow` and renewed by the plugin roughly hourly (IAP is
+cookie-based and awkward outside a browser). A token in a ``.qgz`` travels with the
+project the first time someone emails it; a token in ``QGIS3.ini`` ends up in a support
+bundle; a token in this repository would be in a public GitHub repo forever.
+``QgsAuthManager`` encrypts it in ``qgis-auth.db`` and hands out a seven-character id, and
+that id is the only thing that appears in project files, settings and layer URIs.
+
+WHERE THE REFRESH TOKEN GOES, AND WHY NOT HERE
+
+Not in the config map. The ``APIHeader`` method emits **every** key in that map as an
+outgoing HTTP header, so a ``refresh_token`` entry would be sent to the backend -- and to
+anything else the credential is ever attached to -- on every single request. It is stored
+as an *auth setting* instead (:func:`store_refresh_token`), encrypted in the same database
+but never attached to a request. That distinction is the whole reason there are two
+storage calls here rather than one bigger config map.
 
 WHY THE APIHeader METHOD
 
@@ -43,6 +53,7 @@ from qgis.core import QgsApplication, QgsAuthMethodConfig
 
 from .core.errors import ConfigurationError
 from .core.tracks import TRACK_HEADER
+from .log import log_warning
 
 #: QGIS auth method that injects arbitrary request headers.
 AUTH_METHOD = "APIHeader"
@@ -57,6 +68,16 @@ CONFIG_NAME = "CVI labeling API"
 #: with it reach whatever the deployment's default track is, which is what the API does
 #: with any read that does not say.
 DEFAULT_TRACK_KEY = ""
+
+#: Where the OAuth refresh token lives: an *auth setting*, not a config map entry.
+#:
+#: The distinction is the security property, not a filing preference. Auth settings are
+#: encrypted in qgis-auth.db and are never attached to a request by any auth method; the
+#: APIHeader config map, by contrast, is emitted verbatim as request headers. A refresh
+#: token in the config map would be sent to the backend on every request -- and a refresh
+#: token is a far worse thing to leak than the hour-long ID token it mints, because it
+#: does not expire.
+REFRESH_TOKEN_SETTING = "cvi/refresh_token"
 
 
 @dataclass(frozen=True)
@@ -100,7 +121,7 @@ def master_password_ready(prompt: bool = True) -> bool:
     return bool(manager.setMasterPassword(True))
 
 
-def store_bearer_token(token: str, existing_authcfg: str = "", track: str = "") -> str:
+def store_id_token(token: str, existing_authcfg: str = "", track: str = "") -> str:
     """Store or replace the API bearer token for one track; return its ``authcfg`` id.
 
     The token is passed in, used once and not returned, logged or stored anywhere else.
@@ -145,7 +166,92 @@ def store_bearer_token(token: str, existing_authcfg: str = "", track: str = "") 
             "QGIS refused to store the credential. Check the Authentication tab in "
             "Settings > Options."
         )
+    # The renewal path rewrites this config every hour under the SAME id, which is what
+    # keeps saved projects and loaded layers working. QGIS caches a decrypted config per
+    # id, so without this the method would keep serving the previous hour's header from
+    # cache -- a refresh that writes a fresh token nothing ever sends, which looks exactly
+    # like the token not refreshing at all.
+    clear_cached_config(config.id())
     return config.id()
+
+
+def clear_cached_config(authcfg: str) -> None:
+    """Drop QGIS's decrypted copy of one config, so the next request re-reads it.
+
+    Best-effort on purpose. ``clearCachedConfig`` is not guaranteed to be exposed through
+    SIP on every build this plugin supports, and a missing binding must degrade to "the
+    header may be stale until QGIS is restarted" rather than to a failed sign-in.
+    """
+    if not authcfg:
+        return
+    manager = QgsApplication.authManager()
+    clear = getattr(manager, "clearCachedConfig", None) if manager is not None else None
+    if clear is None:
+        return
+    try:
+        clear(authcfg)
+    except Exception as exc:  # noqa: BLE001 - a cache hint must never fail a rotation
+        log_warning(f"Could not clear the cached credential for {authcfg}: {exc}")
+
+
+def store_refresh_token(token: str) -> bool:
+    """Keep the refresh token in qgis-auth.db, out of every outgoing request.
+
+    Returns False rather than raising when this QGIS build does not expose the auth-setting
+    API. That degrades honestly: sign-in still works, the ID token is still stored, and the
+    session simply ends in an hour instead of renewing itself -- which the caller says out
+    loud. Raising instead would refuse a sign-in that would otherwise have worked.
+    """
+    if not token:
+        return False
+    manager = auth_manager()
+    store = getattr(manager, "storeAuthSetting", None)
+    if store is None:
+        return False
+    try:
+        return bool(store(REFRESH_TOKEN_SETTING, token, True))
+    except Exception as exc:  # noqa: BLE001 - see the docstring: degrade, never refuse
+        log_warning(f"Could not store the sign-in renewal token: {exc}")
+        return False
+
+
+def read_refresh_token() -> str:
+    """The stored refresh token, or ``""``.
+
+    Needs the master password entered this session, because the value is encrypted. An
+    empty answer therefore means either "never signed in with Google" or "the database is
+    locked", and the caller has to check :func:`master_password_ready` to tell them apart
+    -- reporting a locked database as a lost sign-in would send the analyst through a
+    browser round-trip that fixes nothing.
+    """
+    manager = auth_manager()
+    read = getattr(manager, "authSetting", None)
+    if read is None:
+        return ""
+    try:
+        value = read(REFRESH_TOKEN_SETTING, "", True)
+    except Exception as exc:  # noqa: BLE001 - a missing binding is not a sign-in failure
+        log_warning(f"Could not read the sign-in renewal token: {exc}")
+        return ""
+    return str(value or "").strip()
+
+
+def clear_refresh_token() -> bool:
+    """Destroy the local copy of the refresh token. Half of signing out.
+
+    The other half is revoking it at Google, which the plugin does, because a refresh token
+    that still works is a live grant on the analyst's account -- and this module promises
+    that signing out actually removes the credential.
+    """
+    manager = auth_manager()
+    remove = getattr(manager, "removeAuthSetting", None)
+    if remove is None:
+        return False
+    try:
+        return bool(remove(REFRESH_TOKEN_SETTING))
+    except Exception as exc:  # noqa: BLE001 - sign-out must complete even if this fails
+        log_warning(f"Could not remove the stored sign-in renewal token: {exc}")
+        return False
 
 
 def config_name(track: str = "") -> str:
@@ -157,7 +263,7 @@ def config_name(track: str = "") -> str:
     return f"{CONFIG_NAME} [{track}]" if track else CONFIG_NAME
 
 
-def store_bearer_token_for_tracks(
+def store_id_token_for_tracks(
     token: str,
     tracks: Sequence[str] = (),
     existing: Mapping[str, str] | None = None,
@@ -182,7 +288,7 @@ def store_bearer_token_for_tracks(
     wanted = [DEFAULT_TRACK_KEY, *(name for name in tracks if name)]
     stored: dict[str, str] = {}
     for name in dict.fromkeys(wanted):  # ordered, deduplicated
-        stored[name] = store_bearer_token(token, existing.get(name, ""), name)
+        stored[name] = store_id_token(token, existing.get(name, ""), name)
     # Entries for tracks that no longer exist are carried over rather than dropped: a
     # track missing from `tracks` may simply mean the panel has not connected yet, and
     # deleting a credential over that guess is not recoverable.
@@ -225,9 +331,16 @@ def remove_all(authcfgs: Mapping[str, str] | None) -> int:
 
     One per track means signing out has to be one act, not one per track. A credential
     left behind is a token still on disk after the analyst was told it was gone.
+
+    THE REFRESH TOKEN GOES TOO, and it goes here rather than at the call site so that no
+    future caller can forget it. Removing the ID-token configs while leaving the refresh
+    token behind would leave the strongest credential of the three on disk after the panel
+    said the sign-in was gone -- which is the promise in this module's docstring, broken
+    in the one direction nobody would notice.
     """
     removed = 0
     for authcfg in dict(authcfgs or {}).values():
         if remove(authcfg):
             removed += 1
+    clear_refresh_token()
     return removed

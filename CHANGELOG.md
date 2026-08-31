@@ -8,6 +8,49 @@ most recent entries into `metadata.txt` at release time.
 
 ### Added
 
+- **Sign in with Google, and stay signed in.** The credential is no longer a token pasted
+  into a password box: **Sign in with Google** opens the system browser, runs an
+  authorization-code flow with **PKCE (S256)** against a loopback listener, and stores the
+  resulting Google ID token in `QgsAuthManager` exactly as before — same `APIHeader`
+  method, same `Authorization: Bearer …` plus `X-Track` config map, same seven-character
+  id in every layer URI. **No client secret is embedded**: this is a Google *Desktop app*
+  client shipped in a public repository, so a secret in it would not be one, and PKCE is
+  what binds the exchange.
+
+  **Why the plugin runs the flow rather than QGIS's own OAuth2 auth method.** QGIS 3.44
+  can carry an `id_token` into a header through `extraTokens`, and it was rejected for two
+  reasons that both fail silently. It would **evict `X-Track`** — one auth config has one
+  method, and `extraTokens` maps token-endpoint *response fields* onto headers, so it
+  cannot carry a constant; since the auth config is the only channel that reaches the
+  native provider's requests, every read and every Part 4 write would resolve to the
+  deployment's default track. And QGIS captures the `id_token` **only on the initial code
+  exchange** — neither the refresh reply nor the synchronous refresh updates it — so after
+  about an hour it sends an expired JWT forever.
+
+  **Expiry is handled explicitly, in three places, because no one of them is enough.** A
+  timer renews at *expiry minus five minutes*, silently and with no browser. A check on the
+  way into anything that will put a credential on the wire covers the laptop that slept
+  through that timer. A repair on `HTTP 401` covers the rest — and it is a **net, not a
+  fix**: QGIS's own OAPIF provider makes the requests that fail and no plugin code is in
+  their path, so the plugin renews the credential and then says, in words, *reload the
+  layer*. Every renewal rewrites all the auth configs **under their existing ids** and
+  clears QGIS's cached copy of each, so saved `.qgz` projects and already-loaded layers
+  keep working and the provider's next request carries the new token rather than a cached
+  old one.
+
+  **The refresh token is stored as an encrypted auth setting, never in the config map.**
+  Under the `APIHeader` method every key in that map becomes an outgoing HTTP header, so a
+  refresh token there would be transmitted on every single request — and unlike the ID
+  token beside it, a refresh token does not expire. Signing out removes every credential,
+  destroys the local refresh token **and** revokes the grant at Google, so "signed out" is
+  true on both sides.
+
+  **A 403 now reaches the analyst verbatim.** The backend distinguishes "your credential is
+  bad" from "you authenticated perfectly and are not on the access list", and the second
+  message names the address it saw and says that signing in again will not help. Replacing
+  it with the word "Forbidden" is how somebody re-signs-in forever and files a bug, so the
+  server's own sentence is passed through and a **Copy my address** button sits next to it.
+
 - **The historical view: what the team believed at a chosen instant.** The panel gains a
   second time control, *Historical view (transaction time)*, and a menu entry beside it.
   Ticking it and pressing **Add historical layer** adds a read-only layer showing the
@@ -26,18 +69,18 @@ most recent entries into `metadata.txt` at release time.
   The point of a historical view is comparing it against the live layer, and against another
   historical layer at a different instant.
 
-  **The instant travels as an `X-Recorded-At` request header**, per layer, in the OAPIF
-  URI's `http-header:` vocabulary — where `X-Track` already goes. A query parameter cannot
-  do this job: `QgsOapifProvider::computeCapabilities` builds the `OPTIONS` probe that
-  decides whether a layer is editable and appends **no** query parameters, while
-  `sendOPTIONS` **does** install the URI's headers. A query-only pin would therefore report
-  the collection writable, QGIS would enable editing, and an edit made on January's map
-  would land on the live row — the present edited while looking at the past, silently. As a
-  header it is on every request the provider makes, including the probe, so the server
-  answers without the write verbs and QGIS greys the pencil out by itself. The plugin also
-  holds the layer read-only on its own side, because `setDataSource` recomputes that from
-  provider capabilities on every re-point, and says loudly if the server ever advertises a
-  pinned layer as writable.
+  **The instant travels as a landing-URL `?recorded_at=` query parameter**, corrected from
+  the header transport this entry originally claimed. Measured against QGIS 3.44.13 with a
+  bare HTTP listener: a layer URI's `http-header:` parameters **never reach the wire at
+  all**, while the same headers carried by an `APIHeader` auth configuration arrive intact
+  — which is why the *track* has always worked and why the instant, which had no such
+  channel, never arrived. A landing-URL query parameter does survive, on every request the
+  provider builds except the `OPTIONS` editability probe. That probe being unpinned costs
+  nothing: the historical collection is `editable: false` on the server, so it answers
+  `Allow: HEAD, GET` either way. The plugin also holds the layer read-only on its own side,
+  because `setDataSource` recomputes that from provider capabilities on every re-point, and
+  says loudly if the server ever advertises a pinned layer as writable. The full record is
+  in `core/recorded.py`.
 
   **The layer is unmistakable in the Layers panel.** `[BELIEVED 2026-01-15 08:00Z] Labels —
   read-only`, with the discriminating token first because the layer tree truncates from the

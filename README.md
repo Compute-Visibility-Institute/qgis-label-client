@@ -13,7 +13,7 @@ cannot do on its own.
 
 | | Why QGIS cannot do it |
 |---|---|
-| **Authentication** — stores an API token in `QgsAuthManager` and puts its seven-character id in every layer URI | QGIS can hold the credential, but something has to put it there and reference it. Doing this properly is what keeps tokens out of `.qgz` files that get emailed |
+| **Authentication** — signs in with Google, stores the resulting token in `QgsAuthManager`, puts its seven-character id in every layer URI, and **renews it before it expires** | QGIS can hold a credential, but something has to obtain it, reference it and replace it. QGIS 3.44 can carry an ID token itself, but only by evicting the `X-Track` header from the credential and only until the first refresh, after which it sends an expired one forever |
 | **Imagery credentials** — fetches fresh signed object-storage URLs and re-points raster layer sources | **The clearest reason this plugin exists.** Signed URLs expire, and there is no way to write "a URL, but fetch it fresh" into a project file. A `.qgz` saved on Monday has dead raster layers on Tuesday |
 | **Collections and class vocabulary** — read from the backend at connect time | Categories, styles, attribute schemas and form order live in the server's class registry. Anything compiled into the plugin would drift from the web UI the first time someone adds a class |
 | **As-of date** — pins layers to one instant of *valid* time | The Temporal Controller cannot drive `datetime`: its filter is a function node the Part 1 compiler refuses, so it filters client-side and downloads the whole collection. Sending the instant server-side is a plugin job |
@@ -57,11 +57,13 @@ Open the **CVI Label Client** panel from the toolbar, then:
 1. **API URL** — the landing page of your deployment's OGC API - Features endpoint.
    There is no default and there never will be one: this repository is public, so a real
    hostname cannot live in it. The greyed-out hint is a reserved example domain.
-2. **Sign in…** — paste your API token. It goes straight into `QgsAuthManager`
+2. **Sign in with Google** — opens your browser. Pick your work account, approve the
+   consent screen, close the tab. The resulting token goes straight into `QgsAuthManager`
    (`qgis-auth.db`, encrypted) and the plugin keeps only the seven-character reference.
    The first credential you ever store makes QGIS ask you to set a **master password**,
    which is **unrecoverable if forgotten**. That is why signing in is an explicit button
-   and not a side effect of loading a layer.
+   and not a side effect of loading a layer — and why it is worth letting your operating
+   system's keychain remember it, since the token renewal needs that database unlocked.
 3. **Connect** — lists the collections, the history tracks and the class registry.
 4. **History track** — pick which dataset you are working in. See below; this is the one
    setting whose being wrong produces data that looks entirely correct.
@@ -69,8 +71,48 @@ Open the **CVI Label Client** panel from the toolbar, then:
 6. **Refresh imagery URLs** at the start of each session.
 
 Nothing is stored anywhere except `QgsSettings` (URLs, page size, as-of state, the
-selected track) and `qgis-auth.db` (the tokens). No credential is written to a project
-file.
+selected track, the signed-in address and the token's expiry instant — none of them a
+secret) and `qgis-auth.db` (the tokens). No credential is written to a project file.
+
+### Staying signed in
+
+A Google ID token lives about an hour; an editing session does not. The plugin therefore
+holds a **refresh token** — encrypted in `qgis-auth.db` as an *auth setting*, deliberately
+**not** in the credential's header map, because that map is emitted verbatim as request
+headers and a refresh token does not expire. Renewal happens three ways, because no one of
+them covers every case:
+
+| | Covers |
+|---|---|
+| A timer at *expiry minus five minutes* | The normal afternoon. Silent, no browser |
+| A check on the way into any action that will put a credential on the wire | A laptop suspended over lunch, where the timer fired late or not at all |
+| A repair on `HTTP 401` | Everything else — and it is a **net, not a fix** |
+
+That last row is the honest limit. QGIS's native OAPIF provider makes its own requests and
+no plugin code is in their path, so a renewed credential cannot un-fail a request that
+already failed: the plugin renews, then says *reload the layer*. This is why the timer is
+the primary mechanism rather than the 401 handler.
+
+Signing out removes every stored credential **and** revokes the grant at Google, so
+"signed out" is true on both sides rather than only on this machine.
+
+### Why the plugin runs the OAuth flow itself
+
+QGIS 3.44 can carry an OpenID `id_token` into a header, via the OAuth2 auth method's
+`extraTokens` map. Two things rule it out here, and both fail silently:
+
+- **it would evict `X-Track`.** One auth config has one method, and `extraTokens` maps
+  token-endpoint *response fields* onto headers — it cannot carry a constant. The auth
+  config is the only channel that reaches the native provider's requests (see
+  `core/recorded.py`), so the track would stop travelling and every read and write would
+  resolve to the deployment default;
+- **the ID token is captured once and never refreshed.** QGIS sets `extraTokens` only on
+  the initial code exchange, so after about an hour it sends an expired JWT forever.
+
+Running the flow in the plugin keeps the header transport that is already proven and buys
+a genuinely fresh token every hour with no browser round trip. No client secret is
+embedded: this is a Google *Desktop app* client in a public repository, so a secret in it
+would not be one, and PKCE (S256) is what binds the exchange.
 
 ---
 
@@ -118,7 +160,8 @@ Some things follow from that and are worth knowing before they surprise you:
 - **Reads with no track selected fall back to the deployment default; writes do not.** A
   browser with no opinion should see something; a write is the contaminating operation.
 - **Credentials are stored one per track** (same token, plus the `X-Track` header), and one
-  more that names no track. Signing in happens *before* Connect — you need a credential to
+  more that names no track. Every hourly renewal rewrites all of them **under their
+  existing ids**, so saved projects and already-loaded layers keep working. Signing in happens *before* Connect — you need a credential to
   discover what tracks exist — so a first sign-in stores only the un-tracked entry and
   signing in again after connecting fans it out. Either way the track travels in the layer
   URI, so nothing breaks in between. Signing out removes all of them.
@@ -279,25 +322,25 @@ Two properties are worth stating plainly, because both are deliberate:
   is incoherent: it would mean editing what you used to think. This is enforced rather than
   documented, in four places, and the first of them is not this plugin.
 
-### Why a header, and not a query parameter
+### How the instant actually travels
 
-The instant travels as an **`X-Recorded-At` request header**, attached per layer through the
-OAPIF URI's `http-header:` vocabulary — exactly where `X-Track` already goes. Two facts
-about QGIS's provider make that the only workable transport:
+**Corrected by measurement.** The original argument was that the instant rides the OAPIF
+URI's `http-header:` vocabulary onto every provider request including the `OPTIONS`
+editability probe. Captured against a bare HTTP listener on QGIS 3.44.13, half of it
+survives and half does not — `core/recorded.py` holds the full record:
 
-| Fact | Consequence |
+| Measured | Consequence |
 |---|---|
-| `sendOPTIONS` installs the URI's `http-header:` parameters | The instant **is** on the editability probe, so the server can answer it without `POST` in `Allow`, and QGIS disables editing on its own |
-| `computeCapabilities` — which builds that probe — appends **no** query parameters, unlike `init()`, `featureCount()` and `addFeatures()` | A landing-URL query parameter is **absent** from the probe |
+| **`http-header:` parameters never reach the wire at all.** A layer URI carrying `X-Track`, `X-Recorded-At` and a marker header sent none of the three | The URI header is inert. It is still emitted, because it costs one parameter and a build that started honouring it would send the same value twice |
+| The same headers carried by an **`APIHeader` auth configuration** arrived intact | This is why the *track* has always worked: the credential carries `X-Track`. It is also why Google sign-in had to keep the `APIHeader` method rather than switching to QGIS's OAuth2 one |
+| A **landing-URL query parameter does survive**, on every request the provider builds except the probe | `?recorded_at=` is what actually pins a historical layer |
 
-So a query-only pin can never grey the pencil out, and what follows is the worst failure
-available here: the probe reports the collection writable, QGIS enables editing, and an
-annotator moves a vertex on what they believe is January's map. Whether that write carries
-the parameter then depends on which provider method built the request — so the edit lands on
-the **live** row. Editing the present while looking at the past, silently.
-
-`?recorded_at=` is still accepted by the backend for curl and for bug reports — a
-header-only interface is untestable by hand — and is never used by a layer.
+The probe is genuinely unpinned, exactly as `computeCapabilities` predicts, and that costs
+nothing here: the historical collection is `editable: false` on the server, so the probe
+answers `Allow: HEAD, GET` pinned or not and QGIS reports no write capabilities at all.
+`layers.provider_advertises_writes` raises if that ever stops being true, and the layer's
+own echo column is checked against the instant that was asked for — so a pin that fails to
+arrive refuses the layer by name instead of quietly showing the present.
 
 ### What you see
 
