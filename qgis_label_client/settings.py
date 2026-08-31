@@ -46,6 +46,21 @@ DEFAULTS: dict[str, Any] = {
     #
     # Still not a token: every value is a seven-character reference into qgis-auth.db.
     "authcfg_by_track": "",
+    # Who is signed in, for the panel label. An email address, not a credential: it is
+    # already visible in the QGIS window and on every server log line, and holding it here
+    # is what lets the panel say "Signed in as ..." without decrypting anything -- which
+    # matters because reading the credential needs the master password and the panel
+    # refreshes on startup, before anybody has entered it.
+    "oauth_email": "",
+    # When the stored ID token dies, as epoch seconds. NOT a credential either: it is one
+    # integer out of a token the server issued, and it is what the renewal timer and the
+    # lazy pre-flight check both read.
+    #
+    # Held here rather than derived from the stored token on demand for the same reason as
+    # the address: decoding the token means decrypting it, and the schedule has to be
+    # readable while the auth database is still locked. 0 means "no Google session" --
+    # a fresh profile, or one still holding a hand-pasted token -- and nothing is renewed.
+    "oauth_expires_at": 0,
     # Which history track this profile works in. Empty means "whatever the deployment
     # defaults to", which is what a fresh profile has and what the API does with a read
     # that names no track.
@@ -231,6 +246,38 @@ class PluginSettings:
     def authcfg(self) -> str:
         """The credential for the currently selected track."""
         return self.authcfg_for(self.track)
+
+    @property
+    def oauth_email(self) -> str:
+        """The signed-in address, or ``""``. For display, never for authorisation."""
+        return str(self.get("oauth_email")).strip()
+
+    @property
+    def oauth_expires_at(self) -> int:
+        """Epoch seconds at which the stored ID token dies, or 0 for "no Google session".
+
+        Zero is the answer for a profile that never signed in with Google *and* for one
+        holding a hand-pasted token, and the two are deliberately not distinguished: in
+        both cases there is nothing this plugin can renew, so the renewal machinery stays
+        silent rather than nagging about a credential it does not manage.
+        """
+        try:
+            return max(0, int(self.get("oauth_expires_at")))
+        except (TypeError, ValueError):
+            return 0
+
+    def set_oauth_session(self, email: str, expires_at: int) -> None:
+        """Remember who signed in and when their token dies. Neither value is a secret."""
+        self.set("oauth_email", email or "")
+        self.set("oauth_expires_at", max(0, int(expires_at)))
+
+    def clear_oauth_session(self) -> None:
+        """Forget the session. Called on sign-out, so the panel cannot claim a stale one.
+
+        Clearing ``oauth_expires_at`` also disarms the renewal timer, which otherwise would
+        keep trying to renew a sign-in the analyst has just ended.
+        """
+        self.set_oauth_session("", 0)
 
     @property
     def as_of_mechanism(self) -> AsOfMechanism:

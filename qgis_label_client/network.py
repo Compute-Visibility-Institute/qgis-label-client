@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,6 +25,7 @@ from qgis.core import QgsBlockingNetworkRequest, QgsFeedback
 from qgis.PyQt.QtCore import QByteArray, QUrl
 from qgis.PyQt.QtNetwork import QNetworkRequest
 
+from .core import oauth
 from .core.errors import BackendError
 from .core.tracks import TRACK_HEADER
 
@@ -33,6 +35,9 @@ USER_AGENT = "qgis-label-client"
 
 #: Media type of an OGC API - Features Part 4 create request body.
 GEOJSON_MEDIA_TYPE = "application/geo+json"
+
+#: The only body Google's OAuth endpoints accept.
+FORM_MEDIA_TYPE = "application/x-www-form-urlencoded"
 
 # TRACK_HEADER is imported rather than defined: it is set here on the plugin's own
 # requests, and QGIS's OAPIF provider makes its own -- which this module never sees --
@@ -86,8 +91,29 @@ def _body_detail(body: bytes) -> str:
     return text[:300]
 
 
+def _json_object(body: bytes) -> dict | None:
+    """The response body as a JSON object, or ``None``. Never raises."""
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _describe_status(status: int, url: str, body: bytes) -> str:
     """Turn an HTTP status into something an annotator can act on."""
+    if status == 403:
+        # The auth edge distinguishes "your credential is bad" (401) from "you
+        # authenticated perfectly and are not on the access list" (403), and it writes the
+        # second message for a person to read: which address it saw, and that signing in
+        # again will not help. That sentence is the difference between an analyst emailing
+        # an administrator and an analyst filing a bug, so it is passed through verbatim
+        # rather than replaced with the word "Forbidden".
+        payload = _json_object(body) or {}
+        detail = str(payload.get("detail") or "").strip()
+        if detail:
+            return f"HTTP 403 from {url}. {detail}"
+
     hints = {
         401: "The API rejected the credential. Sign in again from the panel; the token "
         "may have expired or been rotated.",
@@ -240,3 +266,42 @@ def post_json(
         return response.json()
     except BackendError:
         return None
+
+
+def post_form(
+    url: str,
+    fields: Mapping[str, str],
+    *,
+    feedback: QgsFeedback | None = None,
+) -> Any:
+    """POST a form-encoded body with **no** credential attached. Worker thread only.
+
+    For Google's token and revocation endpoints, which authenticate the request *body* --
+    the authorization code plus its PKCE verifier, or the refresh token. Attaching an
+    ``authcfg`` here would send the labeling API's bearer token to Google, which is both
+    useless and a credential sent somewhere it was not issued for.
+
+    Through ``QgsBlockingNetworkRequest`` anyway, rather than reaching for the standard
+    library, for the reasons in the module docstring minus the last one: the user's proxy
+    configuration and their SSL exceptions. A sign-in that works everywhere except behind
+    a corporate proxy is a sign-in that does not work.
+    """
+    request, fetcher = _prepare(url, "application/json", "", "")
+    request.setRawHeader(b"Content-Type", FORM_MEDIA_TYPE.encode("ascii"))
+    error = fetcher.post(request, QByteArray(oauth.encode_form(fields)), False, feedback)
+
+    # The OAuth error object is read BEFORE _read turns the status into prose, because the
+    # difference between `invalid_grant` and every other error is the difference between
+    # "sign in again" and "retry in a minute" -- and _read would flatten both into one
+    # BackendError whose only distinguishing feature is a substring. Anything that is not
+    # an OAuth error object falls straight through, so there is still exactly one place
+    # that handles HTTP status.
+    reply = fetcher.reply()
+    body = bytes(reply.content()) if reply is not None else b""
+    oauth.raise_for_token_error(_json_object(body) or {})
+
+    response = _read(fetcher, error, url)
+    if not response.body.strip():
+        # The revocation endpoint answers 200 with nothing, and that is a success.
+        return None
+    return response.json()

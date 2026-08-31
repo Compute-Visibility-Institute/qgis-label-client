@@ -3,7 +3,7 @@ name=CVI Label Client
 qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 supportsQt6=True
-description=Thin client for a bitemporal OGC API - Features labeling backend: token auth, refreshed signed imagery URLs, a registry-driven class vocabulary, and a control for each time axis - as-of on valid time, and a read-only historical view on transaction time.
+description=Thin client for a bitemporal OGC API - Features labeling backend: Google sign-in, refreshed signed imagery URLs, a registry-driven class vocabulary, and a control for each time axis - as-of on valid time, and a read-only historical view on transaction time.
 version=0.1.0
 author=Compute Visibility Institute
 email=opensource@example.org
@@ -12,7 +12,9 @@ about=Connects QGIS to a labeling platform that serves OGC API - Features (Parts
     QGIS's native provider does all vector reading and editing, so this plugin only covers what
     QGIS cannot do on its own:
     .
-    * stores the API token in QgsAuthManager, so no credential is ever written into a .qgz;
+    * signs in with Google in your browser and stores the resulting token in QgsAuthManager,
+      so no credential is ever written into a .qgz - and renews that token in the background,
+      because it lives about an hour and an editing session does not;
     * refreshes short-lived signed object-storage URLs and re-points raster layers at them,
       which a project file cannot do because the URLs expire;
     * loads collections and the label class vocabulary from the backend, so forms and styling
