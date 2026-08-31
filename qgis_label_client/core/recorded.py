@@ -49,6 +49,15 @@ The header is still sent. It costs one URI parameter, it is what curl and the we
 use, and a QGIS build that starts honouring ``http-header:`` would simply be sending the
 same value twice.
 
+THE SECOND BULLET IS LOAD-BEARING BEYOND THIS MODULE. "Only an ``APIHeader`` auth
+configuration reaches the native provider's wire" is the measurement that rules out
+QGIS 3.44's built-in OAuth2 method for sign-in: that method's ``extraTokens`` map carries
+token-endpoint *response fields*, not constants, so adopting it would silently drop
+``X-Track`` from every provider read and every Part 4 write. It is why
+:mod:`..core.oauth` runs the OAuth flow in the plugin and keeps writing an ``APIHeader``
+credential, and it is cited in the backend repository as the reason its side of that
+decision was made too. Do not delete this capture.
+
 THE ECHO IS A CANARY, AND IT MUST NOT BE A LAYER FILTER
 
 ``v_label_asof`` echoes the instant it actually resolved at on every row. The check is

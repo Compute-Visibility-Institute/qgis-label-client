@@ -78,6 +78,10 @@ class LabelClientDock(QDockWidget):
     connectRequested = pyqtSignal()
     signInRequested = pyqtSignal()
     signOutRequested = pyqtSignal()
+    #: "Copy my address". The single most common next action after the backend answers
+    #: "you authenticated fine and are not on the access list" is pasting that address to
+    #: an administrator, and retyping an address by eye is how a grant lands on nobody.
+    copyAddressRequested = pyqtSignal()
     loadLayersRequested = pyqtSignal(list)
     refreshImageryRequested = pyqtSignal()
     asOfApplied = pyqtSignal()
@@ -162,27 +166,43 @@ class LabelClientDock(QDockWidget):
         )
         form.addRow("API URL", self.url_edit)
 
-        self.auth_label = QLabel("No credential stored.", group)
+        self.auth_label = QLabel("Not signed in.", group)
         self.auth_label.setWordWrap(True)
+        # Selectable so the address, and a refusal message from the server, can be copied
+        # into an email. A message somebody has to retype is a message that gets
+        # paraphrased, and the whole value of the server's 403 text is that it is exact.
+        self.auth_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
         form.addRow("Credential", self.auth_label)
 
         buttons = QHBoxLayout()
-        self.sign_in_button = QPushButton("Sign in…", group)
+        self.sign_in_button = QPushButton("Sign in with Google", group)
         self.sign_in_button.setToolTip(
-            "Stores an API token in the QGIS authentication database. The token is never "
-            "written to a project file or to this plugin's settings."
+            "Opens your browser to sign in with Google. The resulting token is stored "
+            "encrypted in the QGIS authentication database and is never written to a "
+            "project file or to this plugin's settings."
         )
         self.sign_out_button = QPushButton("Sign out", group)
+        self.sign_out_button.setToolTip(
+            "Removes every stored credential and revokes this plugin's access at Google, "
+            "so 'signed out' is true on both sides."
+        )
+        self.copy_address_button = QPushButton("Copy my address", group)
+        self.copy_address_button.setToolTip(
+            "Copies the address you are signed in as. Paste it to an administrator if the "
+            "backend says you are not on the access list."
+        )
         self.connect_button = QPushButton("Connect", group)
         self.connect_button.setDefault(True)
         buttons.addWidget(self.sign_in_button)
         buttons.addWidget(self.sign_out_button)
+        buttons.addWidget(self.copy_address_button)
         buttons.addStretch(1)
         buttons.addWidget(self.connect_button)
         form.addRow(buttons)
 
         self.sign_in_button.clicked.connect(self.signInRequested)
         self.sign_out_button.clicked.connect(self.signOutRequested)
+        self.copy_address_button.clicked.connect(self.copyAddressRequested)
         self.connect_button.clicked.connect(self.connectRequested)
         return group
 

@@ -58,3 +58,31 @@ def test_a_backend_error_carries_the_status_and_the_wait_the_server_asked_for():
     assert refused.throttled is False
     assert refused.status is None
     assert refused.retry_after is None
+
+
+def test_a_403_hands_the_server_s_own_sentence_to_the_analyst():
+    """The message that decides whether a new analyst emails an administrator or files a bug.
+
+    The edge distinguishes "your credential is bad" (401) from "you authenticated
+    perfectly and are not on the access list" (403), and it writes the second for a person
+    to read: which address it saw, and that signing in again will not change anything.
+    Replacing that with the word "Forbidden" throws away the only sentence that says what
+    to do next, and the analyst re-signs-in forever.
+    """
+    body = (
+        b'{"code":"not_provisioned","detail":"Your Google sign-in worked. '
+        b"a@example.org is not yet on the access list. Ask an administrator to grant you "
+        b'access."}'
+    )
+    message = _describe_status(403, "https://api.example.org/oapif/collections", body)
+    assert "not yet on the access list" in message
+    assert "Ask an administrator" in message
+    # And not the generic hint, which would contradict the sentence beside it.
+    assert "not authorised for this resource" not in message
+
+
+def test_a_403_with_no_json_still_says_something():
+    # A 403 from an intermediary -- a proxy, an IAP frontend -- carries no detail, and the
+    # generic hint is then the only thing there is to say.
+    message = _describe_status(403, "https://api.example.org/oapif", b"")
+    assert "HTTP 403" in message
