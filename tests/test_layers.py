@@ -636,3 +636,43 @@ def test_a_layer_whose_geometry_qgis_cannot_spell_falls_back_to_the_class(_symbo
     # rather than raise while a deployment is still in it.
     alpha = REGISTRY.get("alpha")
     assert layer_tools._symbol_for(alpha, geom_type="") == layer_tools._symbol_for(alpha)
+
+
+# ── the fields an analyst must not be invited to fill in ─────────────────────
+
+
+def test_the_feature_id_is_not_an_editable_box() -> None:
+    """`id` rendered as an empty editable field that TOOK FOCUS on every new polygon.
+
+    It is the OAPIF feature id -- a surrogate bigint, GENERATED ALWAYS AS IDENTITY --
+    so there is no correct value to type. It is deliberately absent from the
+    collection's `immutable_properties` (it is the feature id, not a property), so
+    nothing upstream was marking it and the first thing an analyst saw on every new
+    feature was a required-looking field with no answer.
+    """
+    from qgis_label_client.layers import SERVER_ASSIGNED_FIELDS
+
+    assert "id" in SERVER_ASSIGNED_FIELDS
+
+
+def test_provenance_columns_are_locked_too() -> None:
+    """Who edited a label and when is recorded BY the server, from the verified identity.
+
+    These usually arrive read-only from the provider already; locking them in the form
+    costs nothing and means the form is right against a deployment that has not
+    configured that.
+    """
+    from qgis_label_client.layers import SERVER_ASSIGNED_FIELDS
+
+    for name in ("recorded_from", "created_by", "created_at", "updated_by", "updated_at"):
+        assert name in SERVER_ASSIGNED_FIELDS
+
+
+def test_the_fields_an_analyst_actually_fills_in_stay_editable() -> None:
+    """The point is to remove impossible choices, not real ones. class_id, the names, the
+    attributes and both valid-time bounds are the analyst's to set -- valid_from
+    especially, which the plugin proposes and a person may override."""
+    from qgis_label_client.layers import SERVER_ASSIGNED_FIELDS
+
+    for name in ("class_id", "names", "attrs", "valid_from", "valid_to", "capture_id"):
+        assert name not in SERVER_ASSIGNED_FIELDS

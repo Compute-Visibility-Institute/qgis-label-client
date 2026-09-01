@@ -820,6 +820,8 @@ def apply_registry(
             _apply_class_value_map(layer, registry)
 
     _apply_aliases(layer, registry, names)
+
+    _lock_server_assigned(layer, registry)
     _apply_map_tip(layer, registry, names, historical)
 
 
@@ -895,6 +897,48 @@ def _apply_class_value_map(layer: QgsVectorLayer, registry: ClassRegistry) -> No
     if not entries:
         return
     layer.setEditorWidgetSetup(index, QgsEditorWidgetSetup("ValueMap", {"map": entries}))
+
+
+#: Columns the SERVER assigns, which an analyst must never be invited to type into.
+#:
+#: `id` is the one that prompted this. It is the OAPIF feature id -- a surrogate bigint,
+#: GENERATED ALWAYS AS IDENTITY -- and it rendered as an empty editable box that TOOK
+#: FOCUS when the attribute form opened, so the first thing an analyst saw on every new
+#: polygon was a required-looking field with no correct answer. It is absent from the
+#: collection's `immutable_properties` for a good reason (it is the feature id, not a
+#: property), so nothing upstream was marking it.
+#:
+#: The rest are the provenance columns. They already arrive read-only from the provider
+#: on a well-configured deployment; setting them here as well costs nothing and means the
+#: form is right even against a deployment that has not.
+SERVER_ASSIGNED_FIELDS = (
+    "id",
+    "label_id",
+    "track_id",
+    "recorded_from",
+    "created_by",
+    "created_at",
+    "updated_by",
+    "updated_at",
+)
+
+
+def _lock_server_assigned(layer: QgsVectorLayer, registry: ClassRegistry) -> None:
+    """Mark server-assigned columns read-only in the attribute form.
+
+    QgsEditFormConfig rather than the field's own editability: the provider decides what
+    it will ACCEPT, this decides what the form OFFERS, and the second is what an analyst
+    experiences. A field the server will reject is worse than a field that is not there,
+    because it looks like a decision somebody has to make.
+    """
+    config = layer.editFormConfig()
+    fields = layer.fields()
+    names = {registry.fields.label_id, registry.fields.track_id} | set(SERVER_ASSIGNED_FIELDS)
+    for name in names:
+        index = fields.indexOf(name)
+        if index >= 0:
+            config.setReadOnly(index, True)
+    layer.setEditFormConfig(config)
 
 
 def _apply_aliases(layer: QgsVectorLayer, registry: ClassRegistry, names: list[str]) -> None:
