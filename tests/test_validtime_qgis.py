@@ -229,7 +229,8 @@ def test_the_conversion_normalises_to_utc_before_taking_components() -> None:
     Asserted on what QDate/QTime were CONSTRUCTED with rather than on what the stub
     returns: checking the return value would be checking the stub, not this code.
     """
-    from datetime import timedelta, timezone as tz
+    from datetime import timedelta
+    from datetime import timezone as tz
 
     from qgis_label_client.validtime import _as_qdatetime
 
