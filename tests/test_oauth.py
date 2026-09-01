@@ -26,6 +26,7 @@ import pytest
 
 from qgis_label_client.core.oauth import (
     CLIENT_ID,
+    CLIENT_SECRET,
     REFRESH_SKEW_SECONDS,
     Credential,
     SignInCancelledError,
@@ -208,23 +209,38 @@ def test_the_browser_page_escapes_what_it_is_handed_and_declares_its_length():
 # --- the token exchange -------------------------------------------------------
 
 
-def test_the_code_exchange_sends_the_verifier_and_no_secret():
-    """PKCE instead of a secret, deliberately. See the module docstring.
+def test_the_code_exchange_sends_both_the_verifier_and_the_secret():
+    """PKCE AND a secret. This test used to assert the opposite, and was wrong.
 
-    The verifier is what proves this is the same client that made the authorization
-    request; a secret shipped in a public repository proves nothing about anybody.
+    The old reasoning: the verifier proves this is the same client that made the
+    authorization request, and a secret shipped in a public repository proves nothing
+    about anybody. Both clauses are true, and Google refuses the request regardless --
+
+        invalid_request: client_secret is missing
+
+    -- because it requires the field as a client IDENTIFIER, not as a protection. PKCE
+    is additional to it, never a substitute. Asserting its absence made a passing suite
+    out of a flow that could not complete a single sign-in.
     """
-    fields = token_request("the-code", "the-verifier", "http://127.0.0.1:1/")
+    fields = token_request(
+        "the-code", "the-verifier", "http://127.0.0.1:1/", client_secret="s3cr3t"
+    )
     assert fields["code_verifier"] == "the-verifier"
     assert fields["grant_type"] == "authorization_code"
     assert fields["redirect_uri"] == "http://127.0.0.1:1/"
-    assert "client_secret" not in fields
+    assert fields["client_secret"] == "s3cr3t"
 
 
-def test_the_renewal_sends_no_secret_either():
-    fields = refresh_request("r3fr3sh")
-    assert fields == {
+def test_the_renewal_carries_the_secret_too():
+    """Same endpoint, same client, same requirement.
+
+    Omitting it here would have been the nastier half of the bug: sign-in works, and the
+    silent renewal fails an hour later with a layer going 401 mid-edit and nothing about
+    the symptom pointing back at this request body.
+    """
+    assert refresh_request("r3fr3sh", client_secret="s3cr3t") == {
         "client_id": CLIENT_ID,
+        "client_secret": "s3cr3t",
         "grant_type": "refresh_token",
         "refresh_token": "r3fr3sh",
     }
@@ -380,3 +396,78 @@ def test_the_panel_line_says_who_and_for_how_much_longer():
     # No address stored is not an error state; it is a session signed in before the panel
     # learned to record one.
     assert describe_session("", 0, now=0) == "Signed in with Google"
+
+
+# ── the client_secret that PKCE does not replace ─────────────────────────────
+
+
+def test_the_token_exchange_carries_the_client_secret() -> None:
+    """Google refuses the exchange without it, AFTER the analyst has consented.
+
+    The reasoning that omitted it was sound and still wrong: a desktop client's secret
+    is not confidential, PKCE's verifier is what binds the exchange -- and Google
+    requires the field anyway, as a client identifier rather than as a protection.
+    Observed as `invalid_request: client_secret is missing` at the worst possible
+    moment, with a browser tab already saying "Signed in".
+    """
+    fields = token_request("CODE", "VERIFIER", "http://127.0.0.1:9/", client_secret="s3cr3t")
+    assert fields["client_secret"] == "s3cr3t"
+    assert fields["code_verifier"] == "VERIFIER", (
+        "PKCE is additional to the secret, not replaced by it"
+    )
+
+
+def test_the_refresh_carries_it_too() -> None:
+    """Otherwise sign-in works and the silent renewal fails an hour later.
+
+    That is the hardest failure to attribute, because nothing about a layer going 401
+    mid-session points back at the refresh body.
+    """
+    assert refresh_request("RT", client_secret="s3cr3t")["client_secret"] == "s3cr3t"
+
+
+def test_an_absent_secret_is_omitted_rather_than_sent_empty() -> None:
+    """An empty client_secret is a different Google error from a missing one, and the
+    missing-field message is the one that names what to do about it.
+
+    Reachable only by asking for it: the default is the embedded CLIENT_SECRET, so a
+    deployment that overrides it with a blank setting gets the clearer failure.
+    """
+    assert "client_secret" not in token_request("C", "V", "http://127.0.0.1:9/", client_secret="")
+    assert "client_secret" not in refresh_request("RT", client_secret="")
+
+
+def test_a_release_build_needs_no_pasting() -> None:
+    """Onboarding cost: install, sign in. Not "install, then paste two values".
+
+    The constant is the seam the release workflow writes into. Substituting a value there
+    must reach the token request without any other change, which is the whole reason the
+    default is the constant rather than the empty string literal.
+    """
+    import qgis_label_client.core.oauth as oauth_module
+
+    original = oauth_module.CLIENT_SECRET
+    try:
+        oauth_module.CLIENT_SECRET = "released-value"
+        fields = oauth_module.token_request("C", "V", "http://127.0.0.1:9/")
+        assert fields["client_secret"] == "released-value"
+    finally:
+        oauth_module.CLIENT_SECRET = original
+
+
+def test_the_source_tree_carries_no_client_secret() -> None:
+    """The release workflow substitutes it; git must never hold it.
+
+    Not because publishing it would be dangerous -- Google documents an installed app's
+    secret as not confidential, and the allowlist is what actually grants access. Because
+    a value in git history can only be rotated by rewriting history, and GitHub's push
+    protection blocks the push regardless of that argument.
+
+    This asserts the seam the workflow greps for. If someone hardcodes a value here, the
+    substitution step fails loudly at release rather than silently producing a zip with
+    the wrong secret in it.
+    """
+    assert CLIENT_SECRET == "", (
+        "core.oauth.CLIENT_SECRET must stay empty in source; "
+        ".github/workflows/release.yml substitutes it into the published zip"
+    )

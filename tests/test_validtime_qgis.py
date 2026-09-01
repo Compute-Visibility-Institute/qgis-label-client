@@ -140,3 +140,51 @@ def test_an_unparseable_stamp_is_ignored_rather_than_raised() -> None:
 
 def test_an_empty_project_is_not_an_error() -> None:
     assert current_stack(FakeProject([])).layers == ()
+
+
+# ── the reference that stops QGIS segfaulting on unload ──────────────────────
+
+
+def test_the_registered_function_is_held_by_the_module() -> None:
+    """QgsExpression.registerFunction stores a RAW POINTER and takes no reference.
+
+    Written as `registerFunction(_valid_from_function())` this reads correctly and
+    crashes QGIS: the object is collected the moment the call returns and QGIS is left
+    pointing at freed memory. Unticking the plugin dereferences it and takes the whole
+    application down — no traceback, because the interpreter is gone before it could
+    write one. Observed on 3.44.13.
+
+    So the assertion is about object lifetime, not about behaviour, and it is the only
+    thing standing between a refactor and a hard crash that no other test can catch.
+    """
+    from qgis_label_client import validtime
+
+    validtime.unregister_functions()
+    assert validtime._registered_function is None
+
+    validtime.register_functions()
+    assert validtime._registered_function is not None, (
+        "nothing holds the function; QGIS will dereference freed memory on unload"
+    )
+
+
+def test_unregistering_drops_the_reference_only_after_qgis_has_let_go() -> None:
+    """Clearing the name first would recreate the dangling pointer, in the one code path
+    most likely to be running during interpreter teardown."""
+    from qgis_label_client import validtime
+
+    validtime.register_functions()
+    validtime.unregister_functions()
+    assert validtime._registered_function is None
+
+
+def test_registering_twice_does_not_replace_a_live_registration() -> None:
+    """A plugin reload calls initGui again; swapping the object under a live pointer is
+    the same crash by another route."""
+    from qgis_label_client import validtime
+
+    validtime.unregister_functions()
+    validtime.register_functions()
+    first = validtime._registered_function
+    validtime.register_functions()
+    assert validtime._registered_function is first

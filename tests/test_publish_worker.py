@@ -107,6 +107,11 @@ class Recorder:
         self.sent: list[dict] = []
         self.extents: list[dict] = []
         self.attempts: list[str] = []
+        #: Which collection each accepted feature was created in, in order. A publish now
+        #: fans out by geometry type, and a feature sent to the wrong collection is
+        #: rejected by the server's own geometry check -- 872 times, in a report that
+        #: reads like an outage. So the destination is recorded, not assumed.
+        self.collections: list[str] = []
         #: Every track name the worker asked for, one per attempt. A publish that sent a
         #: single feature to a track the run was not pinned to would be invisible in the
         #: counts and permanent in the data, so it is recorded rather than assumed.
@@ -124,6 +129,7 @@ class Recorder:
             return None
         name = feature.get("properties", {}).get("names", {}).get("en", "")
         self.attempts.append(name)
+        self.collections.append(collection_id)
         if self._throttle:
             seen = self._throttled.get(name, 0)
             if self._throttle < 0 or seen < self._throttle:
@@ -152,10 +158,19 @@ def recorder(monkeypatch) -> Recorder:
     return rec
 
 
-def _prepared(features, *, completeness: str = "", transform=None, extent=None, count=None):
+def _prepared(
+    features,
+    *,
+    completeness: str = "",
+    transform=None,
+    extent=None,
+    count=None,
+    name: str = "Compounds",
+    collection_id: str = "",
+):
     source = SourceLayer(
-        layer_id="compounds",
-        name="Compounds",
+        layer_id=name.lower(),
+        name=name,
         geometry_type="Polygon",
         crs_authid="EPSG:4326",
         feature_count=len(features) if count is None else count,
@@ -164,13 +179,14 @@ def _prepared(features, *, completeness: str = "", transform=None, extent=None, 
     plan = LayerPlan(
         source=source,
         choice=LayerChoice(
-            layer_id="compounds",
+            layer_id=source.layer_id,
             publish=True,
             class_id="compound",
             extent_completeness=completeness,
         ),
         label_class=COMPOUND,
         mappings=map_fields(source.field_names, COMPOUND),
+        collection_id=collection_id,
     )
     return publish_tools.PreparedLayer(
         plan=plan,
@@ -179,19 +195,20 @@ def _prepared(features, *, completeness: str = "", transform=None, extent=None, 
         mappings=plan.mappings,
         transform=transform,
         extent_geojson=extent,
+        collection_id=collection_id,
     )
 
 
-def _request(prepared, **kwargs) -> publish_tools.PublishRequest:
+def _request(prepared, *more, **kwargs) -> publish_tools.PublishRequest:
     # A track is required, not defaulted: publish() refuses without one, because 1,246
     # identical 403s from the edge is not a report anybody can act on. Every test here
     # supplies it so that the refusal itself stays testable in one place.
     kwargs.setdefault("track", TRACK.name)
     return publish_tools.PublishRequest(
         base_url="https://api.example.org/oapif",
-        collection_id="label",
+        collection_id=kwargs.pop("collection_id", "label"),
         authcfg="",
-        layers=[prepared],
+        layers=[prepared, *more],
         **kwargs,
     )
 
@@ -543,3 +560,57 @@ def test_the_report_carries_the_track_the_run_actually_used(recorder):
     report = publish_tools.publish(_request(_prepared(_features(2))))
     assert report.track == TRACK.name
     assert f"on track {TRACK.name}" in report.summary()
+
+
+# --- one run, several collections -------------------------------------------
+
+
+def test_each_layer_is_sent_to_its_own_collection(recorder):
+    """The destination is the layer's, not the run's.
+
+    Labels are stored one collection per geometry type, so a project of compounds and
+    cooling units writes to two of them in a single publish. A run-wide destination would
+    send one of the two to a collection whose column type refuses it, feature by feature,
+    with the report reading as a backend fault.
+    """
+    report = publish_tools.publish(
+        _request(
+            _prepared(_features(3), name="Compounds", collection_id="label_polygon"),
+            _prepared(_features(2), name="CoolingUnits", collection_id="label_point"),
+            collection_id="",
+        )
+    )
+    assert recorder.collections == ["label_polygon"] * 3 + ["label_point"] * 2
+    assert report.published == 5
+
+
+def test_a_layer_with_no_collection_of_its_own_uses_the_run_fallback(recorder):
+    # A deployment still serving one untyped collection: no per-layer route, one
+    # collection for the run. This is the pre-split behaviour and it has to keep working.
+    publish_tools.publish(_request(_prepared(_features(2))))
+    assert set(recorder.collections) == {"label"}
+
+
+def test_a_layer_with_nowhere_to_go_is_refused_before_anything_is_sent(recorder):
+    """Named in the refusal, and refused before the first request.
+
+    Reachable without the dialog, which is why the check is here as well as in the plan.
+    Defaulting to whichever collection the request happened to carry is the one outcome
+    that must not happen: the rows land somewhere permanent, the server assigns their
+    identities, and nothing afterwards can find them again to move them.
+    """
+    with pytest.raises(ConfigurationError, match="Compounds"):
+        publish_tools.publish(_request(_prepared(_features(3)), collection_id=""))
+    assert recorder.sent == []
+
+
+def test_the_report_says_which_collection_each_layer_went_to(recorder):
+    # After a partial run the question is "what still needs sending, and to where". With
+    # several collections in one run, the counts alone no longer answer the second half.
+    report = publish_tools.publish(
+        _request(
+            _prepared(_features(1), collection_id="label_polygon"),
+            collection_id="",
+        )
+    )
+    assert "label_polygon" in report.detail_lines()[0]

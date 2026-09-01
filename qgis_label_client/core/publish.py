@@ -62,6 +62,7 @@ from .legacy import (
 )
 from .names import NameSet, build_names
 from .registry import ClassRegistry, LabelClass
+from .routing import DIMENSION_SUFFIXES, CollectionRoutes, base_geometry_type
 from .tracks import Track
 
 #: Layer custom property recording that this layer has already been published, and what
@@ -96,9 +97,6 @@ _MULTI_TO_SINGLE = {multi: single for single, multi in _SINGLE_TO_MULTI.items()}
 #: -- a curve type, or a layer OGR reports as "Unknown (any)" -- is decided per feature by
 #: :func:`conform_geometry` instead of being pre-judged in the preview.
 _KNOWN_GEOMETRY_TYPES = frozenset(_SINGLE_TO_MULTI) | frozenset(_MULTI_TO_SINGLE)
-
-#: WKB display-string suffixes marking extra ordinates: ``PolygonZ``, ``PointZM``.
-_DIMENSION_SUFFIXES = ("Z", "M")
 
 
 # ---------------------------------------------------------------------------
@@ -289,18 +287,6 @@ def strip_elevation(
     return {**geometry, "coordinates": _flatten(coordinates)}, True
 
 
-def base_geometry_type(name: str) -> str:
-    """A WKB display string with its dimensionality suffix removed.
-
-    ``QgsWkbTypes.displayString`` spells a Z-enabled polygon layer ``PolygonZ``, which is
-    the same *shape* as ``Polygon`` for the purpose of matching a class.
-    """
-    base = (name or "").strip()
-    while base and base[-1] in _DIMENSION_SUFFIXES:
-        base = base[:-1]
-    return base
-
-
 def geometry_mismatch(source_type: str, want: str) -> str | None:
     """Why a layer of `source_type` could publish nothing as a class wanting `want`.
 
@@ -477,7 +463,7 @@ class SourceLayer:
         Read from the declared type rather than from the features, because it is needed
         in the preview -- see :data:`STORAGE_DIMENSIONS` for why it matters at all.
         """
-        return self.geometry_type.endswith(_DIMENSION_SUFFIXES)
+        return self.geometry_type.endswith(DIMENSION_SUFFIXES)
 
 
 @dataclass(frozen=True)
@@ -515,6 +501,13 @@ class LayerPlan:
     label_class: LabelClass | None = None
     mappings: tuple[FieldMapping, ...] = ()
     guess: ClassGuess = field(default_factory=ClassGuess)
+    #: The collection this layer's features would be created in, chosen from its geometry
+    #: type -- see :mod:`.routing`. Empty when the caller supplied no routes, which is not
+    #: the same as "nowhere": it means nobody asked, and the publish path always does.
+    collection_id: str = ""
+    #: Why this layer has no collection to go to, or ``""``. Blocking; see
+    #: :meth:`problems`.
+    routing_problem: str = ""
 
     @property
     def publish(self) -> bool:
@@ -556,6 +549,14 @@ class LayerPlan:
         mismatch = geometry_mismatch(self.source.geometry_type, self.label_class.geom_type)
         if mismatch:
             return (f"{self.source.name} {mismatch}.",)
+        # Last, because it is the least specific of the geometry complaints: a point layer
+        # set to a polygon class is told about the class first, which is the thing the
+        # person can fix on this screen. Blocking all the same -- a layer with no
+        # collection to go to would otherwise be sent to whichever one the request
+        # happened to name, and app.label_check() would refuse it feature by feature in a
+        # report that reads like a server fault.
+        if self.routing_problem:
+            return (self.routing_problem,)
         return ()
 
     def mapping_lines(self) -> tuple[str, ...]:
@@ -688,6 +689,15 @@ class PublishPlan:
     def damaged_name_count(self) -> int:
         return sum(plan.source.damaged_names for plan in self.selected())
 
+    def collections(self) -> tuple[str, ...]:
+        """Every collection this publish would create features in, sorted.
+
+        Plural, because the destination is now a property of each layer rather than of the
+        run: one geometry family per collection means a project holding compounds, cooling
+        units and powerlines writes to three of them in a single publish.
+        """
+        return tuple(sorted({plan.collection_id for plan in self.selected() if plan.collection_id}))
+
     def republished(self) -> tuple[LayerPlan, ...]:
         """Selected layers that have been published before."""
         return tuple(plan for plan in self.selected() if plan.source.previous is not None)
@@ -793,9 +803,16 @@ class PublishPlan:
             return "Nothing selected. No features will be published."
         classes = sorted({plan.class_id for plan in chosen})
         where = f" on track {self.track_name}" if self.track_name else ""
+        # The collections are in the one-line summary as well as in the table's own
+        # column, because this sentence is what the confirmation and the status line
+        # repeat. A publish now fans out across collections by geometry, and a summary
+        # that named only the track would leave the fan-out visible nowhere but a column
+        # the eye skips.
+        collections = self.collections()
+        into = f", into {', '.join(collections)}" if collections else ""
         return (
             f"{self.total_features()} feature(s) from {len(chosen)} layer(s), "
-            f"as {len(classes)} class(es): {', '.join(classes)}{where}."
+            f"as {len(classes)} class(es): {', '.join(classes)}{where}{into}."
         )
 
 
@@ -804,6 +821,7 @@ def build_plan(
     registry: ClassRegistry,
     choices: Mapping[str, LayerChoice] | None = None,
     track: Track | None = None,
+    routes: CollectionRoutes | None = None,
 ) -> PublishPlan:
     """Build the plan the preview dialog renders and the task executes.
 
@@ -814,6 +832,12 @@ def build_plan(
     A layer previously published to a *different* track keeps its pre-selection: sending
     the same shapefile into a second dataset is not a duplicate, it is how a test track
     gets populated. It is still announced -- see :meth:`PublishPlan.republished_elsewhere`.
+
+    `routes` decides WHERE each layer goes, from its geometry type -- see :mod:`.routing`.
+    It is optional so that the plan stays testable and renderable without a backend, and
+    ``None`` means "nobody asked", not "nowhere": a plan built without routes states no
+    destination and refuses nothing. The publish path always passes them, so the only way
+    to reach a send is through a plan that named a collection per layer.
     """
     decisions = dict(choices or {})
     plans: list[LayerPlan] = []
@@ -840,6 +864,8 @@ def build_plan(
                 label_class=label_class,
                 mappings=mappings,
                 guess=guess,
+                collection_id=routes.collection_for(source.geometry_type) if routes else "",
+                routing_problem=routes.refusal(source.name, source.geometry_type) if routes else "",
             )
         )
 
@@ -897,6 +923,10 @@ class LayerOutcome:
 
     layer_name: str
     class_id: str
+    #: Where this layer's features were sent. On the outcome rather than on the report,
+    #: because one run now writes to several collections -- and after a partial run, "what
+    #: still needs sending, and to where" is the only question the report has to answer.
+    collection_id: str = ""
     #: Features the layer was expected to hold, from the plan. Zero when the provider
     #: could not say in advance.
     expected: int = 0
@@ -946,7 +976,8 @@ class LayerOutcome:
         return max(0, self.expected - self.read)
 
     def line(self) -> str:
-        bits = [f"{self.layer_name} -> {self.class_id}: {self.published} published"]
+        into = f" in {self.collection_id}" if self.collection_id else ""
+        bits = [f"{self.layer_name} -> {self.class_id}{into}: {self.published} published"]
         if self.failed:
             bits.append(f"{self.failed} rejected by the server")
         if self.skipped:
@@ -991,8 +1022,19 @@ class PublishReport:
     #: user needs the report of those far more than they need a traceback in the log.
     error: str = ""
 
-    def outcome_for(self, layer_name: str, class_id: str, expected: int = 0) -> LayerOutcome:
-        outcome = LayerOutcome(layer_name=layer_name, class_id=class_id, expected=expected)
+    def outcome_for(
+        self,
+        layer_name: str,
+        class_id: str,
+        expected: int = 0,
+        collection_id: str = "",
+    ) -> LayerOutcome:
+        outcome = LayerOutcome(
+            layer_name=layer_name,
+            class_id=class_id,
+            collection_id=collection_id,
+            expected=expected,
+        )
         self.outcomes.append(outcome)
         return outcome
 

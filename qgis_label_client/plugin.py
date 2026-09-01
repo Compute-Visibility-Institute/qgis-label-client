@@ -41,7 +41,7 @@ from qgis.PyQt.QtWidgets import (
 from . import auth, client, imagery, network, oauth_flow, qa
 from . import layers as layer_tools
 from . import publish as publish_tools
-from .core import oauth, recorded
+from .core import oauth, recorded, routing
 from .core.asof import AsOfMechanism, describe
 from .core.collections import Collection
 from .core.errors import LabelClientError
@@ -572,6 +572,19 @@ class LabelClientPlugin:
             )
             return
         try:
+            # Before the browser, like the master-password check below and for the same
+            # reason: a source checkout carries no client secret (it is substituted into
+            # the released zip -- see core.oauth.CLIENT_SECRET), and discovering that
+            # AFTER the analyst has consented at Google means they have granted access to
+            # a flow that cannot finish. Google's own message for this is
+            # "invalid_request: client_secret is missing", which names nothing they can act on.
+            if not (self.settings.oauth_client_secret or oauth.CLIENT_SECRET):
+                self._fail(
+                    "No OAuth client secret is configured, so sign-in cannot complete. "
+                    "A release build carries one; a source checkout needs it set in the "
+                    "plugin's settings under 'oauth_client_secret'. Nothing was sent to Google."
+                )
+                return
             if not auth.master_password_ready():
                 self._fail(
                     "The QGIS authentication database was not unlocked, so there is "
@@ -645,7 +658,12 @@ class LabelClientPlugin:
         def work(feedback: QgsFeedback) -> oauth.Credential:
             payload = network.post_form(
                 oauth.TOKEN_ENDPOINT,
-                oauth.token_request(code, verifier, redirect),
+                oauth.token_request(
+                    code,
+                    verifier,
+                    redirect,
+                    client_secret=self.settings.oauth_client_secret or oauth.CLIENT_SECRET,
+                ),
                 feedback=feedback,
             )
             return oauth.credential_from_token_response(payload, time.time())
@@ -779,7 +797,12 @@ class LabelClientPlugin:
 
         def work(feedback: QgsFeedback) -> oauth.Credential:
             payload = network.post_form(
-                oauth.TOKEN_ENDPOINT, oauth.refresh_request(refresh_token), feedback=feedback
+                oauth.TOKEN_ENDPOINT,
+                oauth.refresh_request(
+                    refresh_token,
+                    client_secret=self.settings.oauth_client_secret or oauth.CLIENT_SECRET,
+                ),
+                feedback=feedback,
             )
             # A refresh reply carries no refresh_token of its own; the one we sent stays
             # valid and is threaded through so the credential is complete either way.
@@ -1351,18 +1374,27 @@ class LabelClientPlugin:
             return
         if self._defer_until_fresh(self.show_history):
             return
-        layer = layer_tools.find_label_layer(self.registry)
-        if layer is None:
+        # Across every label layer, not the first one found. Labels are served as one
+        # collection per geometry type, so "the label layer" is two or three layers and
+        # the selection is on whichever one the analyst clicked in. Asking only the first
+        # would answer "select exactly one label" to somebody who has exactly one label
+        # selected, in the other layer.
+        candidates = layer_tools.find_label_layers(self.registry)
+        if not candidates:
             self._fail("No label layer loaded.")
             return
-        selected = list(layer.getSelectedFeatures())
-        if len(selected) != 1:
+        with_selection = [
+            (candidate, list(candidate.getSelectedFeatures())) for candidate in candidates
+        ]
+        chosen = [(candidate, features) for candidate, features in with_selection if features]
+        if len(chosen) != 1 or len(chosen[0][1]) != 1:
             self._message(
-                "Select exactly one label first. History is per label, keyed on its "
-                "immutable label_id.",
+                "Select exactly one label first, in one label layer. History is per "
+                "label, keyed on its immutable label_id.",
                 Qgis.MessageLevel.Warning,
             )
             return
+        layer, selected = chosen[0]
 
         field = self.registry.fields.label_id
         index = layer.fields().indexOf(field)
@@ -1431,6 +1463,39 @@ class LabelClientPlugin:
             self.settings.set(key, chosen)
         return chosen
 
+    def _label_routes(self) -> routing.CollectionRoutes:
+        """Which collection each geometry type publishes into, for this backend.
+
+        Resolved against the collections ``/collections`` actually listed, never against
+        ids compiled in here -- see :mod:`.core.routing`. ``label_collection`` is the hint
+        about WHICH group of collections holds labels, not the destination: its stem is
+        what matches, so a value remembered from before the geometry split still selects
+        the split collections afterwards, with no migration and no re-prompt.
+
+        Falls back to asking, which is what this plugin has always done when a collection
+        id could not be worked out. That path degrades to exactly the pre-split behaviour
+        -- one collection, everything into it -- and the preview still shows it per layer,
+        so the analyst sees what the fallback decided rather than inheriting it silently.
+        """
+        listed = [collection.collection_id for collection in self.collections]
+        preferred = str(self.settings.get("label_collection")).strip()
+        routes = routing.build_routes(listed, preferred=preferred)
+        if routes:
+            log(f"Publish routing: {routes.describe()}")
+            return routes
+        if routes.ambiguous:
+            # Said out loud rather than tie-broken. Two unrelated sets of geometry-typed
+            # collections is a question about this deployment, and answering it with a
+            # rule here would put features in another dataset's collections permanently.
+            log_warning(
+                "Could not tell which collections hold labels; more than one geometry-typed "
+                f"set is offered ({', '.join(routes.ambiguous)}). Asking."
+            )
+        chosen = self._collection_setting(
+            "label_collection", "Label collection", "Which collection holds the labels?"
+        )
+        return routing.single(chosen) if chosen else routing.CollectionRoutes()
+
     def _on_history(self, label_id: str, entries, track: str = "") -> None:
         if self.dock is None:
             return
@@ -1458,43 +1523,67 @@ class LabelClientPlugin:
         if not self.registry:
             self._fail("Connect first.")
             return
-        label_layer = layer_tools.find_label_layer(self.registry)
+        # EVERY label layer, checked separately. Labels are served as one collection per
+        # geometry type, so checking the first one found would examine the polygons, say
+        # nothing about the points it never read, and report a clean project. A coverage
+        # check that is silently partial is worse than no check: its silence is believed,
+        # and what it silently omits is the 872 cooling units this check exists for.
+        label_layers = layer_tools.find_label_layers(self.registry)
         extent_layer = layer_tools.find_extent_layer(self.registry)
+        if not label_layers:
+            # qa.check_coverage says this better than a bespoke sentence here would, and
+            # says it identically whichever layer is missing.
+            label_layers = [None]
+
+        reports = []
         try:
-            report, coverage_by_fid = qa.check_coverage(label_layer, extent_layer, self.registry)
+            for label_layer in label_layers:
+                report, coverage_by_fid = qa.check_coverage(
+                    label_layer, extent_layer, self.registry
+                )
+                # Select the problem features so the finding is on the canvas, not in a
+                # dialog -- per layer, because a feature id is only meaningful in its own.
+                label_layer.selectByIds(
+                    [
+                        fid
+                        for fid, coverage in coverage_by_fid.items()
+                        if coverage in ("unsurveyed", "partial")
+                    ]
+                )
+                reports.append((label_layer.name(), report))
         except LabelClientError as exc:
             self._fail(str(exc))
             return
-
-        # Select the problem features so the finding is on the canvas, not in a dialog.
-        flagged = [
-            fid
-            for fid, coverage in coverage_by_fid.items()
-            if coverage in ("unsurveyed", "partial")
-        ]
-        label_layer.selectByIds(flagged)
 
         # The track is named on the coverage result for the same reason it is named on an
         # empty history: "all labels are inside an exhaustive extent" is a different fact
         # about a test dataset than about the analysts' one, and the sentence alone cannot
         # tell them apart.
         track = self.current_track()
-        summary = report.summary()
+        # One line per layer, named. A merged count would hide which geometry the finding
+        # is in, and that is the first thing the analyst needs in order to go and look.
+        summary = "; ".join(f"{name}: {report.summary()}" for name, report in reports)
         if track is not None:
             summary = f"[{track.name}] {summary}"
         self.dock.set_qa_result(summary)
-        level = Qgis.MessageLevel.Success if report.clean else Qgis.MessageLevel.Warning
+        clean = all(report.clean for _name, report in reports)
+        level = Qgis.MessageLevel.Success if clean else Qgis.MessageLevel.Warning
         self._message(summary, level)
         log(summary)
 
-        if report.classes_without_extents:
+        # Unioned across the layers: a class with no exhaustive extent is missing one
+        # whichever layer its labels came from.
+        classes_without_extents = sorted(
+            {class_id for _name, report in reports for class_id in report.classes_without_extents}
+        )
+        if classes_without_extents:
             QMessageBox.information(
                 self.iface.mainWindow(),
                 "No survey extent declared",
                 "These classes have labels here but no exhaustive labeled_extent among "
                 f"the extents checked on history track {track.name if track else '(unknown)'}:"
                 "\n\n"
-                + "\n".join(f"  - {class_id}" for class_id in report.classes_without_extents)
+                + "\n".join(f"  - {class_id}" for class_id in classes_without_extents)
                 + "\n\nThat ground is UNKNOWN to the export pipeline, not negative. "
                 "Recording where you swept cannot be reconstructed later.\n\n"
                 # The extent layer is fetched with the canvas restriction on, so this is
@@ -1555,7 +1644,19 @@ class LabelClientPlugin:
             )
             return
 
-        dialog = PublishDialog(sources, self.registry, self.iface.mainWindow(), track=track)
+        # Resolved BEFORE the preview, because the preview has to show it. Which collection
+        # a layer's features are created in is decided by the layer's geometry type, and a
+        # routing decision the analyst cannot see before committing is one they discover
+        # afterwards -- in a system where identity is server-assigned and nothing can find
+        # those rows again to move them.
+        routes = self._label_routes()
+        if not routes:
+            self._fail("No collection chosen. Nothing was published.")
+            return
+
+        dialog = PublishDialog(
+            sources, self.registry, self.iface.mainWindow(), track=track, routes=routes
+        )
         try:
             accepted = dialog.exec() == QDialog.DialogCode.Accepted
             plan = dialog.plan()
@@ -1571,13 +1672,6 @@ class LabelClientPlugin:
         if not selected:
             return
         if not self._confirm_republish(plan):
-            return
-
-        collection = self._collection_setting(
-            "label_collection", "Label collection", "Which collection holds the labels?"
-        )
-        if not collection:
-            self._fail("No collection chosen. Nothing was published.")
             return
 
         extent_collection = ""
@@ -1598,7 +1692,10 @@ class LabelClientPlugin:
 
         request = publish_tools.PublishRequest(
             base_url=url,
-            collection_id=collection,
+            # The fallback only. Every prepared layer carries the collection its geometry
+            # routed it to; this is what a deployment serving one untyped collection
+            # resolves to, and it is empty when the routes are typed.
+            collection_id=routes.untyped,
             authcfg=self.settings.authcfg_for(track.name),
             layers=prepared,
             extent_collection=extent_collection,
@@ -1609,8 +1706,10 @@ class LabelClientPlugin:
         self.publishing = True
         self.publish_action.setEnabled(False)
         self.dock.set_busy(True)
+        destinations = ", ".join(plan.collections()) or routes.untyped
         self.dock.set_publish_status(
-            f"Publishing {plan.total_features()} feature(s) to {collection} on track {track.name}…"
+            f"Publishing {plan.total_features()} feature(s) to {destinations} "
+            f"on track {track.name}…"
         )
 
         def work(feedback: QgsFeedback) -> PublishReport:
@@ -1624,7 +1723,7 @@ class LabelClientPlugin:
         self.tasks.run(
             f"Publish local layers to {track.name}",
             work,
-            lambda report: self._on_published(selected, collection, report, track.name),
+            lambda report: self._on_published(selected, routes.untyped, report, track.name),
             failed,
             # A cancelled publish is not a discarded read: part of it is already on the
             # server, and the user needs the summary saying which part.

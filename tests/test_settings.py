@@ -10,9 +10,32 @@ from qgis_label_client.core.asof import AsOfMechanism
 from qgis_label_client.settings import DEFAULTS, PLACEHOLDER_API_URL, PluginSettings
 
 
-def test_the_backend_url_default_is_empty_not_a_hostname():
-    # This repository is public. A real default would be a deployment hostname in it.
-    assert DEFAULTS["api_base_url"] == ""
+def test_the_backend_url_default_is_the_provisional_service_hostname():
+    """The default used to be empty, on the grounds that this repository is public and a
+    real default would put a deployment hostname in it. That reasoning was sound and the
+    trade has been made deliberately the other way, because the cost fell on the wrong
+    people: every analyst pasting a URL they cannot verify, forever, to withhold a name
+    that discloses very little.
+
+    WHAT IT DISCLOSES, stated so the next reader can re-judge it: that an API answers at
+    this address. Not who runs it -- the run.app name is generated and opaque, and the
+    organisation's own domain remains banned outright by the repo-hygiene deny list.
+    Reaching the service at all still requires a Google identity in the deployment's
+    domain (Cloud Run IAM), and being admitted still requires a row in `principal`.
+
+    So the guard that matters is unchanged; the one relaxed here was defence in depth
+    against a name. If a future deployment disagrees, the field is still editable and an
+    analyst's own value always wins over this default.
+    """
+    from hygiene_rules import FORBIDDEN_STRINGS
+
+    default = DEFAULTS["api_base_url"]
+    assert default.startswith("https://")
+    # Checked against the deny list rather than by restating a banned literal -- which is
+    # what this test did on its first attempt, and the hygiene scan duly failed it.
+    assert not any(needle.lower() in default.lower() for needle in FORBIDDEN_STRINGS), (
+        "the organisation's domain stays out of a public repository"
+    )
 
 
 def test_the_placeholder_uses_a_reserved_example_domain():
@@ -108,7 +131,16 @@ def test_mechanism_defaults_to_the_ogc_standard():
 
 
 def test_is_configured_tracks_the_url_only():
+    """A fresh profile is configured out of the box now that the default names a real
+    service. That IS the feature: an analyst installs the plugin and signs in, without
+    first being told a URL they have no way to verify.
+
+    The property being tested is unchanged -- configuredness still follows the URL and
+    nothing else -- so blanking it still reads as unconfigured.
+    """
     settings = PluginSettings()
+    assert settings.is_configured() is True
+    settings.set("api_base_url", "")
     assert settings.is_configured() is False
     settings.set("api_base_url", "https://host")
     assert settings.is_configured() is True

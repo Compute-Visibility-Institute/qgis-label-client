@@ -282,6 +282,13 @@ class PreparedLayer:
     transform: QgsCoordinateTransform | None = None
     extent_geojson: Mapping[str, Any] | None = None
     extent_problem: str = ""
+    #: Which collection this layer's features are created in, decided from the layer's
+    #: geometry type in :mod:`.core.routing` and settled here on the main thread. Per
+    #: layer rather than per run: one geometry family per collection means a project of
+    #: compounds, cooling units and powerlines writes to three of them in one publish.
+    #: Empty falls back to :attr:`PublishRequest.collection_id`, which is what a
+    #: deployment serving a single untyped collection resolves to.
+    collection_id: str = ""
 
 
 def _extent_polygon(
@@ -369,6 +376,10 @@ def prepare(plans: Iterable[LayerPlan], project: QgsProject | None = None) -> li
                 transform=transform,
                 extent_geojson=extent_geojson,
                 extent_problem=extent_problem,
+                # Carried from the plan rather than recomputed: the collection shown in the
+                # preview and the collection written to have to be the same one, and the
+                # only way to guarantee that is for there to be one decision.
+                collection_id=plan.collection_id,
             )
         )
     return prepared
@@ -423,7 +434,13 @@ def stamp_published(
             format_record(
                 PublishRecord(
                     published_at=published_at,
-                    collection_id=collection_id,
+                    # The layer's own collection, not the run's: a publish now fans out
+                    # across collections by geometry, and a stamp naming a collection this
+                    # layer never went to would put a false destination in the warning the
+                    # next preview shows -- which is worse than no warning, because it is
+                    # read as fact. `collection_id` remains the fallback for a deployment
+                    # that routes everything to one untyped collection.
+                    collection_id=plan.collection_id or collection_id,
                     class_id=outcome.class_id,
                     feature_count=carried + outcome.published,
                     track=track or report.track,
@@ -446,6 +463,12 @@ class PublishRequest:
     """Everything :func:`publish` needs. Built on the main thread, read on the worker."""
 
     base_url: str
+    #: Where a layer goes when it carries no collection of its own.
+    #:
+    #: The run-wide fallback, not the destination: geometry-typed collections mean the
+    #: destination belongs to the layer (:attr:`PreparedLayer.collection_id`). This is what
+    #: a deployment serving a single untyped collection resolves to, and what a caller
+    #: reaching this module without a routed plan supplies.
     collection_id: str
     authcfg: str
     layers: list[PreparedLayer] = field(default_factory=list)
@@ -469,6 +492,16 @@ class PublishRequest:
 
     def total_features(self) -> int:
         return sum(prepared.plan.source.feature_count for prepared in self.layers)
+
+    def target_for(self, prepared: PreparedLayer) -> str:
+        """The collection one prepared layer's features are created in."""
+        return prepared.collection_id or self.collection_id
+
+    def unrouted(self) -> list[str]:
+        """Names of prepared layers with nowhere to go. See :func:`publish`."""
+        return [
+            prepared.plan.source.name for prepared in self.layers if not self.target_for(prepared)
+        ]
 
 
 #: Longest single wait after a 429 when the server sent no ``Retry-After``. The edge
@@ -499,6 +532,7 @@ def _wait(seconds: float, feedback: QgsFeedback | None) -> bool:
 
 def _send_one(
     request: PublishRequest,
+    collection_id: str,
     feature: Mapping[str, Any],
     feedback: QgsFeedback | None,
 ) -> tuple[int, str | None]:
@@ -526,7 +560,7 @@ def _send_one(
         try:
             client.create_feature(
                 request.base_url,
-                request.collection_id,
+                collection_id,
                 feature,
                 request.authcfg,
                 feedback,
@@ -554,6 +588,7 @@ def _send_one(
 
 def _send(
     request: PublishRequest,
+    collection_id: str,
     feature: Mapping[str, Any],
     subject: str,
     outcome: LayerOutcome,
@@ -588,7 +623,7 @@ def _send(
         # Already stopping. Sending would be one more write the user asked not to make.
         outcome.not_sent += 1
         return
-    published, error = _send_one(request, feature, feedback)
+    published, error = _send_one(request, collection_id, feature, feedback)
     if published:
         outcome.published += 1
     elif error is None:
@@ -732,7 +767,10 @@ def _publish_layer(
 ) -> LayerOutcome:
     """Publish one layer's features. Returns its outcome; never raises for a bad row."""
     plan = prepared.plan
-    outcome = report.outcome_for(plan.source.name, plan.class_id, plan.source.feature_count)
+    collection_id = request.target_for(prepared)
+    outcome = report.outcome_for(
+        plan.source.name, plan.class_id, plan.source.feature_count, collection_id
+    )
     outcome.reprojected = prepared.transform is not None
     if plan.label_class is None:  # pragma: no cover - prepare() filters these out
         return outcome
@@ -789,7 +827,14 @@ def _publish_layer(
         outcome.damaged_names += int(bool(result.damaged_names))
         outcome.omitted_names += int(bool(result.omitted_names))
 
-        _send(request, result.draft.to_geojson(request.fields), subject, outcome, feedback)
+        _send(
+            request,
+            collection_id,
+            result.draft.to_geojson(request.fields),
+            subject,
+            outcome,
+            feedback,
+        )
 
     return outcome
 
@@ -811,8 +856,16 @@ def publish(request: PublishRequest, feedback: QgsFeedback | None = None) -> Pub
     """
     if not request.base_url:
         raise ConfigurationError("No backend URL configured.")
-    if not request.collection_id:
-        raise ConfigurationError("No collection chosen to publish into.")
+    unrouted = request.unrouted()
+    if unrouted:
+        # Per layer, because the destination is per layer. Raised before anything is sent
+        # rather than defaulted to whichever collection the request happened to name: a
+        # point published into the polygon collection is refused by app.label_check()
+        # feature by feature, and 872 of those read as a server fault rather than as a
+        # layer that never had anywhere to go.
+        raise ConfigurationError(
+            "No collection chosen to publish into for: " + ", ".join(unrouted) + "."
+        )
     if not request.track:
         # Refused here as well as in the preview, and the reason is the same one that put
         # the URL and collection checks here: this function is reachable without the

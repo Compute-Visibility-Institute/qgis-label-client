@@ -234,3 +234,59 @@ def test_a_future_instant_is_refused_by_the_controller_not_only_by_the_picker(fa
     plugin.open_recorded_view(ahead.strftime("%Y-%m-%dT%H:%M:%SZ"))
     assert any("in the future" in text for _, text, _ in fake_iface.messages)
     plugin.unload()
+
+
+# --- which collections hold the labels --------------------------------------
+#
+# Labels are stored one collection per geometry type. Which ones those are is read from
+# /collections at runtime, exactly as the class vocabulary is, and the plugin's own
+# remembered setting is a hint about WHICH group -- never a compiled-in id.
+
+
+def _connected(fake_iface, *collection_ids):
+    from qgis_label_client.core.collections import Collection
+
+    plugin = _plugin(fake_iface)
+    plugin.collections = [Collection(collection_id=c, title=c) for c in collection_ids]
+    return plugin
+
+
+def test_the_routes_come_from_the_collections_the_backend_listed(fake_iface):
+    plugin = _connected(fake_iface, "label_polygon", "label_point", "labeled_extent")
+    routes = plugin._label_routes()
+    assert routes.collection_for("MultiPolygon") == "label_polygon"
+    assert routes.collection_for("Point") == "label_point"
+    plugin.unload()
+
+
+def test_a_setting_stored_before_the_split_needs_no_migration(fake_iface):
+    """The remembered collection is ``label``; the backend now serves ``label_*``.
+
+    Matching by stem is what keeps the backend change from re-prompting every existing
+    user at the exact moment they are about to publish irreversibly. If this breaks, the
+    symptom is a dialog asking a question that was already answered.
+    """
+    plugin = _connected(fake_iface, "label_polygon", "label_point", "label_line")
+    plugin.settings.set("label_collection", "label")
+    routes = plugin._label_routes()
+    assert routes.stem == "label"
+    assert routes.collection_for("MultiLineString") == "label_line"
+    plugin.unload()
+
+
+def test_a_backend_this_cannot_read_falls_back_to_asking(monkeypatch, fake_iface):
+    # Degrading honestly: the plugin asks which collection holds the labels and sends
+    # everything there, which is exactly what it did before the split. Guessing instead
+    # would put the founding dataset in another dataset's collections, permanently.
+    plugin = _connected(fake_iface, "capture_point", "capture_polygon", "annotation_point")
+    monkeypatch.setattr(plugin, "_ask_collection", lambda *args: "annotation_point")
+    routes = plugin._label_routes()
+    assert routes.collection_for("MultiPolygon") == "annotation_point"
+    plugin.unload()
+
+
+def test_a_backend_this_cannot_read_and_nobody_answers_for_routes_nothing(monkeypatch, fake_iface):
+    plugin = _connected(fake_iface, "capture_point", "capture_polygon", "annotation_point")
+    monkeypatch.setattr(plugin, "_ask_collection", lambda *args: "")
+    assert not plugin._label_routes()
+    plugin.unload()

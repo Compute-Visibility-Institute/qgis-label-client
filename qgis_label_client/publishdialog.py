@@ -54,14 +54,26 @@ from qgis.PyQt.QtWidgets import (
 )
 
 from .core.fields import COMPLETENESS_EXHAUSTIVE, COMPLETENESS_PARTIAL
-from .core.publish import LayerChoice, PublishPlan, PublishReport, SourceLayer, build_plan
+from .core.publish import (
+    LayerChoice,
+    LayerPlan,
+    PublishPlan,
+    PublishReport,
+    SourceLayer,
+    build_plan,
+)
 from .core.registry import ClassRegistry
+from .core.routing import CollectionRoutes
 from .core.tracks import Track
 
 _COLUMNS = (
     "Publish",
     "Features",
     "Geometry",
+    # Next to Geometry, because it is decided BY the geometry and by nothing else on this
+    # screen. The class combo is the control people expect to change the destination, and
+    # it does not; putting the two columns apart would invite exactly that reading.
+    "Collection (by geometry)",
     "CRS",
     "Class (from the registry)",
     "Fields",
@@ -72,11 +84,12 @@ _COLUMNS = (
 COL_LAYER = 0
 COL_FEATURES = 1
 COL_GEOMETRY = 2
-COL_CRS = 3
-COL_CLASS = 4
-COL_FIELDS = 5
-COL_EXTENT = 6
-COL_NOTES = 7
+COL_COLLECTION = 3
+COL_CRS = 4
+COL_CLASS = 5
+COL_FIELDS = 6
+COL_EXTENT = 7
+COL_NOTES = 8
 
 #: Item data role carrying a layer id on a row.
 LAYER_ROLE = int(Qt.ItemDataRole.UserRole) + 1
@@ -91,6 +104,7 @@ class PublishDialog(QDialog):
         registry: ClassRegistry,
         parent: QWidget | None = None,
         track: Track | None = None,
+        routes: CollectionRoutes | None = None,
     ) -> None:
         super().__init__(parent)
         # The track is in the WINDOW TITLE as well, because a modal dialog's title bar is
@@ -104,6 +118,7 @@ class PublishDialog(QDialog):
         self._sources = list(sources)
         self._registry = registry
         self._track = track
+        self._routes = routes
         # Set before the table is built: building it connects signals that fire while the
         # rows are being populated, and a refresh mid-build would read half a table.
         self._refreshing = True
@@ -186,7 +201,7 @@ class PublishDialog(QDialog):
 
     def _populate(self) -> None:
         """Render the opening plan: guessed classes, defaults already applied."""
-        plan = build_plan(self._sources, self._registry)
+        plan = build_plan(self._sources, self._registry, None, self._track, self._routes)
         for row, layer_plan in enumerate(plan):
             source = layer_plan.source
 
@@ -207,6 +222,10 @@ class PublishDialog(QDialog):
                 _readonly(str(source.feature_count) if source.count_known else "unknown"),
             )
             self.table.setItem(row, COL_GEOMETRY, _readonly(source.geometry_type))
+            # Filled once, not on every refresh: the destination follows from the layer's
+            # geometry type, which nothing on this screen can change. A routing refusal is
+            # a blocking problem and appears in the Notes column with the rest of them.
+            self.table.setItem(row, COL_COLLECTION, _collection_cell(layer_plan))
             self.table.setItem(row, COL_CRS, _readonly(source.crs_authid))
 
             self.table.setCellWidget(row, COL_CLASS, self._class_combo(layer_plan.choice.class_id))
@@ -315,7 +334,7 @@ class PublishDialog(QDialog):
 
     def plan(self) -> PublishPlan:
         """The plan as currently configured."""
-        return build_plan(self._sources, self._registry, self.choices(), self._track)
+        return build_plan(self._sources, self._registry, self.choices(), self._track, self._routes)
 
     # --- rendering ------------------------------------------------------------
 
@@ -491,4 +510,27 @@ def _readonly(text: str) -> QTableWidgetItem:
     item = QTableWidgetItem(text)
     item.setFlags(Qt.ItemFlag.ItemIsEnabled)
     item.setToolTip(text)
+    return item
+
+
+def _collection_cell(layer_plan: LayerPlan) -> QTableWidgetItem:
+    """Which collection this layer's features would be created in.
+
+    On the screen rather than only in the log, because it is a decision the analyst never
+    makes and can only check here. The features fan out across collections by geometry
+    type; a route that turns out to be wrong is discovered as rows in the wrong place, and
+    the server assigns identity, so nothing afterwards can find them again to move them.
+    """
+    if layer_plan.collection_id:
+        item = _readonly(layer_plan.collection_id)
+        item.setToolTip(
+            f"{layer_plan.source.geometry_type or 'This geometry'} publishes into "
+            f"{layer_plan.collection_id}. Each collection stores one geometry type; the "
+            "class is an attribute of the feature, not of the collection."
+        )
+        return item
+    # "-" rather than an empty cell: blank reads as "not filled in yet", and this is a
+    # layer that has nowhere to go. The Notes column carries the reason.
+    item = _readonly("-")
+    item.setToolTip(layer_plan.routing_problem or "No collection resolved for this layer.")
     return item

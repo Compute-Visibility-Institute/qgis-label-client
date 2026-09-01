@@ -46,6 +46,42 @@ jobs:
       - name: Test before releasing
         run: pytest -q
 
+      # ─────────────────────────────────────────────────────────────────────
+      # The OAuth client secret, substituted into the ZIP and never into git.
+      #
+      # It is not confidential -- an installed app's secret ships in every copy
+      # and identifies the APP, not the bearer; the allowlist is what grants
+      # access. But a value committed to a public repository can only be rotated
+      # by rewriting history, so it lives in an Actions secret and is written in
+      # here, at the last moment before packaging.
+      #
+      # AFTER the tests above, deliberately: the suite asserts the source default
+      # is empty, and running it against a substituted tree would assert nothing.
+      #
+      # Absent, the step is a no-op and the release still builds -- a fork
+      # without the secret gets a working plugin whose sign-in asks for one,
+      # which is better than a release that fails to publish.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Substitute the OAuth client secret
+        env:
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
+        run: |
+          if [ -z "$OAUTH_CLIENT_SECRET" ]; then
+            echo "::warning::OAUTH_CLIENT_SECRET is not set; the released plugin will ask each analyst to supply one."
+            exit 0
+          fi
+          f=qgis_label_client/core/oauth.py
+          grep -q '^CLIENT_SECRET = ""$' "$f" || {
+            echo "::error::$f no longer has an empty CLIENT_SECRET to substitute; refusing to guess."; exit 1; }
+          python - "$f" <<'PY'
+          import os, sys, pathlib
+          p = pathlib.Path(sys.argv[1])
+          p.write_text(p.read_text().replace(
+              'CLIENT_SECRET = ""',
+              'CLIENT_SECRET = "%s"' % os.environ["OAUTH_CLIENT_SECRET"], 1))
+          PY
+          echo "substituted (value not echoed)"
+
       - name: Resolve the tag
         id: tag
         run: |

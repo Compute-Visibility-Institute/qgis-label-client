@@ -181,6 +181,26 @@ def install_default(layer: QgsVectorLayer, fields: CoreFields = DEFAULT_FIELDS) 
     return True
 
 
+#: The registered function object, held for exactly as long as QGIS knows about it.
+#:
+#: THIS MODULE-LEVEL NAME IS THE WHOLE FIX FOR A HARD CRASH, and it looks like dead code
+#: to anyone who does not know that. It was written as
+#:
+#:     QgsExpression.registerFunction(_valid_from_function())
+#:
+#: which reads correctly and segfaults QGIS on plugin unload. registerFunction() hands the
+#: object across to C++, which stores a RAW POINTER and does not take a reference. With no
+#: Python name holding it, the object is collected the moment the call returns, and QGIS is
+#: left pointing at freed memory. Unticking the plugin in the Plugin Manager dereferences
+#: that pointer and takes the whole application down with it -- no traceback, no log line,
+#: because the interpreter is gone before it could write one.
+#:
+#: Observed on QGIS 3.44.13 the first time the plugin was unloaded.
+_registered_function = None
+
+_FUNCTION_NAME = "cvi_valid_from"
+
+
 def register_functions() -> None:
     """Register ``cvi_valid_from()`` so the field default can call it.
 
@@ -188,17 +208,35 @@ def register_functions() -> None:
     unload -- a stale function bound to a torn-down plugin is the classic way a QGIS plugin
     leaves a project unopenable after a reload.
     """
-    if QgsExpression.isFunctionName(_FUNCTION_NAME):
+    global _registered_function
+
+    if _registered_function is not None or QgsExpression.isFunctionName(_FUNCTION_NAME):
         return
-    QgsExpression.registerFunction(_valid_from_function())
+    # Bound to the module BEFORE the hand-off, so the reference already exists by the time
+    # C++ has the pointer. Assigning afterwards would leave a window in which a garbage
+    # collection triggered from inside registerFunction() could still free it.
+    _registered_function = _valid_from_function()
+    QgsExpression.registerFunction(_registered_function)
 
 
 def unregister_functions() -> None:
+    """Drop the function, and only then drop our reference to it.
+
+    The order matters for the same reason the reference does: while QGIS still has the
+    pointer, the object has to stay alive. Clearing the name first would recreate the
+    dangling pointer this module exists to avoid, in the one code path most likely to be
+    running during interpreter teardown.
+
+    Any layer whose ``valid_from`` default names this function stops resolving once it is
+    gone. That is correct -- the plugin that gave the field its meaning has been unloaded --
+    and it is why the default is only installed on live layers rather than written into a
+    saved project.
+    """
+    global _registered_function
+
     if QgsExpression.isFunctionName(_FUNCTION_NAME):
         QgsExpression.unregisterFunction(_FUNCTION_NAME)
-
-
-_FUNCTION_NAME = "cvi_valid_from"
+    _registered_function = None
 
 
 def _valid_from_function():  # pragma: no cover - requires a running QGIS

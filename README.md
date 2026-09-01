@@ -458,7 +458,25 @@ nothing when it does not know the source CRS, `label.geom` has no range check, a
 `ST_GeometryType` still matches the class, so projected metres would land as degrees of
 longitude looking exactly like valid data.
 
-Two things the dialog says out loud, because both are silent failures otherwise:
+**Which collection each layer goes to is decided from its geometry type, and shown.**
+Labels are stored one collection per geometry family — a cooling unit is a Point, a
+powerline is a LineString — because an untyped collection cannot tell QGIS what it holds:
+OGC API - Features has no way to declare a geometry type, pygeoapi reports `geometry-any`,
+and QGIS falls back to inferring the type by *sampling features*. An empty collection
+samples as nothing, the layer is treated as non-spatial, and the Edit menu offers "Add
+Record" where it should offer "Add Polygon Feature" — every digitizing tool gone, on the
+day a deployment is empty. A QGIS vector layer has exactly one geometry type, so a polygon
+layer publishes to the polygon collection. **No collection id is compiled into the
+plugin**: the routes are resolved against what `/collections` lists, exactly as the class
+vocabulary is read from the registry, and a deployment still serving a single untyped
+collection keeps working unchanged. A layer that matches no collection — a mixed or
+unknown-geometry layer above all — is **refused by name and by geometry type before
+anything is sent**, because a point published into the polygon collection is rejected
+feature by feature by the server and 872 refusals read as an outage. Class remains an
+attribute rather than a layer: there are three collections however many classes exist, and
+adding one is still a single row in `label_class`.
+
+Two more things the dialog says out loud, because both are silent failures otherwise:
 
 - **Damaged names.** Six of the seven source `.cpg` files declare UTF-7 and the writer
   never flushed its final escape run, so at least 52% of the Chinese names have lost their
@@ -539,6 +557,7 @@ qgis_label_client/
 │   ├── publish.py       the bootstrap plan, feature drafting and its report
 │   ├── recorded.py      transaction-time instants: the other axis, one file each
 │   ├── registry.py      the class vocabulary
+│   ├── routing.py       geometry type -> which collection to publish into
 │   ├── expressions.py   QGIS-expression quoting, shared by asof and tracks
 │   ├── styling.py       registry style block -> QGIS symbol properties
 │   ├── teardown.py      the undo stack that makes unload() correct

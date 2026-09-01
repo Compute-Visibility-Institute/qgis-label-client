@@ -34,7 +34,31 @@ PLACEHOLDER_API_URL = "https://api.example.org/oapif"
 
 DEFAULTS: dict[str, Any] = {
     # Landing page of the `api` Cloud Run service's OGC API - Features endpoint.
-    "api_base_url": "",
+    #
+    # PROVISIONAL, and deliberately so. This is the generated run.app hostname, which is
+    # stable for the life of the service but is not the address this deployment intends
+    # to keep: a custom domain is already delegated in Terraform and waiting on NS records
+    # at the registrar. When that lands, this default changes and every analyst who never
+    # touched the field follows automatically -- which is the reason to have a default at
+    # all rather than making each of them paste it.
+    #
+    # An analyst who HAS edited the field keeps their value: QgsSettings only falls back
+    # to this when the key is absent. So changing it later cannot silently repoint
+    # somebody who deliberately aimed at a different deployment.
+    "api_base_url": "https://api-xzuhhhdboa-zf.a.run.app",
+    # Google's client secret for the DESKTOP OAuth client in core.oauth.CLIENT_ID.
+    #
+    # NOT A SECRET, AND STILL NOT HARDCODED. Google documents an installed app's secret
+    # as not confidential -- it is compiled into the binary and cannot be one -- while
+    # still requiring it as a client identifier on the token endpoint. Without it the
+    # exchange fails with `invalid_request: client_secret is missing` AFTER the analyst
+    # has already consented in the browser, which is the worst possible moment to fail.
+    #
+    # It lives here rather than beside CLIENT_ID because this repository is public and
+    # GPL: a value committed there is public permanently and could only be rotated by
+    # cutting a release. The client id is hardcoded because it is on every authorization
+    # URL anyway; the secret is deployment configuration, distributed with the API URL.
+    "oauth_client_secret": "",
     # Reference into qgis-auth.db. NOT a token.
     #
     # Kept for one reason only: profiles written before history tracks existed have a
@@ -106,6 +130,15 @@ DEFAULTS: dict[str, Any] = {
     "recorded_at": "",
     # Collection ids. Discovered from /collections at runtime; these are only the
     # pre-selected defaults in the panel and are overwritten by what the user picks.
+    #
+    # label_collection is now a HINT rather than a destination. Labels live in one
+    # collection per geometry type -- a cooling unit is a Point, a powerline is a
+    # LineString -- and which one a layer publishes to is resolved from its geometry
+    # against what the backend lists (qgis_label_client.core.routing). What this key
+    # supplies is which FAMILY of collections holds labels at all, matched by stem, so a
+    # value stored before the split ("label") still selects the split collections
+    # afterwards and nothing has to migrate it. It is still the destination outright on a
+    # deployment that serves a single untyped collection.
     "label_collection": "",
     "extent_collection": "",
     "history_collection": "",
@@ -176,6 +209,11 @@ class PluginSettings:
     @property
     def api_base_url(self) -> str:
         return str(self.get("api_base_url")).strip()
+
+    @property
+    def oauth_client_secret(self) -> str:
+        """Google's client secret for the desktop OAuth client. See DEFAULTS."""
+        return str(self.get("oauth_client_secret")).strip()
 
     @property
     def track(self) -> str:

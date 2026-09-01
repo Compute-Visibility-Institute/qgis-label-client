@@ -33,6 +33,7 @@ from qgis_label_client.core.publish import (
     was_promoted,
 )
 from qgis_label_client.core.registry import parse_registry
+from qgis_label_client.core.routing import build_routes
 
 COMPOUND = REGISTRY.get("compound")
 COOLING_UNIT = REGISTRY.get("cooling_unit")
@@ -445,6 +446,152 @@ def test_damaged_names_are_counted_across_the_whole_plan():
         REGISTRY,
     )
     assert plan.damaged_name_count() == 83
+
+
+# --- where the features go --------------------------------------------------
+#
+# Labels are stored one collection per geometry type, because an untyped collection with
+# nothing in it to sample makes QGIS treat the layer as non-spatial and hide every
+# digitizing tool. A QGIS vector layer has exactly one geometry type, so the plan is where
+# the destination is decided -- and the preview is where it has to become visible, because
+# the server assigns identity and a publish into the wrong collection cannot be found again.
+
+
+def _routes():
+    # Built from a collection list, exactly as the plugin builds it from /collections.
+    # Never from ids written into the plugin: see core/routing.py.
+    return build_routes(["label_polygon", "label_point", "label_line", "labeled_extent"])
+
+
+def test_a_layer_is_routed_by_its_own_geometry_not_by_its_class():
+    """Point layer to the point collection, polygon layer to the polygon one.
+
+    Deliberately in one plan: a project holding compounds and cooling units publishes to
+    two collections in a single run, and a plan that carried one destination for the run
+    would send half of it to a collection that refuses it feature by feature.
+    """
+    plan = build_plan(
+        [
+            _source("Compounds", geometry_type="MultiPolygon"),
+            _source("CoolingUnits", geometry_type="Point"),
+            _source("Powerlines", geometry_type="MultiLineString"),
+        ],
+        REGISTRY,
+        None,
+        TRACK,
+        _routes(),
+    )
+    by_name = {layer_plan.source.name: layer_plan.collection_id for layer_plan in plan}
+    assert by_name == {
+        "Compounds": "label_polygon",
+        "CoolingUnits": "label_point",
+        "Powerlines": "label_line",
+    }
+    assert plan.problems() == ()
+
+
+def test_adding_a_class_needs_no_new_collection():
+    """The property this whole design is load-bearing for.
+
+    Five classes share the polygon collection today. A sixth is one row in label_class:
+    the plan routes it by geometry like the others, and nothing here keys on a class id --
+    no migration, no new collection, no plugin release.
+    """
+    plan = build_plan(
+        [
+            _source("Compounds", geometry_type="MultiPolygon"),
+            _source("Bld_Datacenters", geometry_type="MultiPolygon"),
+            _source("Substation", geometry_type="MultiPolygon"),
+        ],
+        REGISTRY,
+        None,
+        TRACK,
+        _routes(),
+    )
+    assert len({layer_plan.class_id for layer_plan in plan}) == 3
+    assert plan.collections() == ("label_polygon",)
+
+
+def test_a_layer_with_no_collection_to_go_to_blocks_the_publish():
+    """Refused, by name and by geometry type, rather than sent somewhere plausible.
+
+    An "Unknown (any)" layer -- what OGR reports for mixed geometry -- has no single
+    destination. Publishing it into whichever collection the run named would have
+    app.label_check() reject the mismatched features one at a time, and a report full of
+    server refusals is read as an outage rather than as a layer that needed splitting.
+    """
+    plan = build_plan(
+        [_source("Everything", geometry_type="Unknown (any)")],
+        REGISTRY,
+        {"everything": LayerChoice(layer_id="everything", publish=True, class_id="compound")},
+        TRACK,
+        _routes(),
+    )
+    problems = plan.problems()
+    assert problems
+    assert "Everything" in problems[0] and "Unknown (any)" in problems[0]
+    assert plan.layers[0].collection_id == ""
+
+
+def test_the_class_mismatch_is_reported_before_the_routing_refusal():
+    # Both are true of a point layer set to a polygon class, and only one of them is
+    # fixable on the preview screen. The one with a control next to it comes first.
+    plan = build_plan(
+        [_source("CoolingUnits", geometry_type="Point")],
+        REGISTRY,
+        {"coolingunits": LayerChoice(layer_id="coolingunits", publish=True, class_id="compound")},
+        TRACK,
+        build_routes(["label_polygon"]),
+    )
+    assert "this class stores MultiPolygon" in plan.problems()[0]
+
+
+def test_a_plan_built_without_routes_states_no_destination_and_refuses_nothing():
+    """ "Nobody asked" is not "nowhere".
+
+    The plan has to stay renderable and testable without a backend to ask. The publish
+    path always passes routes, so the only way to reach a send is through a plan that named
+    a collection for every layer -- see publish() in qgis_label_client/publish.py.
+    """
+    plan = build_plan([_source("Compounds", geometry_type="MultiPolygon")], REGISTRY, None, TRACK)
+    assert plan.layers[0].collection_id == ""
+    assert plan.layers[0].routing_problem == ""
+    assert plan.problems() == ()
+
+
+def test_the_summary_names_the_collections_it_would_write_to():
+    # The table has a column for it, but this sentence is what the confirmation and the
+    # status line repeat, and a publish that now fans out across collections would
+    # otherwise have its fan-out visible only in a column the eye skips.
+    plan = build_plan(
+        [
+            _source("Compounds", geometry_type="MultiPolygon"),
+            _source("CoolingUnits", geometry_type="Point"),
+        ],
+        REGISTRY,
+        None,
+        TRACK,
+        _routes(),
+    )
+    assert "label_point" in plan.summary() and "label_polygon" in plan.summary()
+
+
+def test_a_backend_serving_one_untyped_collection_routes_everything_to_it():
+    # The plugin ships independently of the backend, so a current release will meet a
+    # deployment that has not split yet. Everything into the one collection, which is both
+    # correct there and exactly what that user already had.
+    plan = build_plan(
+        [
+            _source("Compounds", geometry_type="MultiPolygon"),
+            _source("CoolingUnits", geometry_type="Point"),
+        ],
+        REGISTRY,
+        None,
+        TRACK,
+        build_routes(["label"], preferred="label"),
+    )
+    assert plan.collections() == ("label",)
+    assert plan.problems() == ()
 
 
 # --- the report -------------------------------------------------------------

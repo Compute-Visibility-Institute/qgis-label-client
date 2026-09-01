@@ -66,6 +66,30 @@ def _as_qdatetime(moment: datetime) -> QDateTime:
     return QDateTime(QDate(utc.year, utc.month, utc.day), QTime(utc.hour, utc.minute, utc.second))
 
 
+def _collapsible(title: str, parent: QWidget, *, collapsed: bool = False) -> QgsCollapsibleGroupBox:
+    """A group box that remembers whether the analyst collapsed it.
+
+    QgsCollapsibleGroupBox has always collapsed on click -- the arrows in the panel are
+    not decoration. What it could not do here is REMEMBER, because QGIS keys the saved
+    state on the widget's object name and none of these had one. Every restart reopened
+    all nine groups, so the panel was a wall of text that had to be re-tidied each
+    session and could only be scrolled.
+
+    `collapsed` is the state on FIRST run only; the saved value wins afterwards. It is set
+    for the groups that are not part of a working day -- a one-time bootstrap, a
+    vocabulary reference -- so a fresh install opens on the controls somebody is about to
+    use rather than on everything the plugin can do.
+    """
+    group = QgsCollapsibleGroupBox(title, parent)
+    # Stable, derived from the title rather than hand-written, so a renamed group cannot
+    # silently inherit another one's saved state.
+    group.setObjectName("cvi_" + "".join(c if c.isalnum() else "_" for c in title.lower()))
+    group.setSaveCollapsedState(True)
+    if collapsed:
+        group.setCollapsed(True)
+    return group
+
+
 class LabelClientDock(QDockWidget):
     """Connection, collections, imagery, both time axes and QA, in one persistent panel.
 
@@ -113,6 +137,22 @@ class LabelClientDock(QDockWidget):
 
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
+
+        # WHY A MINIMUM WIDTH IS SET AT ALL, given nothing here is fixed-width.
+        #
+        # A dock can only be dragged as narrow as its content's minimumSizeHint, and Qt
+        # computes that from the widest child that cannot shrink -- here a QLineEdit and
+        # a form column, neither of which word-wraps. The panel therefore held roughly a
+        # third of a 2000px screen even with every group collapsed, which is what made
+        # collapsing them feel like it had not worked.
+        #
+        # 220px is narrower than the panel is comfortable at, deliberately: it is a floor
+        # for the analyst who wants the canvas, not a target. Anything that will not fit
+        # scrolls horizontally rather than widening the dock, which is the trade this
+        # whole change is making -- a scrollbar the analyst can ignore, instead of screen
+        # space they cannot reclaim.
+        scroll.setMinimumWidth(220)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         container = QWidget(scroll)
         layout = QVBoxLayout(container)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -154,12 +194,17 @@ class LabelClientDock(QDockWidget):
     # --- construction ---------------------------------------------------------
 
     def _build_connection_group(self, parent: QWidget) -> QWidget:
-        group = QgsCollapsibleGroupBox("Backend", parent)
+        group = _collapsible("Backend", parent)
         form = QFormLayout(group)
 
         self.url_edit = QLineEdit(group)
-        # Placeholder, never a default value. This repository is public and must not
-        # contain a deployment hostname.
+        # Without this the field's own sizeHint sets the dock's floor -- see the
+        # minimum-width note above.
+        self.url_edit.setMinimumWidth(120)
+        # The placeholder is a reserved example domain; the real default lives in
+        # settings.DEFAULTS and is filled in before this is ever seen. It survives for the
+        # case that default was blanked deliberately, where an example is more useful than
+        # an empty box.
         self.url_edit.setPlaceholderText(PLACEHOLDER_API_URL)
         self.url_edit.setToolTip(
             "Landing page of the OGC API - Features endpoint served by the api service."
@@ -215,7 +260,7 @@ class LabelClientDock(QDockWidget):
         An annotator spends an afternoon in the map canvas, not in this panel, and the
         thing they need on screen is not a control -- it is an answer.
         """
-        group = QgsCollapsibleGroupBox("History track", parent)
+        group = _collapsible("History track", parent)
         layout = QVBoxLayout(group)
 
         hint = QLabel(
@@ -243,7 +288,7 @@ class LabelClientDock(QDockWidget):
         self.trackChanged.emit(self.selected_track())
 
     def _build_collections_group(self, parent: QWidget) -> QWidget:
-        group = QgsCollapsibleGroupBox("Collections", parent)
+        group = _collapsible("Collections", parent)
         layout = QVBoxLayout(group)
 
         hint = QLabel(
@@ -265,7 +310,7 @@ class LabelClientDock(QDockWidget):
         return group
 
     def _build_bootstrap_group(self, parent: QWidget) -> QWidget:
-        group = QgsCollapsibleGroupBox("Bootstrap", parent)
+        group = _collapsible("Bootstrap", parent, collapsed=True)
         layout = QVBoxLayout(group)
 
         hint = QLabel(
@@ -291,7 +336,7 @@ class LabelClientDock(QDockWidget):
         return group
 
     def _build_imagery_group(self, parent: QWidget) -> QWidget:
-        group = QgsCollapsibleGroupBox("Imagery", parent)
+        group = _collapsible("Imagery", parent)
         layout = QVBoxLayout(group)
 
         hint = QLabel(
@@ -312,7 +357,7 @@ class LabelClientDock(QDockWidget):
         return group
 
     def _build_asof_group(self, parent: QWidget) -> QWidget:
-        group = QgsCollapsibleGroupBox("As-of date (valid time)", parent)
+        group = _collapsible("As-of date (valid time)", parent)
         layout = QVBoxLayout(group)
 
         hint = QLabel(
@@ -372,7 +417,7 @@ class LabelClientDock(QDockWidget):
         control. That is the whole use case: the live layer and a historical one open at
         once, and two historical ones at different instants if you want to compare beliefs.
         """
-        group = QgsCollapsibleGroupBox("Historical view (transaction time)", parent)
+        group = _collapsible("Historical view (transaction time)", parent)
         layout = QVBoxLayout(group)
 
         hint = QLabel(
@@ -436,7 +481,7 @@ class LabelClientDock(QDockWidget):
             self.recordedViewRequested.emit(moment)
 
     def _build_qa_group(self, parent: QWidget) -> QWidget:
-        group = QgsCollapsibleGroupBox("QA", parent)
+        group = _collapsible("QA", parent, collapsed=True)
         layout = QVBoxLayout(group)
 
         self.history_button = QPushButton("History of selected label…", group)
@@ -460,7 +505,7 @@ class LabelClientDock(QDockWidget):
         return group
 
     def _build_vocabulary_group(self, parent: QWidget) -> QWidget:
-        group = QgsCollapsibleGroupBox("Class vocabulary", parent)
+        group = _collapsible("Class vocabulary", parent, collapsed=True)
         layout = QVBoxLayout(group)
 
         hint = QLabel(

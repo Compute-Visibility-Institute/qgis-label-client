@@ -71,10 +71,11 @@ from qgis.core import (
     QgsSymbolLayer,
     QgsVectorDataProvider,
     QgsVectorLayer,
+    QgsWkbTypes,
 )
 from qgis.PyQt.QtXml import QDomDocument
 
-from .core import asof, recorded, styling
+from .core import asof, recorded, routing, styling
 from .core import tracks as track_tools
 from .core.asof import AsOfMechanism
 from .core.errors import BackendError
@@ -587,6 +588,30 @@ def plugin_layers(project: QgsProject | None = None) -> list[QgsVectorLayer]:
     ]
 
 
+def find_layers_with_fields(
+    required: Iterable[str],
+    project: QgsProject | None = None,
+    excluding: Iterable[str] = (),
+) -> list[QgsVectorLayer]:
+    """Every plugin layer carrying all of `required` and none of `excluding`.
+
+    Plural because labels are served as one collection per geometry type: a project with
+    compounds, cooling units and powerlines open has three label layers, all equally the
+    label layer. A caller that takes the first of them silently answers its question about
+    a third of the data -- see :func:`find_label_layers`.
+    """
+    wanted = {name for name in required if name}
+    unwanted = {name for name in excluding if name}
+    if not wanted:
+        return []
+    return [
+        layer
+        for layer in live_layers(project)
+        if wanted.issubset({field.name() for field in layer.fields()})
+        and not (unwanted & {field.name() for field in layer.fields()})
+    ]
+
+
 def find_layer_with_fields(
     required: Iterable[str],
     project: QgsProject | None = None,
@@ -605,15 +630,8 @@ def find_layer_with_fields(
     Historical layers are never candidates. They answer a different question, they cannot
     be edited, and every caller of this wants the layer the annotator is working on.
     """
-    wanted = {name for name in required if name}
-    unwanted = {name for name in excluding if name}
-    if not wanted:
-        return None
-    for layer in live_layers(project):
-        names = {field.name() for field in layer.fields()}
-        if wanted.issubset(names) and not (unwanted & names):
-            return layer
-    return None
+    found = find_layers_with_fields(required, project, excluding)
+    return found[0] if found else None
 
 
 def find_label_layer(
@@ -639,7 +657,27 @@ def find_label_layer(
     this plugin stamped on it (which holds even for a deployment whose historical view
     exposes different columns entirely).
     """
-    return find_layer_with_fields(
+    found = find_label_layers(registry, project)
+    return found[0] if found else None
+
+
+def find_label_layers(
+    registry: ClassRegistry, project: QgsProject | None = None
+) -> list[QgsVectorLayer]:
+    """EVERY loaded label layer, in project order.
+
+    There is more than one, and that is the whole reason this exists. Labels are served as
+    one collection per geometry type, so an analyst working on compounds and cooling units
+    has two label layers open and both are the label layer. A QA check that took the first
+    of them would examine the polygons, find nothing wrong with the points it never read,
+    and report a clean project -- the failure mode that makes a check worse than none,
+    because its silence is believed.
+
+    The exclusions are :func:`find_label_layer`'s, and they matter more here rather than
+    less: with several genuine label layers in a project, "the first one that matches" no
+    longer accidentally protects against matching the history collection too.
+    """
+    return find_layers_with_fields(
         (registry.fields.label_id, registry.fields.class_id),
         project,
         excluding=(
@@ -682,10 +720,35 @@ def repoint_layer(layer: QgsVectorLayer, uri: str) -> None:
     layer.triggerRepaint()
 
 
-def _symbol_for(label_class: LabelClass, historical: bool = False):
-    """Build a symbol matching the class's geometry type and registry style."""
-    properties = styling.symbol_properties(label_class.geom_type, label_class.style, historical)
-    kind = styling.symbol_kind(label_class.geom_type)
+def _layer_geometry_family(layer: QgsVectorLayer) -> str:
+    """The layer's geometry family, or ``""`` when this QGIS cannot say.
+
+    Empty is a real answer and not a failure: a mixed or unknown layer -- which is what an
+    untyped collection with nothing in it to sample looks like -- has no one family, and
+    the caller then falls back to styling each category by its own class. Guarded because
+    ``wkbType`` is a binding detail and a stand-in layer in a test has no reason to have
+    one; the styling is worth degrading for, never worth raising for.
+    """
+    try:
+        return routing.geometry_family(str(QgsWkbTypes.displayString(layer.wkbType()) or ""))
+    except (AttributeError, TypeError):  # pragma: no cover - binding shape, not logic
+        return ""
+
+
+def _symbol_for(label_class: LabelClass, historical: bool = False, geom_type: str = ""):
+    """Build a symbol in the class's registry style, for `geom_type` if one is given.
+
+    `geom_type` is the LAYER's geometry family, and it overrides the class's own because a
+    categorized renderer's symbols have to match the layer, not the category. Labels now
+    live in one collection per geometry type, so a point layer carries a category for every
+    class in the registry -- including the polygon ones, which still have to appear, because
+    a category dropped from the renderer renders its features invisible rather than merely
+    unstyled. Given a fill symbol on a point layer QGIS draws nothing at all; given a
+    marker in the polygon class's colours it draws something correct and recognisable.
+    """
+    effective = geom_type or label_class.geom_type
+    properties = styling.symbol_properties(effective, label_class.style, historical)
+    kind = styling.symbol_kind(effective)
     if kind == "marker":
         return QgsMarkerSymbol.createSimple(properties)
     if kind == "line":
@@ -769,10 +832,18 @@ def _apply_class_renderer(
     all and a categorized renderer is the natural expression of that. Retired classes are
     included: historical labels still reference them, and dropping their category would
     render those features invisible rather than merely uneditable.
+
+    Every category is built for the LAYER's geometry, not for the class's. The labels are
+    served as one collection per geometry type, so a point layer is offered categories for
+    the five polygon classes as well -- and a categorized renderer whose symbol type does
+    not match the layer draws nothing. Filtering those categories out instead would be the
+    same invisibility by another route, and would break the day a deployment stores a class
+    somewhere this plugin did not predict.
     """
+    geom_type = _layer_geometry_family(layer)
     categories = []
     for label_class in registry:
-        symbol = _symbol_for(label_class, historical)
+        symbol = _symbol_for(label_class, historical, geom_type)
         if historical:
             _apply_superseded_colour(symbol, label_class, registry.fields)
         categories.append(

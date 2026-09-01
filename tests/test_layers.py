@@ -551,3 +551,88 @@ def test_the_echo_column_names_a_historical_collection_without_knowing_its_id():
     # Collection ids are a deployment's choice, exactly as class names are.
     assert recorded.exposes_recorded_axis(ASOF_FIELDS, REGISTRY.fields)
     assert not recorded.exposes_recorded_axis(LABEL_FIELDS, REGISTRY.fields)
+
+
+# --- one label layer per geometry type --------------------------------------
+#
+# Labels are served as one collection per geometry type, because QGIS infers a layer's
+# geometry by sampling features and an empty untyped collection samples as nothing --
+# which hides every digitizing tool behind "Add Record". The consequence up here is that
+# "the label layer" is now two or three layers, and anything that took the first of them
+# silently answers its question about a fraction of the data.
+
+
+def test_every_label_layer_is_found_not_just_the_first(monkeypatch):
+    """The coverage check runs over all of them or it lies.
+
+    Checking only the first would examine the polygons, say nothing about the 872 cooling
+    units it never read, and report a clean project. A partial check is worse than none:
+    its silence is believed.
+    """
+    polygons = _FakeLayer("label_polygon", LABEL_FIELDS)
+    points = _FakeLayer("label_point", LABEL_FIELDS)
+    lines = _FakeLayer("label_line", LABEL_FIELDS)
+    _with_layers(monkeypatch, polygons, points, lines)
+
+    assert layer_tools.find_label_layers(REGISTRY) == [polygons, points, lines]
+    # And the singular helper still answers with the first of them, for the callers whose
+    # question really is about one layer.
+    assert layer_tools.find_label_layer(REGISTRY) is polygons
+
+
+def test_the_audit_layer_is_excluded_from_the_plural_lookup_too(monkeypatch):
+    # The exclusions matter MORE with several genuine label layers, not less: "the first
+    # match" no longer accidentally protects against also matching label_history.
+    label = _FakeLayer("label_point", LABEL_FIELDS)
+    _with_layers(monkeypatch, _FakeLayer("audit", AUDIT_FIELDS), label)
+    assert layer_tools.find_label_layers(REGISTRY) == [label]
+
+
+# --- symbols that match the layer, not the class ----------------------------
+
+
+class _SymbolKind:
+    """Stands in for one of the three QGIS symbol classes, and says which it is."""
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+
+    def createSimple(self, _properties):  # noqa: N802 - Qt naming
+        return self.kind
+
+
+@pytest.fixture
+def _symbol_kinds(monkeypatch):
+    for name, kind in (
+        ("QgsMarkerSymbol", "marker"),
+        ("QgsLineSymbol", "line"),
+        ("QgsFillSymbol", "fill"),
+    ):
+        monkeypatch.setattr(layer_tools, name, _SymbolKind(kind))
+
+
+def test_a_class_of_another_geometry_still_gets_a_symbol_the_layer_can_draw(_symbol_kinds):
+    """A point layer carries a category for the polygon classes, and must draw them.
+
+    All classes live in one table with a class_id column, so the categorized renderer
+    covers the whole registry on every label layer -- including, now, layers of a
+    different geometry from the class. QGIS draws NOTHING for a category whose symbol type
+    does not match the layer, and dropping the category instead would be the same
+    invisibility by another route. A marker in the polygon class's own colours is both
+    drawable and recognisable.
+    """
+    polygon_class = parse_registry(
+        {"classes": [{"class_id": "beta", "label_en": "Beta", "geom_type": "MultiPolygon"}]}
+    ).get("beta")
+
+    assert layer_tools._symbol_for(polygon_class) == "fill"
+    assert layer_tools._symbol_for(polygon_class, geom_type="Point") == "marker"
+    assert layer_tools._symbol_for(polygon_class, geom_type="LineString") == "line"
+
+
+def test_a_layer_whose_geometry_qgis_cannot_spell_falls_back_to_the_class(_symbol_kinds):
+    # An untyped collection with nothing in it to sample is exactly this case, and it is
+    # the state the geometry split exists to get out of -- so the styling has to degrade
+    # rather than raise while a deployment is still in it.
+    alpha = REGISTRY.get("alpha")
+    assert layer_tools._symbol_for(alpha, geom_type="") == layer_tools._symbol_for(alpha)

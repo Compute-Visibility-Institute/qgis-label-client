@@ -38,11 +38,26 @@ check that looks like one and is not. :func:`claims` decodes the payload without
 anything, for exactly two values -- the address to put on screen and the expiry to
 schedule a refresh from -- and both of those are only ever used to be *more* careful.
 
-NO CLIENT SECRET. The client below is a Google "Desktop app" client shipped inside a
-public GPL plugin, so a secret in it would not be one. PKCE (S256) is what actually binds
-the code to this exchange, and Google documents the secret as optional for this client
-type. Sending a secret that everyone can read would suggest a protection that does not
-exist.
+THE CLIENT SECRET IS HERE, IN PUBLIC, AND THAT IS CORRECT. This paragraph used to say the
+opposite and was wrong in a way worth recording, because the reasoning still sounds right:
+the client below is a Google "Desktop app" client shipped inside a public GPL plugin, so a
+secret in it cannot be one; PKCE (S256) is what binds the code to this exchange; and
+publishing a secret would suggest a protection that does not exist. Every clause is true.
+
+Google refuses the exchange anyway -- `invalid_request: client_secret is missing` -- and
+the two facts only look contradictory until the word is split. Google requires the value
+as a client IDENTIFIER, and separately documents it as not confidential for installed
+apps. It is a field, not a defence. PKCE is additional to it, never a substitute.
+
+So what protects this deployment is not in this file. Anyone holding CLIENT_ID and
+CLIENT_SECRET can sign in AS THEMSELVES and get a token whose `aud` is this client; the
+allowlist then decides, and for a stranger it decides no. The secret guards no door. The
+allowlist is the door.
+
+The cost of believing otherwise was measured: a sign-in that reached Google, obtained
+consent, ran the loopback callback, told the analyst "Signed in" in their browser -- and
+then failed on the exchange. A suite of passing tests asserted the absence of the field
+that made it impossible.
 """
 
 from __future__ import annotations
@@ -64,6 +79,24 @@ from .errors import LabelClientError
 #: anywhere. Who may actually use the platform is decided by the server against the
 #: verified address in the token.
 CLIENT_ID = "513319405696-uenhllp36pheu0997ebb3tq6v4cjj513.apps.googleusercontent.com"
+
+#: Google's client secret for the desktop client above. EMPTY IN SOURCE, FILLED AT RELEASE.
+#:
+#: Required by Google's token endpoint and not confidential -- an installed app's secret
+#: ships in every copy of the binary, so it identifies the APP and guards nothing. What
+#: guards this deployment is the allowlist: holding both values gets a stranger a valid
+#: token and no access.
+#:
+#: It is still not committed, and GitHub's push protection is why the question got asked
+#: properly. Not because publishing it would be dangerous, but because a value in git
+#: history can only be rotated by rewriting history. `.github/workflows/release.yml`
+#: substitutes it into the published zip from an Actions secret, so an analyst installing
+#: from the plugin repository gets a working sign-in with nothing to paste, and rotating
+#: is a re-release rather than surgery on every commit that ever carried it.
+#:
+#: A SOURCE CHECKOUT therefore has no secret and cannot sign in until one is supplied via
+#: `PluginSettings.oauth_client_secret`. plugin.sign_in says so before opening a browser.
+CLIENT_SECRET = ""
 
 #: Where the browser is sent, where the code is exchanged, and where a refresh token is
 #: destroyed. Constants rather than settings: they are Google's, not a deployment's, and a
@@ -296,29 +329,76 @@ def encode_form(fields: Mapping[str, str]) -> bytes:
     return urlencode(sorted(fields.items())).encode("ascii")
 
 
-def token_request(code: str, verifier: str, redirect: str, client_id: str = CLIENT_ID) -> dict:
+def token_request(
+    code: str,
+    verifier: str,
+    redirect: str,
+    client_id: str = CLIENT_ID,
+    client_secret: str | None = None,
+) -> dict:
     """Form fields exchanging an authorization code for tokens.
 
-    NO ``client_secret``. See the module docstring: this is a desktop client shipped in a
-    public repository, the verifier is what binds the exchange, and shipping a secret
-    would imply a protection nobody has.
+    ``client_secret`` IS REQUIRED, and the reasoning that said otherwise was wrong in a
+    way only Google could settle. It went: this is a desktop client shipped in a public
+    repository, PKCE's verifier is what binds the exchange, so a secret would imply a
+    protection nobody has. Every clause of that is true. Google rejects the request
+    anyway:
+
+        invalid_request: client_secret is missing
+
+    The two facts are not in conflict once separated. Google documents an installed
+    app's secret as not confidential -- it is compiled into the binary and cannot be one
+    -- while still REQUIRING it as a client identifier on the token endpoint. Not a
+    protection, then, but a field. PKCE is additional to it, never a replacement for it.
+
+    So the secret is sent, and it is NOT hardcoded beside CLIENT_ID. It comes from
+    settings, because this repository is public and GPL: a value committed here is
+    public permanently and can only be rotated by cutting a release. The client id is
+    hardcoded because it identifies the application and is on every authorization URL
+    anyway; the secret is deployment configuration.
     """
-    return {
+    # None means "whatever this build carries", read at CALL time. A default of
+    # `= CLIENT_SECRET` binds at DEFINITION time, so the release workflow's
+    # substitution would work (it edits the file before import) while any runtime
+    # override -- a test, a settings value, a fork patching the module -- silently
+    # would not. Empty string is different from None and means "send no secret".
+    if client_secret is None:
+        client_secret = CLIENT_SECRET
+    fields = {
         "client_id": client_id,
         "code": code,
         "code_verifier": verifier,
         "grant_type": "authorization_code",
         "redirect_uri": redirect,
     }
+    # Omitted rather than sent empty when absent: an empty client_secret is a DIFFERENT
+    # error from a missing one, and the missing-field message is the one that names what
+    # to do about it.
+    if client_secret:
+        fields["client_secret"] = client_secret
+    return fields
 
 
-def refresh_request(refresh_token: str, client_id: str = CLIENT_ID) -> dict:
-    """Form fields for the silent renewal. Same client, same absence of a secret."""
-    return {
+def refresh_request(
+    refresh_token: str, client_id: str = CLIENT_ID, client_secret: str | None = None
+) -> dict:
+    """Form fields for the silent renewal. Same client, and the same secret.
+
+    The hourly refresh goes to the same token endpoint under the same client, so it
+    carries the same requirement. Omitting it here would leave sign-in working and the
+    renewal failing an hour later -- the failure hardest to attribute, because nothing
+    about it points back to this function.
+    """
+    if client_secret is None:  # late binding -- see token_request
+        client_secret = CLIENT_SECRET
+    fields = {
         "client_id": client_id,
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
     }
+    if client_secret:
+        fields["client_secret"] = client_secret
+    return fields
 
 
 def revocation_request(token: str) -> dict:

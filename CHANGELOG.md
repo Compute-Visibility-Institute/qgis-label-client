@@ -194,6 +194,22 @@ most recent entries into `metadata.txt` at release time.
 
 ### Fixed
 
+- **The QA tools examined one label layer and reported on the project.** With labels
+  served as one collection per geometry type, "the label layer" is two or three layers.
+  The coverage check took the first, found nothing wrong with the points it never read,
+  and reported a clean project — a silently partial check, which is worse than none
+  because its silence is believed. It now runs over every label layer, names each in the
+  result and unions the classes with no exhaustive extent; the history dialog looks for
+  the selection across all of them instead of telling somebody with exactly one label
+  selected to select exactly one label.
+
+- **A categorized label layer drew nothing for the classes of another geometry.** All
+  classes live in one table, so the renderer covers the whole registry on every label
+  layer — which now means fill symbols on a point layer, and QGIS draws nothing at all for
+  a category whose symbol type does not match. Categories are built for the *layer's*
+  geometry in the class's own colours; dropping them instead would be the same
+  invisibility by another route.
+
 - **The QA tools could have picked a historical layer as the layer being worked on.**
   `find_label_layer` discriminates by exposed fields, and the transaction-time view carries
   the same `label_id` and `class_id` as the live collection — so the survey-coverage check,
@@ -213,6 +229,35 @@ most recent entries into `metadata.txt` at release time.
   with the finding that the Temporal Controller cannot drive `datetime` at all.
 
 ### Changed
+
+- **A publish is routed to a collection by the layer's geometry type.** The backend
+  replaces the single untyped `label` collection with one per geometry family, because an
+  untyped collection cannot declare a geometry type to QGIS: OGC API - Features has no way
+  to say it, pygeoapi reports `geometry-any`, and QGIS therefore infers the type by
+  *sampling features*. An empty collection samples as nothing, QGIS treats the layer as
+  non-spatial, and the Edit menu offers "Add Record" instead of "Add Polygon Feature" —
+  every digitizing tool gone, on the first day of a deployment, which is when they are
+  most needed.
+
+  A QGIS vector layer has exactly one geometry type, so the plugin now chooses the
+  destination per layer. **The ids are not compiled in**: the routes are resolved against
+  what `/collections` actually lists, by geometry word, exactly as class vocabulary is
+  read from the registry. The remembered `label_collection` setting becomes a *hint about
+  which group*, matched by stem, so a value stored before the split still selects the
+  split collections with no migration and no re-prompt. A deployment still serving one
+  untyped collection keeps working unchanged, and one this cannot read falls back to
+  asking, which is what it did before.
+
+  **A layer that matches no collection is refused**, by name and by geometry type, before
+  anything is sent — a mixed or unknown-geometry layer most of all. Publishing a point
+  into the polygon collection would be rejected by `app.label_check()` feature by feature,
+  and 872 refusals read as a backend outage rather than as a layer that needed splitting.
+  The preview shows the destination per row and the summary names every collection the run
+  would write to, because it is a decision the analyst never makes and can only check.
+
+  **Class stays an attribute, not a layer.** There are three collections however many
+  classes exist; adding one remains a single row in `label_class`, with no migration, no
+  new collection and no plugin release.
 
 - **Credentials are stored one per history track** (the same token, plus the `X-Track`
   header), alongside one that names no track. `authcfg` becomes `authcfg_by_track`; an

@@ -16,6 +16,7 @@ COLUMN_CONSTANTS = (
     publishdialog.COL_LAYER,
     publishdialog.COL_FEATURES,
     publishdialog.COL_GEOMETRY,
+    publishdialog.COL_COLLECTION,
     publishdialog.COL_CRS,
     publishdialog.COL_CLASS,
     publishdialog.COL_FIELDS,
@@ -53,6 +54,7 @@ from types import SimpleNamespace  # noqa: E402
 from snapshot_fixtures import ARCHIVED_TRACK, REGISTRY, TRACK  # noqa: E402
 
 from qgis_label_client.core.publish import SourceLayer, build_plan  # noqa: E402
+from qgis_label_client.core.routing import build_routes  # noqa: E402
 
 
 class _Recorder:
@@ -69,12 +71,20 @@ class _Recorder:
         self.enabled = value
 
 
-def _stand_in(track):
-    """The three attributes PublishDialog.plan and the renderers actually read."""
+def _stand_in(track, routes=None, geometry_type="MultiPolygon"):
+    """The attributes PublishDialog.plan and the renderers actually read."""
     return SimpleNamespace(
-        _sources=[SourceLayer(layer_id="c", name="Compounds", feature_count=10)],
+        _sources=[
+            SourceLayer(
+                layer_id="c",
+                name="Compounds",
+                geometry_type=geometry_type,
+                feature_count=10,
+            )
+        ],
         _registry=REGISTRY,
         _track=track,
+        _routes=routes,
         choices=lambda: {},
         track_label=_Recorder(),
         summary_label=_Recorder(),
@@ -113,3 +123,58 @@ def test_the_banner_leads_with_the_problem_when_the_track_cannot_take_writes():
     plan = build_plan(dialog._sources, REGISTRY, None, ARCHIVED_TRACK)
     publishdialog.PublishDialog._render_track(dialog, plan)
     assert "archived" in dialog.track_label.text
+
+
+# --- where the features are bound for ---------------------------------------
+#
+# The destination follows from the layer's geometry type and from nothing the analyst
+# touches on this screen, which is exactly why it has to be ON the screen: it is a
+# decision they never make and can only check. The publish is irreversible and the server
+# assigns identity, so a route discovered afterwards is a route that cannot be corrected.
+
+
+class _Cell:
+    """A QTableWidgetItem that remembers what it was told to say."""
+
+    def __init__(self, text: str = "") -> None:
+        self.text = text
+        self.tooltip = ""
+
+    def setFlags(self, _flags) -> None:  # noqa: N802 - Qt naming
+        pass
+
+    def setToolTip(self, text: str) -> None:  # noqa: N802
+        self.tooltip = text
+
+
+def _cell_for(monkeypatch, geometry_type, routes):
+    monkeypatch.setattr(publishdialog, "QTableWidgetItem", _Cell)
+    plan = build_plan(
+        [SourceLayer(layer_id="c", name="Compounds", geometry_type=geometry_type)],
+        REGISTRY,
+        None,
+        TRACK,
+        routes,
+    )
+    return publishdialog._collection_cell(plan.layers[0])
+
+
+def test_the_table_names_the_collection_each_layer_is_bound_for(monkeypatch):
+    cell = _cell_for(monkeypatch, "MultiPolygon", build_routes(["label_polygon", "label_point"]))
+    assert cell.text == "label_polygon"
+
+
+def test_a_layer_with_nowhere_to_go_shows_a_dash_and_the_reason(monkeypatch):
+    # Not an empty cell: blank reads as "not filled in yet" on a table where several
+    # columns legitimately are, and this is a layer that cannot be published at all.
+    cell = _cell_for(monkeypatch, "Unknown (any)", build_routes(["label_polygon", "label_point"]))
+    assert cell.text == "-"
+    assert "Compounds" in cell.tooltip
+
+
+def test_the_preview_routes_against_the_collections_it_was_given():
+    # If this stops holding, the table shows one collection and the publish writes to
+    # another -- the same failure as the track, one field over.
+    routes = build_routes(["label_polygon", "label_point"])
+    plan = publishdialog.PublishDialog.plan(_stand_in(TRACK, routes, "MultiPolygon"))
+    assert plan.collections() == ("label_polygon",)

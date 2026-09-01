@@ -104,7 +104,13 @@ def _storage_crs(monkeypatch):
     monkeypatch.setattr(publish_tools, "_target_crs", lambda: FakeCrs(STORAGE))
 
 
-def _plan(layer_id: str = "compounds", *, crs_authid: str = STORAGE, crs_valid: bool = True):
+def _plan(
+    layer_id: str = "compounds",
+    *,
+    crs_authid: str = STORAGE,
+    crs_valid: bool = True,
+    collection_id: str = "",
+):
     source = SourceLayer(
         layer_id=layer_id,
         name="Compounds",
@@ -118,6 +124,7 @@ def _plan(layer_id: str = "compounds", *, crs_authid: str = STORAGE, crs_valid: 
         source=source,
         choice=LayerChoice(layer_id=layer_id, publish=True, class_id="compound"),
         label_class=COMPOUND,
+        collection_id=collection_id,
     )
 
 
@@ -333,3 +340,42 @@ def test_a_cancelled_run_stamps_only_the_layers_it_reached():
 
     assert PUBLISHED_PROPERTY in first.properties
     assert second.properties == {}
+
+
+# --- where each layer goes --------------------------------------------------
+
+
+def test_the_collection_crosses_the_thread_boundary_with_the_layer():
+    """The preview's decision, carried rather than recomputed on the worker.
+
+    Labels are stored one collection per geometry type, so the destination belongs to the
+    layer. Deciding it again on the far side of the thread boundary would be a second
+    decision that can disagree with the one the analyst confirmed -- and by the time the
+    disagreement is visible the features are on the server, under identities it assigned.
+    """
+    layer = FakeLayer("compounds", FakeCrs(STORAGE))
+    prepared = publish_tools.prepare([_plan(collection_id="label_polygon")], FakeProject([layer]))
+    assert [p.collection_id for p in prepared] == ["label_polygon"]
+
+
+def test_the_stamp_records_the_layer_own_collection_not_the_run_fallback():
+    """The warning shown before a second publish has to name where the first one went.
+
+    One run now writes to several collections. A stamp naming the run-wide fallback would
+    tell the next preview this layer went somewhere it never went -- worse than no warning,
+    because a warning that names a collection is read as fact.
+    """
+    layer = FakeLayer("compounds", FakeCrs(STORAGE))
+    publish_tools.stamp_published(
+        [_plan(collection_id="label_polygon")], _report(190), "label", FakeProject([layer])
+    )
+    record = parse_record(layer.customProperty(PUBLISHED_PROPERTY, ""))
+    assert record.collection_id == "label_polygon"
+
+
+def test_a_layer_with_no_collection_of_its_own_falls_back_to_the_run():
+    # What a deployment serving a single untyped collection resolves to: no per-layer
+    # route, one collection for the run, and the stamp says that one.
+    layer = FakeLayer("compounds", FakeCrs(STORAGE))
+    publish_tools.stamp_published([_plan()], _report(190), "label", FakeProject([layer]))
+    assert parse_record(layer.customProperty(PUBLISHED_PROPERTY, "")).collection_id == "label"
