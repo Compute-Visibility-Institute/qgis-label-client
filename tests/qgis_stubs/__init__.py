@@ -90,7 +90,12 @@ class Stub(metaclass=StubMeta):
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        pass
+        # Kept so a test can assert what a widget was CONSTRUCTED with, which is the only
+        # honest thing to assert about a stub. Checking what it returns would be checking
+        # this file; checking what it was given checks the code under test. Used by the
+        # QDateTime conversion test, where the bug was a wrong TYPE carrying a right value.
+        object.__setattr__(self, "stub_args", args)
+        object.__setattr__(self, "stub_kwargs", kwargs)
 
     def __getattr__(self, name: str) -> Stub:
         if name.startswith("__"):

@@ -188,3 +188,56 @@ def test_registering_twice_does_not_replace_a_live_registration() -> None:
     first = validtime._registered_function
     validtime.register_functions()
     assert validtime._registered_function is first
+
+
+# ── the conversion that stops the form silently showing NULL ─────────────────
+
+
+def test_the_proposal_is_converted_to_a_qdatetime() -> None:
+    """A Python datetime reaches a DateTime field as NULL, with no error anywhere.
+
+    Observed on QGIS 3.44.13. Every diagnostic said the feature worked:
+
+        field type:   DateTime (QVariant 16)
+        evaluates to: datetime.datetime(2026, 4, 21, 3, 40, 14, tzinfo=utc)
+        eval error:   (none)
+
+    and the attribute form showed NULL. sip does not map a Python datetime onto
+    QDateTime on the way out of an expression function, so createFeature gets a type it
+    cannot store and discards it rather than raising.
+
+    The assertion is about the returned TYPE, not the value, because the value was
+    already right and that is exactly what made this hard to see.
+    """
+    from qgis.PyQt.QtCore import QDateTime
+
+    from qgis_label_client.validtime import _as_qdatetime
+
+    out = _as_qdatetime(APRIL)
+    assert isinstance(out, QDateTime), (
+        "a Python datetime is silently dropped by a DateTime field; QGIS needs a QDateTime"
+    )
+
+
+def test_the_conversion_normalises_to_utc_before_taking_components() -> None:
+    """An aware datetime in another zone must not be read off in local wall-clock time.
+
+    A string round trip, or reading .hour off a non-UTC value, would put the deployment's
+    locale between the instant the sensor recorded and the instant stored -- the exact
+    class of error valid time exists to remove.
+
+    Asserted on what QDate/QTime were CONSTRUCTED with rather than on what the stub
+    returns: checking the return value would be checking the stub, not this code.
+    """
+    from datetime import timedelta, timezone as tz
+
+    from qgis_label_client.validtime import _as_qdatetime
+
+    # 05:40:14+02:00 is the same instant as 03:40:14Z. Read naively it is the wrong hour.
+    other_zone = APRIL.astimezone(tz(timedelta(hours=2)))
+    assert other_zone.hour == 5, "fixture must actually differ in wall-clock terms"
+
+    out = _as_qdatetime(other_zone)
+    qdate, qtime = out.stub_args[0], out.stub_args[1]
+    assert qdate.stub_args == (2026, 4, 21)
+    assert qtime.stub_args == (3, 40, 14), "components must come from the UTC instant"

@@ -28,7 +28,7 @@ Everything it reads was stamped onto the raster layers during the signed-URL ref
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from qgis.core import (
     Qgis,
@@ -201,6 +201,37 @@ _registered_function = None
 _FUNCTION_NAME = "cvi_valid_from"
 
 
+def _as_qdatetime(value: datetime):
+    """Convert to a QDateTime, because a Python datetime is silently discarded.
+
+    THE FAILURE THIS PREVENTS LOOKS LIKE NOTHING AT ALL. The expression evaluated
+    correctly, returned the right instant, and reported no error -- and the attribute
+    form showed NULL. Observed on QGIS 3.44.13:
+
+        field type:   DateTime (QVariant 16)
+        evaluates to: datetime.datetime(2026, 4, 21, 3, 40, 14, tzinfo=utc)
+        eval error:   (none)
+
+    sip does not map a Python datetime onto QDateTime on the way out of an expression
+    function, so QgsVectorLayerUtils::createFeature receives a type it cannot store in a
+    DateTime field and writes NULL rather than raising. Every diagnostic upstream says the
+    feature works; only the form disagrees, and it does so without a message.
+
+    Built from components in UTC rather than parsed from a string: a string round trip
+    would put the deployment's locale and the analyst's timezone between the instant the
+    sensor recorded and the instant stored, which is exactly the class of error the whole
+    valid-time design exists to remove.
+    """
+    from qgis.PyQt.QtCore import QDate, QDateTime, Qt, QTime
+
+    utc = value.astimezone(timezone.utc)
+    return QDateTime(
+        QDate(utc.year, utc.month, utc.day),
+        QTime(utc.hour, utc.minute, utc.second),
+        Qt.TimeSpec.UTC,
+    )
+
+
 def register_functions() -> None:
     """Register ``cvi_valid_from()`` so the field default can call it.
 
@@ -252,6 +283,8 @@ def _valid_from_function():  # pragma: no cover - requires a running QGIS
         the form insists rather than inventing a date.
         """
         resolution = propose()
-        return resolution.value if resolution.value is not None else None
+        if resolution.value is None:
+            return None
+        return _as_qdatetime(resolution.value)
 
     return cvi_valid_from
