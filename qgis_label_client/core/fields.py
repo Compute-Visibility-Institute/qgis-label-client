@@ -60,6 +60,16 @@ class CoreFields:
     valid_from: str = "valid_from"
     valid_to: str = "valid_to"
 
+    # --- geometry family -------------------------------------------------------
+    # Present ONLY on the collections that mix geometry types (the read-only
+    # current/as-of/history views). Its presence is how the plugin recognises a
+    # mixed collection at runtime, rather than by knowing their names -- which
+    # would put deployment vocabulary back into this repository.
+    #
+    # Point | LineString | Polygon, collapsing the Multi variants, matching
+    # label_class.geom_type families and core.routing.geometry_family().
+    geom_family: str = "geom_family"
+
     # --- provenance ------------------------------------------------------------
     capture_id: str = "capture_id"
     updated_by: str = "updated_by"

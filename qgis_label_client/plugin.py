@@ -1109,6 +1109,38 @@ class LabelClientPlugin:
                     continue
                 if self._refuse_unpinned_historical(layer, collection_id):
                     continue
+
+                # A collection that MIXES geometry types cannot be one layer. QGIS types
+                # a layer by sampling features -- OAPIF cannot declare a geometry type --
+                # so an unfiltered mixed collection becomes whatever sampled first and
+                # silently drops the rest. Reported from the field as "this loads only
+                # polygons"; with the real corpus it is 872 of 1,246 features invisible.
+                #
+                # Discard the probe and add one filtered layer per family instead. The
+                # probe is not wasted: its FIELDS are how a mixed collection is
+                # recognised, without this plugin knowing any collection's name.
+                if layer_tools.mixes_geometry(layer, self.registry):
+                    title = titles.get(collection_id, collection_id)
+                    for family in layer_tools.GEOMETRY_FAMILIES:
+                        suffix = layer_tools.FAMILY_LABELS.get(family, family.lower())
+                        try:
+                            part = layer_tools.create_layer(
+                                self.settings,
+                                collection_id,
+                                f"{title} — {suffix}",
+                                self.registry,
+                                track,
+                                geom_family=family,
+                            )
+                        except LabelClientError as exc:
+                            log_warning(f"{collection_id} [{family}]: {exc}")
+                            continue
+                        layer_tools.apply_registry(part, self.registry)
+                        project.addMapLayer(part)
+                        added += 1
+                        self._warn_on_track_mismatch(part, track)
+                    continue
+
                 layer_tools.apply_registry(layer, self.registry)
                 project.addMapLayer(layer)
                 added += 1

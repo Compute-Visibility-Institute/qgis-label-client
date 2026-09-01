@@ -676,3 +676,49 @@ def test_the_fields_an_analyst_actually_fills_in_stay_editable() -> None:
 
     for name in ("class_id", "names", "attrs", "valid_from", "valid_to", "capture_id"):
         assert name not in SERVER_ASSIGNED_FIELDS
+
+
+# ── mixed collections become one layer per geometry family ───────────────────
+
+
+def test_a_mixed_collection_is_recognised_by_its_fields_not_its_name() -> None:
+    """`geom_family` exists only on the views that mix geometry types.
+
+    Recognising them by field means a deployment that names its collections differently,
+    or adds a mixed one later, is handled without this plugin knowing anything about it.
+    A list of collection ids here would be exactly the hardcoded vocabulary the class
+    registry design exists to remove.
+    """
+    from qgis_label_client.core.fields import DEFAULT_FIELDS
+
+    assert DEFAULT_FIELDS.geom_family == "geom_family"
+
+
+def test_the_family_filter_is_quoted_as_a_qgis_expression() -> None:
+    """The provider's `filter` takes a QGIS EXPRESSION which it compiles to CQL2 itself.
+
+    Handing it literal CQL2 makes the layer INVALID rather than unfiltered, so the
+    analyst gets no layer at all -- which is why every clause goes through
+    core.expressions rather than being formatted inline.
+    """
+    from qgis_label_client.layers import _family_clause
+
+    clause = _family_clause(None, "Polygon")
+    assert clause == "\"geom_family\" = 'Polygon'"
+
+
+def test_no_family_means_no_clause() -> None:
+    """An unfiltered layer must stay unfiltered: the editable collections are already
+    typed by 016 and adding a redundant clause would be one more thing to get wrong."""
+    from qgis_label_client.layers import _family_clause
+
+    assert _family_clause(None, "") is None
+
+
+def test_all_three_families_are_offered_areas_first() -> None:
+    """Order is the order they appear in the layers panel, and areas first is deliberate:
+    it is what an analyst looks at."""
+    from qgis_label_client.layers import FAMILY_LABELS, GEOMETRY_FAMILIES
+
+    assert GEOMETRY_FAMILIES == ("Polygon", "LineString", "Point")
+    assert [FAMILY_LABELS[f] for f in GEOMETRY_FAMILIES] == ["areas", "lines", "points"]

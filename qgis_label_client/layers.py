@@ -79,7 +79,7 @@ from .core import asof, recorded, routing, styling
 from .core import tracks as track_tools
 from .core.asof import AsOfMechanism
 from .core.errors import BackendError
-from .core.expressions import all_of, identifier
+from .core.expressions import all_of, equals, identifier
 from .core.fields import DEFAULT_FIELDS
 from .core.registry import ClassRegistry, LabelClass
 from .core.tracks import TRACK_HEADER, Track
@@ -214,6 +214,7 @@ def build_layer_uri(
     registry: ClassRegistry | None,
     track: Track | None = None,
     track_filter: str | None = None,
+    geom_family: str = "",
     recorded_at: str = "",
 ) -> str:
     """Data-source URI for one collection, honouring the as-of state, track and instant.
@@ -250,9 +251,53 @@ def build_layer_uri(
         # Bracketed and ANDed rather than concatenated: cql2_filter already contains a
         # bare OR, and appending to it would rebind that OR and change which features come
         # back -- a filter that is wrong rather than absent.
-        cql_filter=all_of(cql, track_filter) or None,
+        # The geometry family joins the same AND, and it is what stops a mixed
+        # collection rendering as one shape. QGIS types a layer by SAMPLING features
+        # -- OAPIF cannot declare a geometry type -- so an unfiltered mixed
+        # collection becomes whatever sampled first and silently drops the rest. A
+        # filtered layer samples only its own family and is typed correctly.
+        cql_filter=all_of(cql, track_filter, _family_clause(registry, geom_family)) or None,
         headers=headers or None,
     )
+
+
+def _family_clause(registry: ClassRegistry | None, geom_family: str) -> str | None:
+    """``"geom_family" = 'Polygon'``, or None when no family was asked for.
+
+    Quoted through core.expressions like every other clause, because the provider's
+    ``filter`` takes a QGIS EXPRESSION which it compiles to CQL2 itself -- handing it
+    literal CQL2 makes the layer invalid rather than unfiltered, so the analyst gets no
+    layer at all.
+    """
+    if not geom_family:
+        return None
+    fields = registry.fields if registry else DEFAULT_FIELDS
+    return equals(fields.geom_family, geom_family)
+
+
+#: Families a mixed collection is split into. Order is the order they appear in the
+#: layers panel, and areas first is deliberate: it is what an analyst looks at.
+GEOMETRY_FAMILIES = ("Polygon", "LineString", "Point")
+
+#: Suffixes for the split layers, so three layers from one collection are tellable apart
+#: without opening their properties.
+FAMILY_LABELS = {"Polygon": "areas", "LineString": "lines", "Point": "points"}
+
+
+def mixes_geometry(layer: QgsVectorLayer, registry: ClassRegistry | None = None) -> bool:
+    """Does this collection hold more than one geometry family?
+
+    Answered from the layer's FIELDS, not from its name. `geom_family` exists only on the
+    views that mix -- so a deployment that names its collections differently, or adds a
+    mixed one later, is handled without this plugin knowing anything about it. Putting a
+    list of collection ids here would be exactly the hardcoded vocabulary the class
+    registry design exists to remove.
+    """
+    fields = registry.fields if registry else DEFAULT_FIELDS
+    try:
+        return layer.fields().indexOf(fields.geom_family) >= 0
+    except (AttributeError, TypeError):  # pragma: no cover - binding shape, not logic
+        return False
 
 
 def create_layer(
@@ -262,8 +307,13 @@ def create_layer(
     registry: ClassRegistry | None = None,
     track: Track | None = None,
     recorded_at: str = "",
+    geom_family: str = "",
 ) -> QgsVectorLayer:
     """Build a vector layer for one collection. Raises if the provider rejects it.
+
+    `geom_family` restricts a MIXED collection to one shape. Without it such a layer is
+    typed by whatever QGIS samples first and silently shows a subset -- with the real
+    corpus that is 872 of 1,246 features invisible, and no error anywhere.
 
     With `recorded_at` set the layer is a view of a past belief, and three things follow
     that a live layer does not get: the echo canary, :func:`mark_read_only`, and
@@ -271,7 +321,9 @@ def create_layer(
     ``setDataSource`` rebuilds the provider and recomputes the layer's read-only state from
     the new provider's capabilities.
     """
-    uri = build_layer_uri(settings, collection_id, registry, track, recorded_at=recorded_at)
+    uri = build_layer_uri(
+        settings, collection_id, registry, track, recorded_at=recorded_at, geom_family=geom_family
+    )
     layer = QgsVectorLayer(uri, display_name, OAPIF_PROVIDER)
     if not layer.isValid():
         raise BackendError(
