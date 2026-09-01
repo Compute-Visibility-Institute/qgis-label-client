@@ -833,16 +833,35 @@ def _apply_class_renderer(
     included: historical labels still reference them, and dropping their category would
     render those features invisible rather than merely uneditable.
 
-    Every category is built for the LAYER's geometry, not for the class's. The labels are
-    served as one collection per geometry type, so a point layer is offered categories for
-    the five polygon classes as well -- and a categorized renderer whose symbol type does
-    not match the layer draws nothing. Filtering those categories out instead would be the
-    same invisibility by another route, and would break the day a deployment stores a class
-    somewhere this plugin did not predict.
+    Every category is built for the LAYER's geometry, not for the class's: a categorized
+    renderer whose symbol type does not match the layer draws nothing at all.
+
+    CATEGORIES ARE FILTERED TO THE CLASSES THAT CAN ACTUALLY OCCUR HERE, plus a catch-all.
+    This function used to offer every class on every layer, on the grounds that dropping a
+    category renders its features invisible and that filtering would break the day a
+    deployment stored a class somewhere this plugin did not predict. The first half stopped
+    being true when labels moved to one collection per geometry type: the views filter on
+    the geometry stored, and app.label_check() refuses a `compound` that is not polygonal,
+    so a compound feature CANNOT reach the lines layer and its category cannot hide one.
+    What it can do is put five polygon classes in a line layer's legend, which is what an
+    analyst reads when choosing what they are about to draw.
+
+    The second half is still true, and is why the catch-all exists rather than why the
+    filter does not. An unfiltered legend was defence against unexpected data by accident;
+    the fallback category is the same defence on purpose, and it says "unexpected" out loud
+    instead of hiding the surprise among eight legitimate entries.
+
+    `Any` classes -- `unclassified` declares one -- match every layer, because a label with
+    no class yet really can be any shape.
     """
     geom_type = _layer_geometry_family(layer)
     categories = []
     for label_class in registry:
+        # No family means QGIS could not type the layer (a mixed or empty collection):
+        # show everything rather than guess, which is the old behaviour and the right
+        # one when there is nothing to filter against.
+        if geom_type and not label_class.matches_geometry(geom_type):
+            continue
         symbol = _symbol_for(label_class, historical, geom_type)
         if historical:
             _apply_superseded_colour(symbol, label_class, registry.fields)
@@ -851,6 +870,12 @@ def _apply_class_renderer(
         )
     if not categories:
         return
+    if geom_type:
+        # QGIS treats a category with an empty value as "all other values". Anything this
+        # plugin did not predict therefore still DRAWS, and draws as something a person
+        # will ask about -- which is the outcome the old unfiltered legend was reaching for.
+        catch_all = _symbol_for(registry.unclassified_or_first(), historical, geom_type)
+        categories.append(QgsRendererCategory("", catch_all, "Other class (unexpected here)", True))
     layer.setRenderer(QgsCategorizedSymbolRenderer(registry.fields.class_id, categories))
     layer.triggerRepaint()
 

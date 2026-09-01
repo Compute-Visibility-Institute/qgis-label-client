@@ -140,6 +140,35 @@ class LabelClass:
     def accepts_any_geometry(self) -> bool:
         return self.geom_type == _ANY_GEOMETRY
 
+    def matches_geometry(self, family: str) -> bool:
+        """Can a label of this class exist on a layer of `family`?
+
+        `family` is the single-part spelling routing uses -- Polygon, Point, LineString --
+        and covers the Multi variants, because ``label_class.geom_type`` and PostGIS spell
+        a family the same way and MultiPolygon is not a different KIND of thing from
+        Polygon.
+
+        An `Any` class matches everything, which is not a special case so much as the
+        point of declaring `Any`: `unclassified` exists precisely because the shape is
+        known before the meaning is, so it has to be offered wherever a shape can be drawn.
+
+        An unknown family matches too. This is asked when deciding what to put in a
+        legend, and a legend that omits a class because this plugin did not recognise a
+        geometry name is worse than one that shows an extra.
+        """
+        if not family or self.accepts_any_geometry:
+            return True
+        from . import routing
+
+        theirs = routing.geometry_family(family)
+        # Recognised as nothing is not the same as recognised as something else. A curve
+        # type, a Z/M variant this plugin has not met, a spelling from a future QGIS: all
+        # resolve to "" here, and the safe reading of "" is SHOW, because the alternative
+        # is a legend that silently omits the class an analyst came to draw.
+        if not theirs:
+            return True
+        return routing.geometry_family(self.geom_type) == theirs
+
     def attribute_names(self) -> list[str]:
         """Declared attributes, in the order the class wants them shown.
 
@@ -215,6 +244,20 @@ class ClassRegistry:
 
     def __len__(self) -> int:
         return len(self.classes)
+
+    def unclassified_or_first(self) -> LabelClass:
+        """A class to borrow a symbol from for the "all other values" bucket.
+
+        `unclassified` by preference: it is already styled to look unfinished -- drab and
+        dashed, deliberately -- which is exactly the right reading for a feature whose
+        class this layer did not expect. Any class will do if a deployment has no
+        `unclassified`, because the bucket only has to be VISIBLE; being pretty is not
+        the job.
+        """
+        for candidate in self.classes:
+            if candidate.accepts_any_geometry:
+                return candidate
+        return self.classes[0]
 
     def __iter__(self):
         return iter(self.classes)

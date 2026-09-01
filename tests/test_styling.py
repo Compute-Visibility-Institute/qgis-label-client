@@ -187,3 +187,61 @@ def test_a_historical_layer_reads_as_a_ghost_without_becoming_invisible():
     # One call on the layer rather than a per-symbol alpha: it survives any renderer and
     # cannot be undone by a class whose own style block sets an opaque fill.
     assert 0.3 < HISTORICAL_OPACITY < 0.8
+
+
+# ── classes are offered where they can occur, and nowhere else ────────────────
+
+
+def test_a_class_matches_its_own_geometry_family() -> None:
+    """MultiPolygon and Polygon are the same KIND of thing, and both spellings occur:
+    label_class.geom_type says MultiPolygon, QGIS says Polygon."""
+    from qgis_label_client.core.registry import LabelClass
+
+    compound = LabelClass(class_id="compound", geom_type="MultiPolygon", label_en="Compound")
+    assert compound.matches_geometry("Polygon")
+    assert compound.matches_geometry("MultiPolygon")
+    assert not compound.matches_geometry("LineString")
+    assert not compound.matches_geometry("Point")
+
+
+def test_an_any_class_is_offered_everywhere() -> None:
+    """`unclassified` exists because the shape is known before the meaning is, so it has
+    to be available wherever a shape can be drawn."""
+    from qgis_label_client.core.registry import LabelClass
+
+    unclassified = LabelClass(class_id="unclassified", geom_type="Any", label_en="Unclassified")
+    assert all(unclassified.matches_geometry(f) for f in ("Polygon", "Point", "LineString"))
+
+
+def test_an_unknown_family_matches_rather_than_hides() -> None:
+    """Asked when building a legend. Omitting a class because this plugin did not
+    recognise a geometry name is worse than showing one too many."""
+    from qgis_label_client.core.registry import LabelClass
+
+    powerline = LabelClass(class_id="powerline", geom_type="MultiLineString", label_en="Powerline")
+    assert powerline.matches_geometry("")
+    assert powerline.matches_geometry("CircularString")
+
+
+def test_the_catch_all_borrows_the_unclassified_style() -> None:
+    """It is already drab and dashed on purpose, which is the right reading for a feature
+    whose class this layer did not expect."""
+    from qgis_label_client.core.registry import ClassRegistry, LabelClass
+
+    reg = ClassRegistry(
+        classes=(
+            LabelClass(class_id="compound", geom_type="MultiPolygon", label_en="Compound"),
+            LabelClass(class_id="unclassified", geom_type="Any", label_en="Unclassified"),
+        )
+    )
+    assert reg.unclassified_or_first().class_id == "unclassified"
+
+
+def test_a_registry_without_unclassified_still_yields_a_symbol() -> None:
+    """The bucket only has to be VISIBLE; being pretty is not the job."""
+    from qgis_label_client.core.registry import ClassRegistry, LabelClass
+
+    reg = ClassRegistry(
+        classes=(LabelClass(class_id="compound", geom_type="MultiPolygon", label_en="Compound"),)
+    )
+    assert reg.unclassified_or_first().class_id == "compound"
