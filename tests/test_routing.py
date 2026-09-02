@@ -182,6 +182,47 @@ def test_a_stored_preference_settles_a_deployment_that_would_otherwise_be_ambigu
     assert routes.collection_for("Point") == "label_point"
 
 
+#: The READ-ONLY views, published one collection per geometry type as well -- because a
+#: collection that mixes geometry types cannot be shown by a QGIS layer at all (it is
+#: typed by whichever shape samples first and hides the rest). Nine ids in three groups,
+#: written here rather than in the plugin: this is what the code has to cope with.
+READ_ONLY_TYPED = [
+    f"{stem}_{family}"
+    for stem in ("label_current", "label_asof", "label_history")
+    for family in ("polygon", "point", "line")
+]
+
+
+def test_the_read_only_typed_collections_never_become_a_publish_destination():
+    """A WRITE MUST NOT BE ROUTED AT A VIEW THAT CANNOT ACCEPT ONE.
+
+    Typing the read-only views puts four geometry-typed groups in ``/collections`` where
+    there was one, and three of those groups take no writes. With nothing saying which
+    group holds the labels, resolving anything here would be a guess, and the guess that
+    loses sends the founding dataset at a view with no INSTEAD OF triggers behind it.
+    Refusing instead makes the plugin ask, which is a dialog rather than a data loss.
+    """
+    routes = routing.build_routes([*TYPED, *READ_ONLY_TYPED, "label_current", "label_asof"])
+    assert not routes
+    # Named, all four, because "ambiguous" alone cannot tell a deployment that grew a
+    # second dataset from one that simply published its read-only views by geometry.
+    assert routes.ambiguous == ("label", "label_asof", "label_current", "label_history")
+
+
+def test_the_remembered_label_collection_still_selects_the_writable_group():
+    """The stored preference does not have to be migrated when the read-only views split.
+
+    It is matched by STEM, so both the value somebody has from before any split
+    ("label") and the value from after the write split ("label_point") keep pointing at
+    the editable collections -- with the nine read-only ones listed alongside.
+    """
+    for preferred in ("label", "label_point"):
+        routes = routing.build_routes([*TYPED, *READ_ONLY_TYPED], preferred=preferred)
+        assert routes.collection_for("MultiPolygon") == "label_polygon"
+        assert routes.collection_for("Point") == "label_point"
+        assert routes.collection_for("MultiLineString") == "label_line"
+
+
 def test_a_collection_naming_two_families_is_not_used_for_either():
     # "label_point_polygon" says nothing about which of the two it stores, and choosing
     # between them here would be a coin toss whose result cannot be undone.

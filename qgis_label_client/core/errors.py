@@ -44,5 +44,18 @@ class BackendError(LabelClientError):
         return self.status == 429
 
 
+class MixedGeometryError(BackendError):
+    """A collection serves several geometry types at once, so no layer can show it whole.
+
+    Its own type rather than a plain :class:`BackendError` because one caller has to *act*
+    on it rather than only report it. The historical-view control remembers which
+    collection serves transaction time and asks for it only once; a remembered mixed one
+    would refuse every attempt from then on, with no control anywhere to change the
+    answer. Recognising this particular failure is what lets that id be forgotten so the
+    next attempt asks again -- and the geometry-typed collections are in the list it asks
+    with.
+    """
+
+
 class RegistryError(LabelClientError):
     """The class registry document could not be understood."""

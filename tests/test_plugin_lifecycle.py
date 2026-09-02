@@ -183,6 +183,43 @@ def test_an_ordinary_collection_is_loaded_normally(fake_iface):
     plugin.unload()
 
 
+def test_a_remembered_mixed_collection_is_forgotten_rather_than_refused_for_ever(
+    fake_iface, monkeypatch
+):
+    """The historical view asks which collection serves it ONCE, and remembers the answer.
+
+    So a remembered collection that mixes geometry types -- which every deployment has,
+    because the mixed views stay for the web viewer -- would refuse every historical view
+    from then on, with no control anywhere to change the answer. Clearing it on that one
+    failure makes the next attempt ask again, with the geometry-typed collections in the
+    list it asks with. Any other failure leaves the setting alone: a timeout is not a
+    reason to make somebody choose a collection again.
+    """
+    from qgis_label_client.core.errors import BackendError, MixedGeometryError
+
+    plugin = _plugin(fake_iface)
+    plugin.settings.set("recorded_collection", "mixes_everything")
+
+    def refuse(*_args, **_kwargs):
+        raise MixedGeometryError("mixes_everything serves points, lines and polygons")
+
+    monkeypatch.setattr(layer_tools, "create_layer", refuse)
+    plugin.open_recorded_view("2026-01-15T08:00:00Z")
+    assert plugin.settings.get("recorded_collection") == ""
+    assert any("mixes_everything" in text for _, text, _ in fake_iface.messages)
+
+    # A different failure must not cost the analyst their answer.
+    plugin.settings.set("recorded_collection", "believed")
+
+    def outage(*_args, **_kwargs):
+        raise BackendError("HTTP 503", status=503)
+
+    monkeypatch.setattr(layer_tools, "create_layer", outage)
+    plugin.open_recorded_view("2026-01-15T08:00:00Z")
+    assert plugin.settings.get("recorded_collection") == "believed"
+    plugin.unload()
+
+
 def test_a_malformed_instant_never_reaches_the_wire(fake_iface):
     """Refused before a request is made, and before a collection is even chosen.
 

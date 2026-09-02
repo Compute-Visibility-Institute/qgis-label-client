@@ -44,7 +44,7 @@ from . import publish as publish_tools
 from .core import oauth, recorded, routing
 from .core.asof import AsOfMechanism, describe
 from .core.collections import Collection
-from .core.errors import LabelClientError
+from .core.errors import LabelClientError, MixedGeometryError
 from .core.publish import PublishPlan, PublishReport
 from .core.registry import ClassRegistry
 from .core.teardown import Teardown
@@ -1065,6 +1065,15 @@ class LabelClientPlugin:
         does its own network round trip, but a layer cannot be constructed on a worker
         thread and handed to ``QgsProject``, so this is the same trade QGIS's own Browser
         panel makes.
+
+        A collection that mixes geometry types is REFUSED by
+        :func:`~.layers.create_layer` and arrives here as an ordinary error, warned about
+        and skipped like any other. It is not split into one filtered layer per geometry
+        family, and that was measured rather than assumed: the subset filter does reach
+        the provider, but QGIS types a layer BEFORE applying it, so each part came back
+        filtered to one family and typed as another and drew nothing at all. What an
+        analyst loads instead is the deployment's per-geometry collections, which are
+        typed at the database and need nothing from this method.
         """
         if self.dock is None or not collection_ids:
             return
@@ -1109,38 +1118,6 @@ class LabelClientPlugin:
                     continue
                 if self._refuse_unpinned_historical(layer, collection_id):
                     continue
-
-                # A collection that MIXES geometry types cannot be one layer. QGIS types
-                # a layer by sampling features -- OAPIF cannot declare a geometry type --
-                # so an unfiltered mixed collection becomes whatever sampled first and
-                # silently drops the rest. Reported from the field as "this loads only
-                # polygons"; with the real corpus it is 872 of 1,246 features invisible.
-                #
-                # Discard the probe and add one filtered layer per family instead. The
-                # probe is not wasted: its FIELDS are how a mixed collection is
-                # recognised, without this plugin knowing any collection's name.
-                if layer_tools.mixes_geometry(layer, self.registry):
-                    title = titles.get(collection_id, collection_id)
-                    for family in layer_tools.GEOMETRY_FAMILIES:
-                        suffix = layer_tools.FAMILY_LABELS.get(family, family.lower())
-                        try:
-                            part = layer_tools.create_layer(
-                                self.settings,
-                                collection_id,
-                                f"{title} — {suffix}",
-                                self.registry,
-                                track,
-                                geom_family=family,
-                            )
-                        except LabelClientError as exc:
-                            log_warning(f"{collection_id} [{family}]: {exc}")
-                            continue
-                        layer_tools.apply_registry(part, self.registry)
-                        project.addMapLayer(part)
-                        added += 1
-                        self._warn_on_track_mismatch(part, track)
-                    continue
-
                 layer_tools.apply_registry(layer, self.registry)
                 project.addMapLayer(layer)
                 added += 1
@@ -1280,6 +1257,14 @@ class LabelClientPlugin:
             layer = layer_tools.create_layer(
                 self.settings, collection_id, name, self.registry, track, recorded_at=moment
             )
+        except MixedGeometryError as exc:
+            # Forget the remembered id as well as reporting, or this refusal repeats for
+            # ever: the collection is asked for once and there is no other control that
+            # can change the answer. Cleared, the next attempt asks again -- and the
+            # geometry-typed collections are in the list it asks with.
+            self.settings.set("recorded_collection", "")
+            self._fail(str(exc))
+            return
         except LabelClientError as exc:
             self._fail(str(exc))
             return

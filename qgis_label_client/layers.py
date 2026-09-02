@@ -78,9 +78,9 @@ from qgis.PyQt.QtXml import QDomDocument
 from .core import asof, recorded, routing, styling
 from .core import tracks as track_tools
 from .core.asof import AsOfMechanism
-from .core.errors import BackendError
-from .core.expressions import all_of, equals, identifier
-from .core.fields import DEFAULT_FIELDS
+from .core.errors import BackendError, MixedGeometryError
+from .core.expressions import all_of, identifier
+from .core.fields import DEFAULT_FIELDS, CoreFields
 from .core.registry import ClassRegistry, LabelClass
 from .core.tracks import TRACK_HEADER, Track
 from .core.uri import build_oapif_uri
@@ -214,7 +214,6 @@ def build_layer_uri(
     registry: ClassRegistry | None,
     track: Track | None = None,
     track_filter: str | None = None,
-    geom_family: str = "",
     recorded_at: str = "",
 ) -> str:
     """Data-source URI for one collection, honouring the as-of state, track and instant.
@@ -251,53 +250,66 @@ def build_layer_uri(
         # Bracketed and ANDed rather than concatenated: cql2_filter already contains a
         # bare OR, and appending to it would rebind that OR and change which features come
         # back -- a filter that is wrong rather than absent.
-        # The geometry family joins the same AND, and it is what stops a mixed
-        # collection rendering as one shape. QGIS types a layer by SAMPLING features
-        # -- OAPIF cannot declare a geometry type -- so an unfiltered mixed
-        # collection becomes whatever sampled first and silently drops the rest. A
-        # filtered layer samples only its own family and is typed correctly.
-        cql_filter=all_of(cql, track_filter, _family_clause(registry, geom_family)) or None,
+        cql_filter=all_of(cql, track_filter) or None,
         headers=headers or None,
     )
 
 
-def _family_clause(registry: ClassRegistry | None, geom_family: str) -> str | None:
-    """``"geom_family" = 'Polygon'``, or None when no family was asked for.
-
-    Quoted through core.expressions like every other clause, because the provider's
-    ``filter`` takes a QGIS EXPRESSION which it compiles to CQL2 itself -- handing it
-    literal CQL2 makes the layer invalid rather than unfiltered, so the analyst gets no
-    layer at all.
-    """
-    if not geom_family:
-        return None
-    fields = registry.fields if registry else DEFAULT_FIELDS
-    return equals(fields.geom_family, geom_family)
-
-
-#: Families a mixed collection is split into. Order is the order they appear in the
-#: layers panel, and areas first is deliberate: it is what an analyst looks at.
-GEOMETRY_FAMILIES = ("Polygon", "LineString", "Point")
-
-#: Suffixes for the split layers, so three layers from one collection are tellable apart
-#: without opening their properties.
-FAMILY_LABELS = {"Polygon": "areas", "LineString": "lines", "Point": "points"}
-
-
 def mixes_geometry(layer: QgsVectorLayer, registry: ClassRegistry | None = None) -> bool:
-    """Does this collection hold more than one geometry family?
+    """Does this collection serve more than one geometry family in one layer?
 
-    Answered from the layer's FIELDS, not from its name. `geom_family` exists only on the
-    views that mix -- so a deployment that names its collections differently, or adds a
-    mixed one later, is handled without this plugin knowing anything about it. Putting a
-    list of collection ids here would be exactly the hardcoded vocabulary the class
-    registry design exists to remove.
+    Answered from the layer's FIELDS, not from its name. ``geom_family`` is on the mixed
+    views and only on them -- so a deployment that names its collections differently, or
+    adds a mixed one later, is handled without this plugin knowing anything about it.
+    Putting a list of collection ids here would be exactly the hardcoded vocabulary the
+    class registry design exists to remove.
+
+    The coupling that keeps this true is worth stating, because it is the one way this
+    goes wrong: a TYPED collection must not expose ``geom_family``. If one does, it is
+    refused here -- loudly, at load, with the sentence below -- rather than shown as a
+    subset, which is the safe direction to fail in but still a deployment defect to fix.
     """
     fields = registry.fields if registry else DEFAULT_FIELDS
     try:
         return layer.fields().indexOf(fields.geom_family) >= 0
     except (AttributeError, TypeError):  # pragma: no cover - binding shape, not logic
         return False
+
+
+def mixed_geometry_refusal(collection_id: str, fields: CoreFields = DEFAULT_FIELDS) -> str:
+    """Why a mixed collection is refused outright instead of loaded.
+
+    A LAYER THAT SILENTLY SHOWS A SUBSET IS THE FAILURE THIS EXISTS TO REMOVE. QGIS types
+    an OAPIF layer by SAMPLING features -- OAPIF cannot declare a collection's geometry
+    type and pygeoapi answers ``{"format": "geometry-any"}`` -- so a collection holding
+    points, lines and polygons becomes whichever shape sampled first and drops the rest
+    with no message anywhere. Measured on the real corpus: 872 of 1,246 features
+    invisible, and nobody goes looking for what they cannot see is missing.
+
+    FILTERING THE LAYER TO ONE FAMILY WAS TRIED AND MEASURED TO FAIL. Do not re-add it.
+    The subset filter DOES reach the provider -- the URI carries
+    ``filter='"geom_family" = 'Point''`` -- but QGIS types the layer BEFORE applying it,
+    so the result is a layer filtered to points and typed as polygons: it draws nothing at
+    all. Wrong in a new way rather than fixed.
+
+    What remains is a refusal. The server publishes one collection per geometry type
+    (``db/migrations/016`` did it for the editable ones), each carrying a concrete PostGIS
+    typmod, and those are what a person should load. This names the problem and points
+    there without naming any collection id: ids are a deployment's choice, discovered from
+    ``/collections`` at runtime, and a deployment that lists none of them is one that has
+    not applied the migration yet -- which is exactly what this sentence tells them.
+    """
+    return (
+        f"{collection_id!r} serves points, lines and polygons in ONE collection, and QGIS "
+        "types a layer from whichever shape it samples first -- OGC API - Features has no "
+        "way to declare a geometry type. The layer would draw that one shape and hide "
+        "every other one with no error at all, so it is refused rather than loaded "
+        "showing a subset. Load this deployment's per-geometry collections instead: one "
+        "each for points, lines and polygons, which QGIS types correctly because each "
+        "holds a single shape. If the collection list offers none, the backend has not "
+        f"published them yet -- a collection carrying a {fields.geom_family!r} column is "
+        "one of the mixed ones."
+    )
 
 
 def create_layer(
@@ -307,13 +319,13 @@ def create_layer(
     registry: ClassRegistry | None = None,
     track: Track | None = None,
     recorded_at: str = "",
-    geom_family: str = "",
 ) -> QgsVectorLayer:
     """Build a vector layer for one collection. Raises if the provider rejects it.
 
-    `geom_family` restricts a MIXED collection to one shape. Without it such a layer is
-    typed by whatever QGIS samples first and silently shows a subset -- with the real
-    corpus that is 872 of 1,246 features invisible, and no error anywhere.
+    A collection that MIXES geometry types is refused here -- see
+    :func:`mixed_geometry_refusal`. That refusal is the guard for every caller at once,
+    which is why it lives beside the construction rather than in the panel that happens to
+    have asked first.
 
     With `recorded_at` set the layer is a view of a past belief, and three things follow
     that a live layer does not get: the echo canary, :func:`mark_read_only`, and
@@ -321,9 +333,7 @@ def create_layer(
     ``setDataSource`` rebuilds the provider and recomputes the layer's read-only state from
     the new provider's capabilities.
     """
-    uri = build_layer_uri(
-        settings, collection_id, registry, track, recorded_at=recorded_at, geom_family=geom_family
-    )
+    uri = build_layer_uri(settings, collection_id, registry, track, recorded_at=recorded_at)
     layer = QgsVectorLayer(uri, display_name, OAPIF_PROVIDER)
     if not layer.isValid():
         raise BackendError(
@@ -331,6 +341,12 @@ def create_layer(
             f"{layer.error().summary() or 'The provider gave no reason.'}"
         )
     fields = registry.fields if registry else DEFAULT_FIELDS
+    if mixes_geometry(layer, registry):
+        # Before anything else the layer is used for, because everything downstream --
+        # the styling, the QA checks, the analyst's own eyes -- would be reading a layer
+        # that shows one shape and hides the rest. Discarding it costs one request; not
+        # discarding it costs 872 features nobody can see are gone.
+        raise MixedGeometryError(mixed_geometry_refusal(collection_id, fields))
     names = [field.name() for field in layer.fields()]
     if recorded_at and not recorded.exposes_recorded_axis(names, fields):
         # Refused rather than loaded unverified. The edge refuses this too, from its own

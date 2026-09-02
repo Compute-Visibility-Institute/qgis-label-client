@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 from qgis_label_client import layers as layer_tools
-from qgis_label_client.core.errors import BackendError
+from qgis_label_client.core.errors import BackendError, MixedGeometryError
 from qgis_label_client.core.registry import parse_registry
 
 REGISTRY = parse_registry({"classes": [{"class_id": "alpha", "label_en": "Alpha"}]})
@@ -678,47 +678,97 @@ def test_the_fields_an_analyst_actually_fills_in_stay_editable() -> None:
         assert name not in SERVER_ASSIGNED_FIELDS
 
 
-# ── mixed collections become one layer per geometry family ───────────────────
+# ── a collection that mixes geometry types is refused, never shown as a subset ─
+#
+# QGIS types an OAPIF layer by SAMPLING features: OGC API - Features cannot declare a
+# collection's geometry type and pygeoapi answers "geometry-any" regardless. A collection
+# holding points, lines and polygons therefore becomes whichever shape sampled first and
+# drops the rest with no error anywhere -- 872 of 1,246 features invisible on the real
+# corpus. These tests hold the line that such a layer is refused rather than loaded, and
+# that the approach measured NOT to work is not quietly re-attempted.
+
+
+MIXED_FIELDS = [*LABEL_FIELDS, "geom_family"]
+
+
+class _ProviderLayer(_FakeLayer):
+    """A layer the provider accepted -- enough of QgsVectorLayer to reach the guard."""
+
+    def isValid(self) -> bool:  # noqa: N802 - Qt naming
+        return True
 
 
 def test_a_mixed_collection_is_recognised_by_its_fields_not_its_name() -> None:
-    """`geom_family` exists only on the views that mix geometry types.
+    """`geom_family` exists on the views that mix geometry types and only on them.
 
     Recognising them by field means a deployment that names its collections differently,
-    or adds a mixed one later, is handled without this plugin knowing anything about it.
-    A list of collection ids here would be exactly the hardcoded vocabulary the class
-    registry design exists to remove.
+    or publishes a mixed one later, is handled without this plugin knowing anything about
+    it. A list of collection ids here would be exactly the hardcoded vocabulary the class
+    registry design exists to remove -- and would be wrong the first time a deployment
+    renamed a collection.
     """
     from qgis_label_client.core.fields import DEFAULT_FIELDS
 
     assert DEFAULT_FIELDS.geom_family == "geom_family"
+    assert layer_tools.mixes_geometry(_FakeLayer("mixed", MIXED_FIELDS), REGISTRY) is True
+    # The typed collections carry no such column, so they are loaded normally. If one ever
+    # did, it would be refused here -- loud rather than silent, which is the right way for
+    # this to be wrong, but still a deployment defect.
+    assert layer_tools.mixes_geometry(_FakeLayer("typed", LABEL_FIELDS), REGISTRY) is False
 
 
-def test_the_family_filter_is_quoted_as_a_qgis_expression() -> None:
-    """The provider's `filter` takes a QGIS EXPRESSION which it compiles to CQL2 itself.
+def test_a_mixed_collection_is_refused_at_load(monkeypatch) -> None:
+    """The guard, at the one place every caller goes through.
 
-    Handing it literal CQL2 makes the layer INVALID rather than unfiltered, so the
-    analyst gets no layer at all -- which is why every clause goes through
-    core.expressions rather than being formatted inline.
+    A layer that silently shows a subset is the failure this whole exercise exists to
+    remove: nobody goes looking for what they cannot see is missing. Refusing costs one
+    discarded request; loading costs most of the dataset, invisibly.
     """
-    from qgis_label_client.layers import _family_clause
+    monkeypatch.setattr(
+        layer_tools,
+        "QgsVectorLayer",
+        lambda uri, name, provider: _ProviderLayer(name, MIXED_FIELDS),
+    )
+    # Its own error type, and that is not decoration: the historical-view control asks
+    # which collection serves it once and remembers the answer, so it has to be able to
+    # tell this failure from an outage in order to forget a remembered mixed one.
+    with pytest.raises(MixedGeometryError) as err:
+        layer_tools.create_layer(_settings(), "everything_at_once", "Everything", REGISTRY, TRACK)
+    assert isinstance(err.value, BackendError)
+    # Names the collection: a panel can show several at once and a sentence that does not
+    # say which one is being refused starts an investigation rather than ending one.
+    assert "everything_at_once" in str(err.value)
 
-    clause = _family_clause(None, "Polygon")
-    assert clause == "\"geom_family\" = 'Polygon'"
+
+def test_the_refusal_says_what_to_load_instead() -> None:
+    """A refusal that only says no leaves the analyst with an empty canvas and no next step.
+
+    It must also survive a deployment that has NOT applied the migration adding the typed
+    collections: there is then nothing to load instead, and saying so is the difference
+    between an analyst who reports a backend that needs updating and one who reports the
+    plugin as broken.
+    """
+    message = layer_tools.mixed_geometry_refusal("everything_at_once")
+
+    assert "everything_at_once" in message
+    # What is wrong: one collection, several shapes, and QGIS picking one of them.
+    assert "points, lines and polygons" in message
+    # What to load instead, without naming any id -- ids come from /collections at
+    # runtime, and hardcoding the nine new ones here is what this plugin does not do.
+    assert "per-geometry collections" in message
+    assert "backend has not" in message
 
 
-def test_no_family_means_no_clause() -> None:
-    """An unfiltered layer must stay unfiltered: the editable collections are already
-    typed by 016 and adding a redundant clause would be one more thing to get wrong."""
-    from qgis_label_client.layers import _family_clause
+def test_the_geometry_family_is_never_a_layer_filter() -> None:
+    """MEASURED TO FAIL, and this is what stops it being re-attempted.
 
-    assert _family_clause(None, "") is None
+    Filtering a mixed layer to one family was tried: the clause DOES reach the provider --
+    the URI carried `filter='"geom_family" = 'Point''` -- but QGIS types a layer BEFORE
+    applying the subset filter, so the result was a layer filtered to points and typed as
+    polygons, drawing nothing at all. Wrong in a new way rather than fixed.
+    """
+    import inspect
 
-
-def test_all_three_families_are_offered_areas_first() -> None:
-    """Order is the order they appear in the layers panel, and areas first is deliberate:
-    it is what an analyst looks at."""
-    from qgis_label_client.layers import FAMILY_LABELS, GEOMETRY_FAMILIES
-
-    assert GEOMETRY_FAMILIES == ("Polygon", "LineString", "Point")
-    assert [FAMILY_LABELS[f] for f in GEOMETRY_FAMILIES] == ["areas", "lines", "points"]
+    assert "geom_family" not in layer_tools.build_layer_uri(_settings(), "label", REGISTRY, TRACK)
+    for function in (layer_tools.build_layer_uri, layer_tools.create_layer):
+        assert "geom_family" not in inspect.signature(function).parameters

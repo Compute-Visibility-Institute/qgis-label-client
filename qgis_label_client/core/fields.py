@@ -61,10 +61,15 @@ class CoreFields:
     valid_to: str = "valid_to"
 
     # --- geometry family -------------------------------------------------------
-    # Present ONLY on the collections that mix geometry types (the read-only
-    # current/as-of/history views). Its presence is how the plugin recognises a
-    # mixed collection at runtime, rather than by knowing their names -- which
-    # would put deployment vocabulary back into this repository.
+    # Present ONLY on the collections that mix geometry types, and that is what the
+    # plugin uses it for: its presence is how a mixed collection is recognised at
+    # runtime -- and REFUSED, see layers.mixed_geometry_refusal -- rather than by
+    # knowing any collection's name, which would put deployment vocabulary back into
+    # this repository.
+    #
+    # It is not filtered on. A layer restricted to one family by a subset filter is
+    # still typed by QGIS before the filter is applied, so it draws nothing; the
+    # geometry-typed collections are what a person loads instead.
     #
     # Point | LineString | Polygon, collapsing the Multi variants, matching
     # label_class.geom_type families and core.routing.geometry_family().

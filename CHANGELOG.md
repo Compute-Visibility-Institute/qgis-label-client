@@ -230,6 +230,27 @@ most recent entries into `metadata.txt` at release time.
 
 ### Changed
 
+- **A collection that mixes geometry types is refused rather than loaded.** QGIS types an
+  OGC API - Features layer by *sampling features* — the standard cannot declare a
+  collection's geometry type and pygeoapi answers `geometry-any` — so a collection holding
+  points, lines and polygons became whichever shape sampled first and hid the rest with no
+  error anywhere: 872 of 1,246 features invisible on the real corpus, and nobody goes
+  looking for what they cannot see is missing. Such a layer is now refused at load, with a
+  sentence naming the collection and pointing at the deployment's per-geometry collections
+  — which the backend publishes for the read-only views as well, each typed at the
+  database, and which QGIS therefore types correctly whether or not they hold a feature.
+
+  **Recognised by field, never by id.** A mixed collection is the one carrying
+  `geom_family`; no collection id is compiled into the plugin, exactly as no class id is.
+  A deployment that has not published the typed collections yet gets the message rather
+  than a layer that quietly shows a third of its data.
+
+  **Splitting the layer with a filter was tried and measured not to work.** The subset
+  filter does reach the provider, but QGIS types the layer *before* applying it, so each
+  part came back filtered to one family and typed as another and drew nothing at all.
+  The historical-view control forgets a remembered mixed collection when it refuses one,
+  so the next attempt asks again instead of repeating the refusal for ever.
+
 - **A publish is routed to a collection by the layer's geometry type.** The backend
   replaces the single untyped `label` collection with one per geometry family, because an
   untyped collection cannot declare a geometry type to QGIS: OGC API - Features has no way
