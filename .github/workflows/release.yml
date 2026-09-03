@@ -131,7 +131,19 @@ jobs:
         # metadata.txt, where a leading "v" would confuse the plugin manager's version
         # comparison; the tag is what exists in git and is what the release attaches to.
         run: |
+          # --allow-uncommitted-changes IS THE POINT, not a workaround. The step above
+          # rewrites CLIENT_SECRET in the checkout so the packaged ZIP carries it, and
+          # that edit must never be committed -- the repository is public. So the tree
+          # is dirty by design at exactly this moment, and qgis-plugin-ci's default
+          # refusal ("You have uncommitted changes") is protecting against a case that
+          # does not apply here.
+          #
+          # The guard that makes this safe is in the substitution step: it asserts the
+          # file still contains `CLIENT_SECRET = ""` before touching it and fails
+          # otherwise, so this flag can never smuggle an unrelated local edit into a
+          # release -- CI checks out clean and the only writer is that step.
           qgis-plugin-ci release "${{ steps.tag.outputs.version }}" \
             --release-tag "${{ steps.tag.outputs.tag }}" \
             --github-token "$GITHUB_TOKEN" \
+            --allow-uncommitted-changes \
             --create-plugin-repo
