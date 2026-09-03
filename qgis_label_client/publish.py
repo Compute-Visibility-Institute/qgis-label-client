@@ -24,6 +24,25 @@ The coordinate transform is built on the main thread too, because it needs the p
 transform context. Once built it is a value object and crosses the boundary safely. Log
 lines are the one main-thread-looking thing the worker does; ``QgsMessageLog`` is
 explicitly thread-safe and queues to the main thread itself.
+
+TWO WAYS OF SENDING, AND WHY BOTH ARE CORRECT
+
+Measured: 1,807 features at one POST each takes about fifteen minutes, and almost none of
+that is the network. The auth edge caps writes at two a second per principal, and
+1807 / 2 is 903 seconds. The round trips are not the cost; the limiter is.
+
+A backend advertising an atomic bulk create in ``/v1/capabilities`` gets chunks --
+:func:`_send_chunk` -- and the same import becomes a handful of requests. A backend
+without one gets exactly what it always got, one feature per request, which is not a
+legacy path but the correct behaviour against a deployment that has not been updated:
+:func:`_send` still buys "every refusal names its row" and "nothing is ever sent twice"
+without asking anything of the server.
+
+The two paths report into the same counters and neither is allowed to be optimistic. What
+gets credited as published is what the server SAID it created, never the length of what
+was sent, and a chunk whose fate is unknown says so rather than resolving itself in either
+direction -- because the repair for a wrong answer here is a second publish, and identity
+is server-assigned, so nothing afterwards can tell the two copies apart.
 """
 
 from __future__ import annotations
@@ -55,6 +74,8 @@ from qgis.core import (
 
 from . import client
 from . import layers as layer_tools
+from .core import bulk
+from .core.bulk import BulkCapability
 from .core.errors import BackendError, ConfigurationError
 from .core.fields import COMPLETENESS_EXHAUSTIVE, CoreFields
 from .core.legacy import FieldMapping, map_fields, name_columns, name_entries
@@ -489,6 +510,21 @@ class PublishRequest:
     #: How many times one feature is re-offered after the edge asks us to slow down.
     #: Only a 429 is retried; see :func:`_send_one`.
     max_throttle_retries: int = 6
+    #: Where to ask what this deployment can do, relative to :attr:`base_url`.
+    #:
+    #: EMPTY MEANS DO NOT ASK, and therefore one feature per request. That is the safe
+    #: default rather than an oversight: this module is reachable without the panel, and a
+    #: caller that has not opted into the bulk path gets the slower one that has always
+    #: worked, not a probe it did not ask for.
+    capabilities_path: str = ""
+    #: Features per bulk request, before the deployment's own cap is applied. Zero means
+    #: "as many as the backend allows"; see the ``publish_chunk_size`` setting for why the
+    #: panel asks for fewer than that.
+    chunk_size: int = 0
+    #: Identifies this run inside every chunk's ``X-Edit-Reason``. Minted per request
+    #: object, because the reason has to be unique per chunk *across the run* for the
+    #: recovery read in :mod:`.core.bulk` to mean anything.
+    run_id: str = field(default_factory=bulk.new_run_id)
 
     def total_features(self) -> int:
         return sum(prepared.plan.source.feature_count for prepared in self.layers)
@@ -596,28 +632,30 @@ def _send(
 ) -> None:
     """Publish one drafted feature and fold the result into the layer's outcome.
 
-    ONE FEATURE PER REQUEST, AND WHY THE BATCH PATH IS GONE
+    ONE FEATURE PER REQUEST: WHEN THIS RUNS, AND WHY IT IS NOT DEAD CODE
 
-    This used to POST a FeatureCollection and fall back to one at a time when the batch was
-    refused. Three facts, none of which held when that was written, make the fallback
-    unsafe rather than merely slow:
+    This is what a backend without the atomic bulk endpoint gets, and what a *bulkable*
+    backend's non-bulkable collections get. It is not a legacy path: it is the correct
+    behaviour against a deployment that has not been updated, and it is the behaviour every
+    property below was chosen to guarantee.
 
-    * a save is **not atomic** -- one HTTP request is one edit, and the first rejection
-      aborts the rest of a batch *after* the earlier rows are already committed;
-    * there is no ETag and no If-Match anywhere, and identity is assigned by the server,
-      so nothing on this side can ask "did that one land?";
-    * the feature service's create handler takes a single ``Feature``; a
-      ``FeatureCollection`` body was never a verified capability.
+    A ``FeatureCollection`` POSTed to ``/items`` was here once and was removed, because
+    three facts made re-sending a refused batch unsafe rather than merely slow: a save is
+    **not atomic**, so the first rejection aborts the rest *after* earlier rows are
+    committed; there is no ETag and no If-Match and identity is the server's, so nothing
+    here can ask "did that one land?"; and the create handler takes a single ``Feature``.
+    A partly-applied batch got re-sent whole, and the founding dataset gained duplicate
+    rows nothing could tell apart. The batch was also *credited* on faith -- a non-raising
+    POST counted as ``len(features)`` published with nothing verifying the server had
+    created that many.
 
-    Together those mean a refused batch that was *partly applied* is re-sent in full, and
-    the founding dataset gets duplicate rows with distinct server-assigned ``label_id``s
-    that nothing -- not the plugin, not ``v_coverage_gaps``, not the analyst -- can tell
-    apart afterwards. The batch also had to be *credited* on faith: a non-raising POST was
-    counted as ``len(features)`` published without anything verifying the server created
-    that many.
-
-    One request per feature costs round trips and buys the two properties this bootstrap
-    actually needs: every refusal names its row, and nothing is ever sent twice.
+    None of that argues against a batch that the **server** applies in one transaction,
+    which is what :func:`_send_chunk` uses when the backend offers one: all-or-nothing
+    removes partial application, and a response stating what was created removes the
+    faith. What it does argue is that this path stays, unchanged, for everything else --
+    because one request per feature buys the two properties the bootstrap actually needs,
+    and buys them without asking anything of the server: every refusal names its row, and
+    nothing is ever sent twice.
     """
     if feedback is not None and feedback.isCanceled():
         # Already stopping. Sending would be one more write the user asked not to make.
@@ -633,6 +671,266 @@ def _send(
     else:
         outcome.failed += 1
         outcome.note(f"the server refused a feature: {error}", subject)
+
+
+# ---------------------------------------------------------------------------
+# Many features per request, when the server can apply them as one transaction
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _BulkRun:
+    """The bulk endpoint this run found, and the chunk ordinal it is up to.
+
+    The ordinal counts across the WHOLE run rather than per layer, because it is half of
+    the ``reason`` that makes an ambiguous chunk recoverable: two chunks sharing a reason
+    would put the recovery read back where it started.
+    """
+
+    capability: BulkCapability
+    run_id: str
+    chunks: int = 0
+
+    def next_reason(self) -> str:
+        reason = bulk.chunk_reason(self.run_id, self.chunks)
+        self.chunks += 1
+        return reason
+
+
+@dataclass
+class _Chunk:
+    """Drafted features waiting for the one request they will travel in.
+
+    Both limits are the deployment's own, from its capability document. Chunking against
+    a locally chosen number is how a founding import discovers a 413 on its first
+    request -- and the byte limit is the one that actually binds here, because a single
+    compound boundary is far larger than a cooling unit and a fixed feature count says
+    nothing about how many bytes it is.
+    """
+
+    max_features: int
+    max_bytes: int
+    subjects: list[str] = field(default_factory=list)
+    features: list[Mapping[str, Any]] = field(default_factory=list)
+    used: int = bulk.ENVELOPE_BYTES
+
+    def __len__(self) -> int:
+        return len(self.features)
+
+    def full_for(self, size: int) -> bool:
+        """True when this chunk must be sent before a feature of `size` bytes is added.
+
+        An empty chunk is never full, however large the feature: one that exceeds the body
+        limit on its own travels alone and is refused by the server *naming that row*,
+        which is a report the operator can act on. Silently dropping it here, or growing a
+        second size rule to catch it, would produce a feature that is missing from the
+        dataset with nothing anywhere saying which one.
+        """
+        if not self.features:
+            return False
+        return len(self.features) >= self.max_features or self.used + size + 1 > self.max_bytes
+
+    def add(self, subject: str, feature: Mapping[str, Any], size: int) -> None:
+        self.subjects.append(subject)
+        self.features.append(feature)
+        # The separator is counted with the feature rather than between them: one byte
+        # over-counted on the first is a budget that binds slightly early, which is the
+        # side of the line to be wrong on.
+        self.used += size + 1
+
+    def clear(self) -> None:
+        self.subjects.clear()
+        self.features.clear()
+        self.used = bulk.ENVELOPE_BYTES
+
+
+def _discover_bulk(request: PublishRequest, feedback: QgsFeedback | None) -> _BulkRun | None:
+    """Ask the backend whether it can take a batch. **Never fails the run.**
+
+    Every outcome that is not a usable capability document degrades to one feature per
+    request: a 404 from a backend that predates the endpoint, a document this cannot read,
+    a timeout, an unreachable host. None of them is an error and none of them is worth a
+    message bar -- the fallback is correct, only slower, and a capability probe that could
+    abort a publish would make the run less reliable than it was before the optimisation
+    existed.
+
+    Support is never inferred from a bulk POST that happened not to fail, which is why
+    this asks. The endpoint lives inside the backend's ``v1/`` namespace precisely so that
+    a backend without it answers a plain 404 rather than having the request proxied to the
+    feature service, where "unknown path" and "endpoint failed" look alike.
+    """
+    if not request.capabilities_path:
+        return None
+    try:
+        document = client.fetch_capabilities(
+            request.base_url,
+            request.capabilities_path,
+            request.authcfg,
+            feedback,
+            track=request.track,
+        )
+    except Exception as exc:  # noqa: BLE001 - see the docstring: the run must survive this
+        log(f"No bulk create advertised at {request.capabilities_path!r} ({exc}).")
+        return None
+
+    capability = bulk.parse_capabilities(document)
+    if capability is None:
+        log("The backend advertises no atomic bulk create; publishing one feature per request.")
+        return None
+    log(
+        f"Publishing in batches of up to {capability.chunk_features(request.chunk_size)} "
+        f"feature(s) through the backend's atomic bulk create."
+    )
+    return _BulkRun(capability=capability, run_id=request.run_id)
+
+
+def _post_chunk(
+    request: PublishRequest,
+    collection_id: str,
+    chunk: _Chunk,
+    reason: str,
+    run: _BulkRun,
+    feedback: QgsFeedback | None,
+) -> bulk.ChunkVerdict:
+    """POST one chunk, waiting out the edge's rate limiter rather than failing on it.
+
+    The 429 retry is safe in a way that retrying anything else is not, and the reason is
+    the same one that makes this endpoint acceptable at all: the limiter refuses the
+    request *before* the transaction is opened, so a throttled chunk certainly created
+    nothing. Every retry re-uses the SAME ``reason``, so the recovery read still asks one
+    question about one chunk however many attempts it took.
+    """
+    attempts = max(1, request.max_throttle_retries + 1)
+    for attempt in range(attempts):
+        if feedback is not None and feedback.isCanceled():
+            return bulk.ChunkVerdict(state=bulk.NOT_SENT)
+        try:
+            payload = client.create_features(
+                request.base_url,
+                collection_id,
+                chunk.features,
+                request.authcfg,
+                feedback,
+                track=request.track,
+                reason=reason,
+                path=run.capability.path,
+            )
+        except BackendError as exc:
+            if feedback is not None and feedback.isCanceled():
+                # The socket was aborted because the user pressed cancel -- but the
+                # request may already have been committed on the other side, and unlike a
+                # single feature there are up to a few hundred of them. Nobody refused
+                # these and nobody can say they landed, which is exactly what UNKNOWN is
+                # for; calling it "never sent" would invite the re-run that duplicates it.
+                return bulk.ChunkVerdict(
+                    state=bulk.UNKNOWN,
+                    detail="the run was cancelled while this batch was in flight",
+                )
+            if exc.throttled:
+                if attempt == attempts - 1:
+                    # Still throttled after every attempt. Read as a refusal it would say
+                    # the server rejected these features, which it did not: it never
+                    # looked at them. Nothing was created, and nothing about the rows is
+                    # wrong -- so they are not-created, and the sentence says the limiter.
+                    return bulk.ChunkVerdict(
+                        state=bulk.NOT_CREATED,
+                        detail=(
+                            f"the auth edge was still rate-limiting after {attempts} "
+                            f"attempt(s), so this batch was never accepted: {exc}"
+                        ),
+                    )
+                delay = exc.retry_after if exc.retry_after else 2.0 * (attempt + 1)
+                log_warning(
+                    f"Rate limited by the auth edge; waiting "
+                    f"{min(delay, MAX_BACKOFF_SECONDS):.0f}s before offering the same "
+                    f"batch again (attempt {attempt + 1} of {attempts})."
+                )
+                if not _wait(delay, feedback):
+                    # Cancelled during the backoff. The 429 already established that
+                    # nothing was written, so this is a batch that never landed and that
+                    # nobody refused.
+                    return bulk.ChunkVerdict(state=bulk.NOT_SENT)
+                continue
+            return bulk.read_failure(exc.status, exc.payload, str(exc), len(chunk))
+        return bulk.read_success(payload, len(chunk))
+    return bulk.ChunkVerdict(state=bulk.NOT_SENT)  # pragma: no cover - the loop returns first
+
+
+def _send_chunk(
+    request: PublishRequest,
+    collection_id: str,
+    chunk: _Chunk,
+    outcome: LayerOutcome,
+    run: _BulkRun,
+    feedback: QgsFeedback | None,
+) -> None:
+    """Publish one chunk in a single transaction and fold the result into the outcome.
+
+    THERE IS NO PER-FEATURE RETRY HERE, AND THAT IS THE POINT
+
+    A refused chunk created nothing -- the server says so, in the response, as data -- and
+    the fix is to correct the row it names and publish again. Re-offering the chunk one
+    feature at a time is the exact loop that made duplicates, and it would also make the
+    ``created`` count meaningless: whatever this reports as published has to be what the
+    server said it created, not what this side hoped.
+
+    So each of the five verdicts maps to exactly one counter, and none of them maps to
+    "try again":
+
+    * the server created them -- credit its count, not the chunk's length;
+    * it refused, naming a row -- that row failed, the rest were not created;
+    * it refused without naming one -- none were created, and its sentence says why;
+    * it never went out -- nobody refused them and nothing landed;
+    * nothing came back that establishes either -- unverified, and the report says how to
+      find out with one read rather than by re-sending.
+    """
+    if not chunk:
+        return
+    count = len(chunk)
+    if feedback is not None and feedback.isCanceled():
+        # Already stopping. Sending would be up to a few hundred writes the user asked not
+        # to make.
+        outcome.not_sent += count
+        return
+
+    reason = run.next_reason()
+    verdict = _post_chunk(request, collection_id, chunk, reason, run, feedback)
+
+    if verdict.state == bulk.CREATED:
+        outcome.published += verdict.created
+        return
+    if verdict.state == bulk.NOT_SENT:
+        outcome.not_sent += count
+        return
+    if verdict.state == bulk.UNKNOWN:
+        outcome.unverified += count
+        outcome.note(
+            f"{count} feature(s) were sent as one batch and the answer never arrived, so "
+            "whether they were created is UNKNOWN: "
+            f"{verdict.detail}. Do NOT simply publish this layer again - the server "
+            "assigns identity, so a batch that did land cannot be recognised and would be "
+            "duplicated. The batch was recorded under the edit reason "
+            f"{reason!r}; a single query of the history collection for that exact reason "
+            "answers it"
+        )
+        return
+    if verdict.state == bulk.REFUSED and verdict.at is not None:
+        subject = chunk.subjects[verdict.at]
+        outcome.failed += 1
+        outcome.note(f"the server refused a feature: {verdict.detail}", subject)
+        if count > 1:
+            outcome.not_created += count - 1
+            outcome.note(
+                "not created: the batch this feature was in is applied as one "
+                "transaction, and another feature in it was refused. Nothing about this "
+                "row was rejected; fix the refusal above and publish again",
+                subject,
+            )
+        return
+    # NOT_CREATED, or a refusal that named no row: nothing landed, and no feature in the
+    # chunk is being blamed for it.
+    outcome.not_created += count
+    outcome.note(f"none of this batch was created: {verdict.detail}")
 
 
 def _extent_refusal(outcome: LayerOutcome, completeness: str) -> str:
@@ -660,6 +958,12 @@ def _extent_refusal(outcome: LayerOutcome, completeness: str) -> str:
         return ""
     unrecorded = outcome.failed + outcome.skipped_invalid_geometry + outcome.skipped_unshapeable
     unrecorded += outcome.not_sent
+    # A feature whose batch was refused, and one whose batch got no answer, are both
+    # "a thing on the ground that this publish cannot show in the database". The second
+    # is the sharper case: an exhaustive claim resting on features that MIGHT be there is
+    # a claim nobody can check, and it licenses the export pipeline to treat everything
+    # else inside the box as background.
+    unrecorded += outcome.not_created + outcome.unverified
     if unrecorded:
         return (
             f"no survey extent was declared: {unrecorded} feature(s) of this layer did not "
@@ -741,6 +1045,11 @@ class _Progress:
     Only whole percentage points are emitted. ``setProgress`` fires a signal that crosses
     a thread boundary, and doing that once per feature would put a thousand queued events
     in front of the main thread's event loop for no visible gain.
+
+    Counted when a feature is ACCOUNTED FOR rather than when it is read, which is the
+    difference between a bar and a decoration once features travel in batches: drafting
+    1,807 rows off a local shapefile takes about a second, so a bar driven by reads would
+    reach 100% almost immediately and then sit there for the whole publish.
     """
 
     total: int
@@ -748,14 +1057,74 @@ class _Progress:
     done: int = 0
     last_percent: int = -1
 
-    def step(self) -> None:
-        self.done += 1
+    def advance(self, count: int = 1) -> None:
+        self.done += count
         if self.feedback is None or self.total <= 0:
             return
         percent = min(100, int(100 * self.done / self.total))
         if percent != self.last_percent:
             self.last_percent = percent
             self.feedback.setProgress(float(percent))
+
+    def step(self) -> None:
+        self.advance(1)
+
+
+def _draft_feature(
+    request: PublishRequest,
+    prepared: PreparedLayer,
+    feature: QgsFeature,
+    values: Mapping[str, Any],
+    subject: str,
+    outcome: LayerOutcome,
+) -> Mapping[str, Any] | None:
+    """One feature as the GeoJSON that will be sent, or ``None`` with the reason counted.
+
+    Split out from the loop so that a feature is drafted in one place whether it is going
+    to be sent on its own or in a batch. Everything it refuses, it refuses *by name*: a
+    deduplicated count of 190 is not something anybody can act on, and after a partial run
+    into a server that assigns identity it is the only way to work out what still needs
+    sending.
+    """
+    geometry = QgsGeometry(feature.geometry())
+    if geometry.isNull() or geometry.isEmpty():
+        # A shapefile "Null shape": an attribute row with nothing on the ground.
+        # label.geom is NOT NULL and there is nothing here to invent.
+        outcome.skipped_no_geometry += 1
+        return None
+    if prepared.transform is not None:
+        try:
+            geometry.transform(prepared.transform)
+        except QgsCsException as exc:
+            outcome.skipped_unshapeable += 1
+            outcome.note(f"could not be reprojected to {STORAGE_CRS}: {exc}", subject)
+            return None
+    if not geometry.isGeosValid():
+        # The server's own trigger would reject it. Failing here names the feature
+        # rather than letting the database refuse it as an untraceable HTTP 500. In a
+        # batch it matters more: one invalid geometry would take its whole chunk with it.
+        outcome.skipped_invalid_geometry += 1
+        outcome.note("invalid geometry, rejected before sending", subject)
+        return None
+
+    result = build_draft(
+        values,
+        geometry_as_geojson(geometry),
+        prepared.plan.label_class,
+        prepared.mappings,
+        skip_damaged_names=prepared.plan.choice.skip_damaged_names,
+    )
+    for message in result.issues:
+        outcome.note(message, subject)
+    if result.draft is None:
+        outcome.skipped_unshapeable += 1
+        return None
+
+    outcome.promoted += int(result.promoted)
+    outcome.flattened += int(result.flattened)
+    outcome.damaged_names += int(bool(result.damaged_names))
+    outcome.omitted_names += int(bool(result.omitted_names))
+    return result.draft.to_geojson(request.fields)
 
 
 def _publish_layer(
@@ -764,6 +1133,7 @@ def _publish_layer(
     report: PublishReport,
     progress: _Progress,
     feedback: QgsFeedback | None,
+    run: _BulkRun | None = None,
 ) -> LayerOutcome:
     """Publish one layer's features. Returns its outcome; never raises for a bad row."""
     plan = prepared.plan
@@ -775,67 +1145,55 @@ def _publish_layer(
     if plan.label_class is None:  # pragma: no cover - prepare() filters these out
         return outcome
 
+    # Per layer, not per run. A chunk is one request to one collection, and this run may
+    # be writing to several; a chunk spanning two layers would also have to carry two sets
+    # of subjects, and the index a refusal names would stop meaning anything.
+    chunk = None
+    if run is not None and run.capability.serves(collection_id):
+        chunk = _Chunk(
+            max_features=run.capability.chunk_features(request.chunk_size),
+            max_bytes=run.capability.max_body_bytes,
+        )
+
+    def flush() -> None:
+        if not chunk:
+            return
+        pending = len(chunk)
+        _send_chunk(request, collection_id, chunk, outcome, run, feedback)
+        chunk.clear()
+        progress.advance(pending)
+
     for feature in prepared.source.getFeatures():
         if feedback is not None and feedback.isCanceled():
             report.cancelled = True
             break
         outcome.read += 1
-        progress.step()
 
-        # Named before anything can go wrong with it, so every complaint below can say
-        # WHICH row. A deduplicated count of 190 refusals is not something anybody can act
-        # on, and after a partial run into a server that assigns identity it is the only
-        # way to work out what still needs sending.
+        # Named before anything can go wrong with it, so every complaint can say WHICH
+        # row -- including a refusal that arrives later, attached to a batch, and is
+        # matched back to this feature by its index in the chunk.
         values = feature_values(feature, prepared.field_names)
         subject = _subject(values, prepared.mappings, outcome.read)
 
-        geometry = QgsGeometry(feature.geometry())
-        if geometry.isNull() or geometry.isEmpty():
-            # A shapefile "Null shape": an attribute row with nothing on the ground.
-            # label.geom is NOT NULL and there is nothing here to invent.
-            outcome.skipped_no_geometry += 1
-            continue
-        if prepared.transform is not None:
-            try:
-                geometry.transform(prepared.transform)
-            except QgsCsException as exc:
-                outcome.skipped_unshapeable += 1
-                outcome.note(f"could not be reprojected to {STORAGE_CRS}: {exc}", subject)
-                continue
-        if not geometry.isGeosValid():
-            # The server's own trigger would reject it. Failing here names the feature
-            # rather than letting the database refuse it as an untraceable HTTP 500.
-            outcome.skipped_invalid_geometry += 1
-            outcome.note("invalid geometry, rejected before sending", subject)
+        draft = _draft_feature(request, prepared, feature, values, subject, outcome)
+        if draft is None:
+            progress.step()
             continue
 
-        result = build_draft(
-            values,
-            geometry_as_geojson(geometry),
-            plan.label_class,
-            prepared.mappings,
-            skip_damaged_names=plan.choice.skip_damaged_names,
-        )
-        for message in result.issues:
-            outcome.note(message, subject)
-        if result.draft is None:
-            outcome.skipped_unshapeable += 1
+        if chunk is None:
+            _send(request, collection_id, draft, subject, outcome, feedback)
+            progress.step()
             continue
 
-        outcome.promoted += int(result.promoted)
-        outcome.flattened += int(result.flattened)
-        outcome.damaged_names += int(bool(result.damaged_names))
-        outcome.omitted_names += int(bool(result.omitted_names))
+        size = bulk.encoded_size(draft)
+        if chunk.full_for(size):
+            flush()
+        chunk.add(subject, draft, size)
 
-        _send(
-            request,
-            collection_id,
-            result.draft.to_geojson(request.fields),
-            subject,
-            outcome,
-            feedback,
-        )
-
+    # Whatever is still queued goes now, including after a cancellation: _send_chunk sees
+    # the cancelled feedback and counts them as never sent, which is what they are. Losing
+    # them silently would leave a layer whose counts do not add up to what was read.
+    flush()
     return outcome
 
 
@@ -878,12 +1236,16 @@ def publish(request: PublishRequest, feedback: QgsFeedback | None = None) -> Pub
 
     report = PublishReport(track=request.track)
     progress = _Progress(total=request.total_features(), feedback=feedback)
+    # Once, before the run, and never inferred from a write that happened not to fail.
+    # Every way of failing to get an answer here ends at the one-feature-per-request path,
+    # which is correct against a backend that has not been updated -- see _discover_bulk.
+    run = _discover_bulk(request, feedback)
     for prepared in request.layers:
         # The extent POST is inside the same guard as the features, because it has the
         # same property: by the time it runs, this layer's rows are already on the server,
         # and an exception that escapes here would discard the report of all of them.
         try:
-            outcome = _publish_layer(request, prepared, report, progress, feedback)
+            outcome = _publish_layer(request, prepared, report, progress, feedback, run)
             # _publish_layer only notices a cancellation between features, so a run stopped
             # during a layer's last request would otherwise finish reporting itself as a
             # complete one -- and would go on to declare a survey extent for a sweep that

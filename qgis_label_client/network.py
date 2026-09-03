@@ -39,6 +39,17 @@ GEOJSON_MEDIA_TYPE = "application/geo+json"
 #: The only body Google's OAuth endpoints accept.
 FORM_MEDIA_TYPE = "application/x-www-form-urlencoded"
 
+#: Header carrying why a write is being made. The edge sanitises it and binds it as
+#: ``app.reason``, which the audit trigger writes onto every history row the request
+#: produces.
+#:
+#: Set here and nowhere else, because only this plugin's own requests carry one -- QGIS's
+#: native provider makes its edits without going through this module. The *string* is
+#: built in :mod:`.core.bulk`, where the property that matters lives: an ambiguous batch
+#: is resolved by asking the history collection for that exact reason, which only works
+#: while no two chunks share one.
+EDIT_REASON_HEADER = "X-Edit-Reason"
+
 # TRACK_HEADER is imported rather than defined: it is set here on the plugin's own
 # requests, and QGIS's OAPIF provider makes its own -- which this module never sees --
 # carrying the same header from the layer URI and the credential instead (see
@@ -164,10 +175,18 @@ def _retry_after(reply: Any) -> float | None:
     return seconds if seconds >= 0 else None
 
 
-def _prepare(url: str, accept: str, authcfg: str, track: str = "") -> tuple[QNetworkRequest, Any]:
+def _prepare(
+    url: str,
+    accept: str,
+    authcfg: str,
+    track: str = "",
+    reason: str = "",
+) -> tuple[QNetworkRequest, Any]:
     request = QNetworkRequest(QUrl(url))
     request.setRawHeader(b"Accept", accept.encode("ascii"))
     request.setRawHeader(b"User-Agent", USER_AGENT.encode("ascii"))
+    if reason:
+        request.setRawHeader(EDIT_REASON_HEADER.encode("ascii"), reason.encode("utf-8"))
     if track:
         # Empty means "name no track", which the edge answers from the deployment
         # default. A blank header would not: it is a header the edge has to decide what
@@ -196,6 +215,11 @@ def _read(fetcher: Any, error: Any, url: str) -> Response:
             _describe_status(status, url, body),
             status=status,
             retry_after=_retry_after(reply),
+            # The same body twice, deliberately: once as prose for the report and once as
+            # the object it was. The bulk publish decides what to re-send from `at` and
+            # `created`, and recovering those from the truncated sentence would mean
+            # parsing English.
+            payload=_json_object(body),
         )
 
     if error != QgsBlockingNetworkRequest.ErrorCode.NoError:
@@ -235,6 +259,7 @@ def post_json(
     content_type: str = GEOJSON_MEDIA_TYPE,
     accept: str = "application/json",
     track: str = "",
+    reason: str = "",
 ) -> Any:
     """POST `payload` as JSON and parse whatever comes back. Worker thread only.
 
@@ -253,8 +278,12 @@ def post_json(
     body nobody reads would report a feature that landed as one the server refused, and
     the only repair for a refusal that did not happen is to publish it a second time.
     A non-2xx status still raises, in :func:`_read`, before any of this.
+
+    That last paragraph is why the *bulk* publish reads the returned document rather than
+    the status: an atomic batch answers with the count it created, and a caller that
+    treated a 201 as "all of them" would be crediting features on faith again.
     """
-    request, fetcher = _prepare(url, accept, authcfg, track)
+    request, fetcher = _prepare(url, accept, authcfg, track, reason)
     request.setRawHeader(b"Content-Type", content_type.encode("ascii"))
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 

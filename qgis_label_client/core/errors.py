@@ -20,11 +20,17 @@ class ConfigurationError(LabelClientError):
 class BackendError(LabelClientError):
     """The backend answered, but not usefully -- HTTP error, bad JSON, wrong shape.
 
-    Carries the HTTP status where there was one, and the ``Retry-After`` the server asked
-    for. Both exist so a caller can *decide* rather than only report: a 429 from the auth
-    edge is a request to wait, and a bootstrap that treats it as a refusal turns a
-    throttled run into a half-written system of record. Everything else keeps working off
-    ``str(exc)``, which is unchanged.
+    Carries the HTTP status where there was one, the ``Retry-After`` the server asked for,
+    and the error document it sent. All three exist so a caller can *decide* rather than
+    only report: a 429 from the auth edge is a request to wait, and a bootstrap that
+    treats it as a refusal turns a throttled run into a half-written system of record.
+    Everything else keeps working off ``str(exc)``, which is unchanged.
+
+    ``payload`` is the JSON object verbatim, when the body was one. The prose in
+    ``str(exc)`` is for a person and is truncated to fit a report; the bulk publish needs
+    two machine-readable fields out of a refusal -- *which* feature was refused, and
+    whether anything was created -- and reading those back out of the sentence would be
+    parsing English to decide what to re-send.
     """
 
     def __init__(
@@ -33,10 +39,12 @@ class BackendError(LabelClientError):
         *,
         status: int | None = None,
         retry_after: float | None = None,
+        payload: object | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.retry_after = retry_after
+        self.payload = payload
 
     @property
     def throttled(self) -> bool:

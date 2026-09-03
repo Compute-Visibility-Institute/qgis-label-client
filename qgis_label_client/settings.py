@@ -111,6 +111,13 @@ DEFAULTS: dict[str, Any] = {
     # per scene. Session start is exactly when a project's raster layers are all dead at
     # the same time.
     "signed_urls_path": "v1/imagery/signed-urls",
+    # What this deployment can do. Read once before a publish run, to find out whether the
+    # backend offers the atomic bulk create and, if it does, the two numbers needed to
+    # chunk against it. Same namespace argument as the three paths above.
+    #
+    # A backend that predates the endpoint answers 404 from inside that namespace, which
+    # is how "no bulk here" is recognised rather than guessed. See core.bulk.
+    "capabilities_path": "v1/capabilities",
     # OAPIF page size. 1000 is pygeoapi's usual maximum; larger is silently clamped.
     "page_size": 1000,
     # Fetch only features overlapping the canvas. On by default because the compound
@@ -148,10 +155,23 @@ DEFAULTS: dict[str, Any] = {
     "recorded_collection": "",
     # Warn this many minutes before the signed URLs expire.
     "expiry_warning_minutes": 30,
-    # There is deliberately no publish batch size. Publishing local layers sends one
-    # feature per request, always: a save is not atomic, there is no If-Match, and identity
-    # is server-assigned, so a batch that failed ambiguously cannot be retried without
-    # risking a duplicate in the founding dataset. See qgis_label_client.publish._send.
+    # Features per request when the backend offers the atomic bulk create. A CEILING on
+    # this side, always clamped down to whatever the deployment says it will take, and
+    # ignored entirely by the one-feature-per-request path a backend without the endpoint
+    # still gets.
+    #
+    # There was deliberately no batch size here until the server grew a bulk endpoint that
+    # inserts in ONE transaction. That is what makes a size a safe thing to have: a chunk
+    # lands whole or not at all, so nothing can be partly applied and nothing has to be
+    # re-sent to find out.
+    #
+    # 200 rather than the 500 the deployment currently allows, for two reasons that both
+    # get worse as the number grows. A refusal is all-or-nothing and takes its whole chunk
+    # with it, so the chunk size is also the cost of one bad row. And progress is reported
+    # per completed chunk, so 1,807 features at 500 is a bar that moves four times.
+    # Against fifteen minutes of one-at-a-time publishing the difference between 4 and 9
+    # requests is nothing; the difference between those two failure modes is not.
+    "publish_chunk_size": 200,
 }
 
 

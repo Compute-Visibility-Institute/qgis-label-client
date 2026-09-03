@@ -100,6 +100,28 @@ def _serialisable(feature: dict) -> dict:
     return feature
 
 
+#: What a backend serving the atomic bulk create answers at /v1/capabilities. ``label`` is
+#: on the list beside the geometry-typed ids because the fallback collection of a
+#: single-collection deployment is what most of these tests publish into.
+CAPABILITIES = {
+    "service": "cvi-auth-edge",
+    "bulk_create": {
+        "path": "v1/collections/{collectionId}/bulk",
+        "collections": ["label", "label_line", "label_point", "label_polygon"],
+        "max_features": 500,
+        "max_body_bytes": 8 << 20,
+        "atomic": True,
+    },
+}
+
+
+def _capabilities(**overrides) -> dict:
+    """The capability document with `bulk_create` amended."""
+    block = dict(CAPABILITIES["bulk_create"])
+    block.update(overrides)
+    return {**CAPABILITIES, "bulk_create": block}
+
+
 class Recorder:
     """Records what was POSTed, and refuses whatever it was told to refuse."""
 
@@ -107,6 +129,22 @@ class Recorder:
         self.sent: list[dict] = []
         self.extents: list[dict] = []
         self.attempts: list[str] = []
+        #: The capability document, or None for a backend that answers 404 -- which is
+        #: the default, so a test says nothing about bulk unless it is about bulk.
+        self.capabilities: dict | None = None
+        #: How many times the capability document was asked for. Once per run, or the
+        #: probe is costing a round trip per layer.
+        self.probes = 0
+        #: Every batch offered, as ``(collection_id, [feature, ...])``. A batch that was
+        #: refused is here too: what must never happen is the same feature appearing in
+        #: two of them.
+        self.batches: list[tuple[str, list[dict]]] = []
+        #: The X-Edit-Reason each batch travelled under. Uniqueness across the run is what
+        #: makes an ambiguous batch recoverable with one read instead of a re-publish.
+        self.reasons: list[str] = []
+        #: Set to a callable to answer a batch by hand: it takes the feature list and
+        #: either returns the response body or raises.
+        self.bulk_hook = None
         #: Which collection each accepted feature was created in, in order. A publish now
         #: fans out by geometry type, and a feature sent to the wrong collection is
         #: rejected by the server's own geometry check -- 872 times, in a report that
@@ -140,6 +178,69 @@ class Recorder:
         self.sent.append(_serialisable(feature))
         return None
 
+    # --- the atomic bulk create -------------------------------------------
+
+    def fetch_capabilities(self, base_url, capabilities_path, authcfg, feedback=None, track=""):
+        self.probes += 1
+        if self.capabilities is None:
+            raise BackendError(f"HTTP 404 from {capabilities_path}", status=404)
+        return self.capabilities
+
+    def create_features(
+        self,
+        base_url,
+        collection_id,
+        features,
+        authcfg,
+        feedback=None,
+        track="",
+        reason="",
+        path="",
+    ):
+        features = list(features)
+        self.tracks.append(track)
+        self.batches.append((collection_id, features))
+        self.reasons.append(reason)
+        names = [f.get("properties", {}).get("names", {}).get("en", "") for f in features]
+        self.attempts += names
+
+        if self._throttle:
+            key = reason or names[0]
+            seen = self._throttled.get(key, 0)
+            if self._throttle < 0 or seen < self._throttle:
+                self._throttled[key] = seen + 1
+                raise BackendError("HTTP 429 for a batch", status=429, retry_after=0.01)
+
+        if self.bulk_hook is not None:
+            return self.bulk_hook(features)
+
+        for index, name in enumerate(names):
+            if name in self._refuse:
+                # The shape the endpoint refuses in: the row it blames, the sentence the
+                # database wrote, and -- the field the whole design turns on -- how many
+                # of them were created, which for one transaction is none.
+                raise BackendError(
+                    f"HTTP 409 from {collection_id}",
+                    status=409,
+                    payload={
+                        "code": "BulkFeatureRefused",
+                        "description": (
+                            f"features[{index}] was refused, so none of the {len(features)} "
+                            f"features in this request were created: {name} is not allowed"
+                        ),
+                        "at": index,
+                        "created": 0,
+                    },
+                )
+
+        self.collections += [collection_id] * len(features)
+        self.sent += [_serialisable(feature) for feature in features]
+        return {
+            "created": len(features),
+            "collection": collection_id,
+            "features": [{"index": index, "id": 4000 + index} for index in range(len(features))],
+        }
+
     def names(self) -> list[str]:
         return [f["properties"]["names"]["en"] for f in self.sent]
 
@@ -149,6 +250,8 @@ def recorder(monkeypatch) -> Recorder:
     """Intercept the create call and make geometry handling deterministic."""
     rec = Recorder()
     monkeypatch.setattr(client, "create_feature", rec.create_feature)
+    monkeypatch.setattr(client, "create_features", rec.create_features)
+    monkeypatch.setattr(client, "fetch_capabilities", rec.fetch_capabilities)
     # The loop copies the geometry before transforming it, so the copy constructor has to
     # hand back something that still answers the four questions.
     monkeypatch.setattr(publish_tools, "QgsGeometry", lambda geometry: geometry)
@@ -217,6 +320,11 @@ def _features(count: int, **kwargs) -> list[FakeFeature]:
     return [FakeFeature({"Name_en": f"Site {n}"}, **kwargs) for n in range(count)]
 
 
+def _names(features) -> list[str]:
+    """The English names of a list of drafted GeoJSON features, in order."""
+    return [feature["properties"]["names"]["en"] for feature in features]
+
+
 MULTIPOLYGON_EXTENT = {"type": "MultiPolygon", "coordinates": [SQUARE["coordinates"]]}
 
 
@@ -248,11 +356,22 @@ def test_every_feature_is_its_own_request(recorder):
     assert report.clean
 
 
-def test_there_is_no_batch_create_at_all(recorder):
-    # The regression this guards is a duplicate in the founding dataset. A batch that
-    # fails ambiguously cannot be retried safely -- a save is not atomic, there is no
-    # If-Match, and identity is the server's -- so the only safe batch API is none.
-    assert not hasattr(client, "create_features")
+def test_a_backend_that_offers_no_bulk_endpoint_gets_one_feature_per_request(recorder):
+    """The fallback is the default, and reaching it needs no configuration.
+
+    The batch that was removed from this plugin POSTed a FeatureCollection to /items,
+    where a save is not atomic and a partly-applied refusal got re-sent whole. The batch
+    that replaced it is a different endpoint with a different property, and the way this
+    tells them apart is by ASKING. A backend that answers nothing useful is published to
+    one feature at a time, which is correct and only slower.
+    """
+    recorder.capabilities = None
+
+    report = publish_tools.publish(_request(_prepared(_features(4)), capabilities_path="v1/caps"))
+
+    assert recorder.batches == []
+    assert len(recorder.sent) == 4
+    assert report.published == 4
 
 
 def test_nothing_sent_carries_a_client_side_identity(recorder):
@@ -614,3 +733,528 @@ def test_the_report_says_which_collection_each_layer_went_to(recorder):
         )
     )
     assert "label_polygon" in report.detail_lines()[0]
+
+
+# --- many features per request, when the server applies them as one transaction --------
+#
+# The batch this plugin removed POSTed a FeatureCollection to /items, where a save is not
+# atomic: the first refusal aborted the rest AFTER earlier rows had committed, nothing on
+# this side could ask whether an ambiguous failure had landed, and re-sending was how the
+# founding dataset gained duplicates nothing could tell apart.
+#
+# The batch it now uses is a different endpoint with one property that answers all three:
+# every feature goes in inside ONE database transaction. So the tests below are not about
+# speed. Each one pins a place where the accounting could quietly go back to being a guess
+# -- crediting features the server never confirmed, blaming rows nobody refused, or
+# resolving an unanswered request in either direction -- because every one of those ends
+# in the same place: a second publish, into a dataset where identity is server-assigned.
+
+
+def _bulk_request(prepared, *more, **kwargs):
+    kwargs.setdefault("capabilities_path", "v1/caps")
+    return _request(prepared, *more, **kwargs)
+
+
+class Progressing:
+    """A feedback handle that records every progress value that crossed the boundary."""
+
+    def __init__(self) -> None:
+        self.percents: list[float] = []
+
+    def isCanceled(self) -> bool:  # noqa: N802 - Qt naming
+        return False
+
+    def setProgress(self, percent) -> None:  # noqa: N802
+        self.percents.append(percent)
+
+
+class CancellingOnDemand:
+    """A feedback handle that is cancelled by whoever sets ``cancelled``.
+
+    The in-flight case needs this rather than :class:`Cancelling`: what has to be
+    reproduced is a socket aborted *while a batch is on the wire*, which is a moment, not
+    a call count.
+    """
+
+    def __init__(self) -> None:
+        self.cancelled = False
+
+    def isCanceled(self) -> bool:  # noqa: N802
+        return self.cancelled
+
+    def setProgress(self, _percent) -> None:  # noqa: N802
+        pass
+
+
+def test_a_bulk_capable_backend_gets_batches_and_the_probe_happens_once(recorder):
+    """Fifteen minutes of one-at-a-time publishing is the limiter, not the network.
+
+    The edge caps writes at two a second per principal, so 1,807 features is 903 seconds
+    before anything else is counted. Batching is the whole of the fix, and the probe that
+    enables it must not itself become per-layer traffic.
+    """
+    recorder.capabilities = CAPABILITIES
+
+    report = publish_tools.publish(
+        _bulk_request(
+            _prepared(_features(6), name="Compounds"),
+            _prepared(_features(4), name="More"),
+            chunk_size=5,
+        )
+    )
+
+    assert recorder.probes == 1
+    assert [len(features) for _collection, features in recorder.batches] == [5, 1, 4]
+    assert report.published == 10
+    assert report.clean
+
+
+def test_no_feature_is_ever_offered_twice_across_the_batches(recorder):
+    # The duplicate-making move, restated for batches. A feature belongs to exactly one
+    # chunk, and a chunk is offered until it is answered -- never split, never re-formed.
+    recorder.capabilities = CAPABILITIES
+
+    publish_tools.publish(_bulk_request(_prepared(_features(23)), chunk_size=7))
+
+    offered = [name for _collection, features in recorder.batches for name in _names(features)]
+    assert sorted(offered) == sorted(f"Site {n}" for n in range(23))
+    assert len(offered) == len(set(offered))
+
+
+def test_what_is_credited_as_published_is_what_the_server_said_it_created(recorder):
+    """The faith the old batch path was credited on, removed.
+
+    It counted ``len(features)`` published on any non-raising POST, with nothing verifying
+    the server had created that many. A response that says 3 when 5 were sent is not a
+    partial success to be reconciled -- one transaction cannot do that -- it is a backend
+    this client cannot account for, and saying so is the only honest answer.
+    """
+    recorder.capabilities = CAPABILITIES
+    recorder.bulk_hook = lambda features: {"created": 3, "features": [{"index": 0}] * 3}
+
+    report = publish_tools.publish(_bulk_request(_prepared(_features(5)), chunk_size=5))
+
+    assert report.published == 0
+    assert report.unverified == 5
+    assert report.clean is False
+
+
+def test_a_batch_the_server_accepted_without_saying_what_it_created_is_not_credited(recorder):
+    # A 201 with a body this cannot read says the request was accepted and nothing about
+    # how many rows exist because of it.
+    recorder.capabilities = CAPABILITIES
+    recorder.bulk_hook = lambda features: None
+
+    report = publish_tools.publish(_bulk_request(_prepared(_features(4)), chunk_size=4))
+
+    assert report.published == 0
+    assert report.unverified == 4
+
+
+def test_a_refused_batch_names_the_row_and_blames_nobody_else(recorder):
+    """Every refusal still names its row, which is what makes a failed import fixable.
+
+    And the other 499 in a 500-feature chunk are NOT refusals. Counting them as rejected
+    would send somebody looking for 499 bad rows that do not exist; counting them as
+    published would be a lie in the other direction. They were not created, which is a
+    third thing and has its own count.
+    """
+    recorder.capabilities = CAPABILITIES
+    recorder._refuse = ("Site 3",)
+
+    report = publish_tools.publish(_bulk_request(_prepared(_features(10)), chunk_size=5))
+
+    outcome = report.outcomes[0]
+    assert outcome.failed == 1
+    assert outcome.not_created == 4
+    assert outcome.published == 5  # the second chunk was untouched by the first's refusal
+    refusal = next(issue for message, issue in outcome.issues.items() if "refused a feature" in message)
+    assert any("Site 3" in subject for subject in refusal.subjects)
+    assert "is not allowed" in next(
+        message for message in outcome.issues if "refused a feature" in message
+    )
+
+
+def test_a_refusal_on_the_first_row_of_a_batch_names_the_first_row(recorder):
+    # The off-by-one a one-based ordinal would produce is the one that makes a
+    # 1,807-feature report unfixable: every named row is the row before the bad one.
+    recorder.capabilities = CAPABILITIES
+    recorder._refuse = ("Site 0",)
+
+    report = publish_tools.publish(_bulk_request(_prepared(_features(4)), chunk_size=4))
+
+    refusal = next(
+        issue for message, issue in report.outcomes[0].issues.items() if "refused a feature" in message
+    )
+    assert any("Site 0" in subject for subject in refusal.subjects)
+
+
+def test_a_refusal_that_names_no_row_blames_none_of_them(recorder):
+    # A request the endpoint refused whole -- too many features, a collection-level crs.
+    # No feature is at fault, so none is named, and the server's sentence is the report.
+    recorder.capabilities = CAPABILITIES
+
+    def refuse_whole(features):
+        raise BackendError(
+            "HTTP 413",
+            status=413,
+            payload={"code": "BulkTooManyFeatures", "at": None, "created": 0},
+        )
+
+    recorder.bulk_hook = refuse_whole
+    report = publish_tools.publish(_bulk_request(_prepared(_features(4)), chunk_size=4))
+
+    outcome = report.outcomes[0]
+    assert outcome.failed == 0
+    assert outcome.not_created == 4
+    assert any("none of this batch was created" in message for message in outcome.issues)
+
+
+def test_a_refused_batch_is_never_re_offered_one_feature_at_a_time(recorder):
+    """The loop that made duplicates, and the reason it is not needed any more.
+
+    Under one transaction a refusal created nothing, so re-sending would not duplicate --
+    but re-sending 500 features as 500 requests to find the one bad row is how the count
+    stops meaning anything, and it is the exact shape the removal docstring warns about.
+    The server named the row. The fix is that row.
+    """
+    recorder.capabilities = CAPABILITIES
+    recorder._refuse = ("Site 2",)
+
+    publish_tools.publish(_bulk_request(_prepared(_features(5)), chunk_size=5))
+
+    assert recorder.sent == []
+    assert len(recorder.batches) == 1
+
+
+def test_a_throttled_batch_is_waited_out_and_re_offered_under_the_same_reason(recorder):
+    """A 429 is refused before the transaction opens, so nothing was written.
+
+    That is what makes re-offering a batch safe when re-offering it after anything else is
+    not. The reason must not change between attempts: it names the chunk, and a chunk that
+    acquired three reasons is a chunk no recovery read can ask about.
+    """
+    recorder.capabilities = CAPABILITIES
+    recorder._throttle = 2
+
+    report = publish_tools.publish(_bulk_request(_prepared(_features(4)), chunk_size=4))
+
+    assert report.published == 4
+    assert len(recorder.batches) == 3
+    assert len(set(recorder.reasons)) == 1
+
+
+def test_a_throttle_that_never_lifts_is_not_reported_as_a_refusal(recorder):
+    # The 429 established that nothing was created, and the edge never looked at these
+    # rows. Reporting them as rejected would send somebody hunting for what is wrong with
+    # three features that are fine.
+    recorder.capabilities = CAPABILITIES
+    recorder._throttle = -1
+
+    report = publish_tools.publish(
+        _bulk_request(_prepared(_features(3)), chunk_size=3, max_throttle_retries=2)
+    )
+
+    assert report.published == 0
+    assert report.failed == 0
+    assert report.unverified == 0
+    assert report.outcomes[0].not_created == 3
+    assert any("still rate-limiting" in message for message in report.outcomes[0].issues)
+    assert len(recorder.batches) == 3  # the first offer plus two retries
+
+
+def test_every_batch_travels_under_its_own_reason_across_the_whole_run(recorder):
+    """The one thing that makes an ambiguous batch recoverable without re-sending it.
+
+    The edge binds it as ``app.reason`` and the audit trigger writes it onto every history
+    row of the batch, so "did chunk 3 land?" is one read for an exact string. Two chunks
+    sharing a reason -- per-layer numbering, say -- puts that question back where it was.
+    """
+    recorder.capabilities = CAPABILITIES
+
+    publish_tools.publish(
+        _bulk_request(
+            _prepared(_features(4), name="Compounds"),
+            _prepared(_features(4), name="More"),
+            chunk_size=2,
+        )
+    )
+
+    assert len(recorder.reasons) == 4
+    assert len(set(recorder.reasons)) == 4
+    assert all(reason for reason in recorder.reasons)
+
+
+def test_a_batch_with_no_answer_is_neither_published_nor_written_off(recorder):
+    """The one count that must never resolve itself.
+
+    Atomicity removes a partly-applied batch. It does not remove an unanswered request:
+    the rows may be there. Calling them published hides missing features; calling them
+    not-sent invites the re-publish that duplicates them permanently. So the report says
+    UNKNOWN, says not to re-run, and carries the reason string that answers it with one
+    read.
+    """
+    recorder.capabilities = CAPABILITIES
+
+    def die(features):
+        raise BackendError("Request to https://api.example.org failed: connection closed")
+
+    recorder.bulk_hook = die
+    report = publish_tools.publish(_bulk_request(_prepared(_features(6)), chunk_size=6))
+
+    outcome = report.outcomes[0]
+    assert outcome.published == 0 and outcome.failed == 0 and outcome.not_sent == 0
+    assert outcome.unverified == 6
+    note = next(message for message in outcome.issues if "UNKNOWN" in message)
+    assert "Do NOT simply publish this layer again" in note
+    assert recorder.reasons[0] in note
+    assert "re-running" in report.summary()
+
+
+def test_a_credential_the_edge_would_not_accept_never_reached_the_transaction(recorder):
+    # A 401 or 403 is answered before any database work, by the edge or by an
+    # intermediary. Reporting those as unverified would make an expired token look like
+    # data that might be on the server.
+    recorder.capabilities = CAPABILITIES
+
+    def refuse(features):
+        raise BackendError("HTTP 401 from the edge", status=401)
+
+    recorder.bulk_hook = refuse
+    report = publish_tools.publish(_bulk_request(_prepared(_features(5)), chunk_size=5))
+
+    assert report.outcomes[0].not_created == 5
+    assert report.unverified == 0
+
+
+def test_a_batch_never_put_on_the_wire_is_reported_as_never_sent(recorder):
+    # Cancelled between drafting and the POST: nobody refused these and nothing landed.
+    recorder.capabilities = CAPABILITIES
+
+    report = publish_tools.publish(
+        _bulk_request(_prepared(_features(10)), chunk_size=5), Cancelling(after=3)
+    )
+
+    assert report.cancelled
+    assert recorder.batches == []
+    assert report.outcomes[0].not_sent == report.outcomes[0].read
+    assert report.failed == 0
+
+
+def test_cancelling_while_a_batch_is_in_flight_leaves_it_unverified_not_unsent(recorder):
+    """A whole chunk is a much bigger thing to be wrong about than one feature.
+
+    The socket is aborted, and the transaction on the other side may already have
+    committed. "Never sent" would be a claim, and the repair for the wrong claim is a
+    re-publish of several hundred rows.
+    """
+    recorder.capabilities = CAPABILITIES
+    feedback = CancellingOnDemand()
+
+    def abort(features):
+        feedback.cancelled = True
+        raise BackendError("Request failed: operation canceled")
+
+    recorder.bulk_hook = abort
+    report = publish_tools.publish(_bulk_request(_prepared(_features(4)), chunk_size=4), feedback)
+
+    outcome = report.outcomes[0]
+    assert outcome.unverified == 4
+    assert outcome.not_sent == 0
+    assert "cancelled while this batch was in flight" in next(
+        message for message in outcome.issues if "UNKNOWN" in message
+    )
+
+
+def test_the_progress_bar_moves_per_batch_rather_than_racing_the_reads(recorder):
+    """A bar that reaches 100% and then waits is a decoration.
+
+    Drafting 1,807 rows off a local shapefile takes about a second; the publish takes
+    considerably longer. Progress therefore counts features that have been ACCOUNTED FOR,
+    which is what makes the bar mean something on the slow half of the run.
+    """
+    recorder.capabilities = CAPABILITIES
+    feedback = Progressing()
+
+    publish_tools.publish(_bulk_request(_prepared(_features(10)), chunk_size=5), feedback)
+
+    assert feedback.percents == [50.0, 100.0]
+
+
+def test_a_skipped_feature_still_advances_the_bar(recorder):
+    # Otherwise a layer with unpublishable rows never reaches 100% and the run looks hung.
+    recorder.capabilities = CAPABILITIES
+    feedback = Progressing()
+    features = [*_features(3), FakeFeature({"Name_en": "Empty"}, FakeGeometry(None))]
+
+    publish_tools.publish(_bulk_request(_prepared(features), chunk_size=4), feedback)
+
+    assert feedback.percents[-1] == 100.0
+
+
+def test_a_layer_whose_collection_is_not_bulkable_falls_back_within_the_same_run(recorder):
+    """Per collection, not per run. A survey extent is one row; bulk buys it nothing.
+
+    The capability document lists which collections the endpoint serves, and a layer
+    routed elsewhere takes the path that works there. Both in one publish, because a run
+    now fans out across collections by geometry.
+    """
+    recorder.capabilities = _capabilities(collections=["label_point"])
+
+    report = publish_tools.publish(
+        _bulk_request(
+            _prepared(_features(3), name="Units", collection_id="label_point"),
+            _prepared(_features(2), name="Compounds", collection_id="label_polygon"),
+            collection_id="",
+            chunk_size=3,
+        )
+    )
+
+    assert [collection for collection, _features in recorder.batches] == ["label_point"]
+    assert recorder.collections[-2:] == ["label_polygon", "label_polygon"]
+    assert report.published == 5
+
+
+def test_a_backend_that_does_not_promise_atomicity_is_published_to_one_at_a_time(recorder):
+    """The transaction IS the argument, so an endpoint without it is not used.
+
+    Everything that makes a batch safe here follows from all-or-nothing. A bulk endpoint
+    that applies what it can is the design that put duplicate rows in the founding
+    dataset, and being offered one is not a reason to use it.
+    """
+    recorder.capabilities = _capabilities(atomic=False)
+
+    report = publish_tools.publish(_bulk_request(_prepared(_features(4)), chunk_size=4))
+
+    assert recorder.batches == []
+    assert report.published == 4
+
+
+def test_a_capability_probe_that_fails_does_not_fail_the_publish(recorder):
+    # A probe that can abort the run makes the run less reliable than it was before the
+    # optimisation existed.
+    def explode(*args, **kwargs):
+        raise RuntimeError("wrapped C/C++ object has been deleted")
+
+    recorder.fetch_capabilities = explode
+
+    report = publish_tools.publish(_bulk_request(_prepared(_features(3))))
+
+    assert report.published == 3
+    assert report.error == ""
+
+
+def test_the_servers_own_cap_wins_over_the_plugins_preference(recorder):
+    # Chunking against a locally chosen number is how a founding import discovers a 413
+    # on its first request.
+    recorder.capabilities = _capabilities(max_features=2)
+
+    publish_tools.publish(_bulk_request(_prepared(_features(5)), chunk_size=500))
+
+    assert [len(features) for _collection, features in recorder.batches] == [2, 2, 1]
+
+
+def test_a_batch_is_closed_by_bytes_as_well_as_by_features(recorder):
+    """The two caps bind at different ends, and either firing first is fine.
+
+    A compound boundary is orders of magnitude larger than a cooling unit, so a feature
+    count says nothing about how many bytes a chunk is. The server answers an oversized
+    body with a 413 naming neither the layer nor the fix, which is not a thing to discover
+    on the first request of a founding import.
+    """
+    recorder.capabilities = _capabilities(max_body_bytes=4096, max_features=500)
+
+    publish_tools.publish(_bulk_request(_prepared(_features(40)), chunk_size=500))
+
+    assert len(recorder.batches) > 1
+    for _collection, features in recorder.batches:
+        assert publish_tools.bulk.encoded_size(publish_tools.bulk.feature_collection(features)) <= 4096
+
+
+def test_a_feature_too_large_for_any_batch_travels_alone_and_is_named(recorder):
+    """Refused BY NAME rather than dropped, and refused by the server rather than here.
+
+    Silently leaving it out would produce a feature missing from the founding dataset with
+    nothing anywhere saying which one. Sent alone, the server's refusal names the row, and
+    the operator has something to act on.
+    """
+    recorder.capabilities = _capabilities(max_body_bytes=4096, max_features=500)
+    huge = FakeFeature({"Name_en": "Site " + "x" * 5000})
+    features = [*_features(2), huge]
+
+    report = publish_tools.publish(_bulk_request(_prepared(features), chunk_size=500))
+
+    lonely = [batch for batch in recorder.batches if len(batch[1]) == 1]
+    assert len(lonely) == 1
+    assert _names(lonely[0][1])[0].startswith("Site xxx")
+    assert report.published == 3
+
+
+def test_the_counts_of_a_batched_run_add_up_to_what_was_read(recorder):
+    """Every feature read is in exactly one bucket, whatever happened to it.
+
+    The report is the only record of a partial run, and a count that does not reconcile is
+    how "what still needs sending" becomes unanswerable.
+    """
+    recorder.capabilities = CAPABILITIES
+    recorder._refuse = ("Site 1",)
+    features = [*_features(7), FakeFeature({"Name_en": "Empty"}, FakeGeometry(None))]
+
+    report = publish_tools.publish(_bulk_request(_prepared(features), chunk_size=4))
+
+    outcome = report.outcomes[0]
+    accounted = (
+        outcome.published
+        + outcome.failed
+        + outcome.not_created
+        + outcome.unverified
+        + outcome.not_sent
+        + outcome.skipped
+    )
+    assert accounted == outcome.read == 8
+
+
+def test_an_exhaustive_sweep_is_refused_when_a_batch_did_not_reach_the_database(recorder):
+    """An extent claims everything of this class inside the polygon is labeled.
+
+    A feature whose batch was refused is a thing on the ground that is not in the
+    database, exactly like a feature refused on its own -- and one whose batch went
+    unanswered is worse, because the claim would rest on rows nobody can confirm.
+    """
+    recorder.capabilities = CAPABILITIES
+    recorder._refuse = ("Site 5",)
+    prepared = _prepared(
+        _features(8), completeness=COMPLETENESS_EXHAUSTIVE, extent=MULTIPOLYGON_EXTENT
+    )
+
+    report = publish_tools.publish(
+        _bulk_request(prepared, extent_collection="extent", chunk_size=4)
+    )
+
+    assert recorder.extents == []
+    assert "not exhaustive" in report.outcomes[0].extent_problem
+
+
+def test_the_survey_extent_is_still_one_ordinary_create(recorder):
+    # One row per layer per publish. Routing it through a batch endpoint would buy
+    # nothing and would put the claim that matters most behind a code path that exists
+    # for volume.
+    recorder.capabilities = CAPABILITIES
+    prepared = _prepared(
+        _features(4), completeness=COMPLETENESS_PARTIAL, extent=MULTIPOLYGON_EXTENT
+    )
+
+    publish_tools.publish(_bulk_request(prepared, extent_collection="extent", chunk_size=4))
+
+    assert len(recorder.extents) == 1
+    assert all(collection != "extent" for collection, _features in recorder.batches)
+
+
+def test_every_batch_names_the_track_it_is_for(recorder):
+    # A batch landing in the wrong dataset is several hundred rows nothing can find
+    # again, because identity is server-assigned.
+    recorder.capabilities = CAPABILITIES
+
+    publish_tools.publish(_bulk_request(_prepared(_features(9)), chunk_size=4))
+
+    assert set(recorder.tracks) == {TRACK.name}

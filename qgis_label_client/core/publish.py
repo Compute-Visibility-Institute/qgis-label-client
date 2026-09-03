@@ -936,10 +936,27 @@ class LayerOutcome:
     skipped_no_geometry: int = 0
     skipped_invalid_geometry: int = 0
     skipped_unshapeable: int = 0
-    #: Drafted but never sent, because the run was cancelled between drafting and the
-    #: POST. Distinct from :attr:`failed`: nobody refused these, so calling them failures
-    #: would report a deliberate stop as a server problem.
+    #: Drafted, and certainly not on the server, with nobody having refused them: the run
+    #: was cancelled before they went out, or the batch carrying them was throttled and
+    #: the run stopped rather than waiting again. Distinct from :attr:`failed`, because
+    #: calling a deliberate stop a refusal reports it as a server problem.
     not_sent: int = 0
+    #: Sent, and certainly not created, without any of them being the reason. A batch is
+    #: one transaction: one refused feature takes its whole chunk down with it, and the
+    #: other rows in that chunk were not rejected on their own merits.
+    #:
+    #: Its own counter rather than folded into :attr:`failed` because "499 rejected by the
+    #: server" would send somebody looking for 499 bad rows that do not exist.
+    not_created: int = 0
+    #: Sent, and whether they landed cannot be established from what came back -- an
+    #: aborted socket, a timeout, a response this client could not read.
+    #:
+    #: The one count that must never be quietly resolved in either direction. Calling
+    #: these published hides missing features; calling them not-sent invites a re-publish,
+    #: which duplicates them permanently because identity is server-assigned. Each one
+    #: carries the chunk's ``reason`` string, which is what answers the question with a
+    #: single read against the history collection.
+    unverified: int = 0
     promoted: int = 0
     #: Features whose third ordinate was dropped to fit the two-dimensional geom column.
     flattened: int = 0
@@ -982,6 +999,10 @@ class LayerOutcome:
             bits.append(f"{self.failed} rejected by the server")
         if self.skipped:
             bits.append(f"{self.skipped} skipped")
+        if self.not_created:
+            bits.append(f"{self.not_created} not created (in a batch that was refused)")
+        if self.unverified:
+            bits.append(f"{self.unverified} sent with no answer - see below BEFORE re-running")
         if self.not_sent:
             bits.append(f"{self.not_sent} never sent (cancelled)")
         if self.never_reached:
@@ -1051,12 +1072,27 @@ class PublishReport:
         return sum(outcome.skipped for outcome in self.outcomes)
 
     @property
+    def not_created(self) -> int:
+        return sum(outcome.not_created for outcome in self.outcomes)
+
+    @property
+    def unverified(self) -> int:
+        return sum(outcome.unverified for outcome in self.outcomes)
+
+    @property
     def damaged_names(self) -> int:
         return sum(outcome.damaged_names for outcome in self.outcomes)
 
     @property
     def clean(self) -> bool:
-        return not self.failed and not self.skipped and not self.cancelled and not self.error
+        return (
+            not self.failed
+            and not self.skipped
+            and not self.not_created
+            and not self.unverified
+            and not self.cancelled
+            and not self.error
+        )
 
     @property
     def _where(self) -> str:
@@ -1086,8 +1122,19 @@ class PublishReport:
         bits = [f"{self.published} feature(s) published{self._where}"]
         if self.failed:
             bits.append(f"{self.failed} rejected by the server")
+        if self.not_created:
+            bits.append(f"{self.not_created} not created because their batch was refused")
         if self.skipped:
             bits.append(f"{self.skipped} skipped before sending")
+        if self.unverified:
+            # Last, and phrased as an instruction rather than a count, because it is the
+            # only line here that changes what the reader should do next. Re-running to be
+            # safe is exactly the wrong move: identity is server-assigned, so a chunk that
+            # did land cannot be recognised and would simply be duplicated.
+            bits.append(
+                f"{self.unverified} sent with no answer - check the details before "
+                "re-running, because re-sending one that landed duplicates it"
+            )
         return ", ".join(bits) + "."
 
     def detail_lines(self) -> list[str]:

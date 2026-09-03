@@ -1718,6 +1718,12 @@ class LabelClientPlugin:
             extent_collection=extent_collection,
             fields=self.registry.fields,
             track=track.name,
+            # Asked once on the worker, before the first write. A deployment offering the
+            # atomic bulk create turns this from fifteen minutes into a handful of
+            # requests; one that does not answers 404 and the run proceeds one feature at
+            # a time, with nothing said to the analyst about a backend they cannot update.
+            capabilities_path=self.settings.get("capabilities_path"),
+            chunk_size=self.settings.get("publish_chunk_size"),
         )
 
         self.publishing = True

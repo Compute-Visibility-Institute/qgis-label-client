@@ -12,10 +12,15 @@ Only two of these are not standard OGC API - Features:
   each class" is not a features question;
 * the history-track list, likewise: "which isolated datasets does this deployment hold?"
   is not one either;
-* signed imagery URLs, likewise.
+* signed imagery URLs, likewise;
+* the capability document, and the atomic bulk create it advertises. OGC API - Features
+  Part 4 creates one resource per request and says nothing about creating many in one
+  transaction, which is precisely the property that makes a batch safe here.
 
-The three custom endpoints are configurable paths rather than constants, so a deployment
-can mount them wherever it likes.
+The custom endpoints are configurable paths rather than constants, so a deployment can
+mount them wherever it likes -- the bulk path being the one the deployment states in its
+own capability document rather than a setting, because a client that has to be configured
+to match the server it just interrogated has asked and then ignored the answer.
 
 EVERY CALL TAKES A TRACK, AND SENDS IT
 
@@ -35,12 +40,12 @@ been part of the collection -- and turn it into features, which is the one case 
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from qgis.core import QgsFeedback
 
-from .core import urls
+from .core import bulk, urls
 from .core.assets import SignedAsset, parse_signed_assets
 from .core.collections import Collection, parse_collections
 from .core.history import HistoryEntry, parse_history
@@ -181,17 +186,66 @@ def create_feature(
     )
 
 
-# There is deliberately no batch create.
-#
-# A FeatureCollection body would turn 1,246 round trips into a couple of dozen, and it was
-# here until three things about the deployment were established. A save is not atomic --
-# one HTTP request is one edit, and the first rejection aborts the rest after the earlier
-# rows are committed. There is no ETag and no If-Match, and identity is assigned by the
-# server, so nothing on this side can ask whether a request that failed ambiguously had
-# already been applied. And the feature service's Part 4 create handler takes a single
-# Feature; the collection body was never a verified capability.
-#
-# The three together mean the only sane response to a refused batch -- retry it one feature
-# at a time -- duplicates whatever the batch already wrote, in the founding dataset, with
-# distinct server-assigned identities that nothing can tell apart afterwards. Round trips
-# are cheaper than that. See qgis_label_client.publish._send.
+def create_features(
+    base_url: str,
+    collection_id: str,
+    features: Sequence[Mapping[str, Any]],
+    authcfg: str,
+    feedback: QgsFeedback | None = None,
+    track: str = "",
+    reason: str = "",
+    path: str = urls.BULK_PATH,
+) -> Any:
+    """Create many features in ONE database transaction. Not OGC API - Features.
+
+    THIS IS NOT THE BATCH THAT WAS REMOVED, AND THE DIFFERENCE IS THE TRANSACTION
+
+    A FeatureCollection posted to ``/items`` was here once and was taken out: a save is
+    not atomic, so the first refusal aborted the rest *after* earlier rows had committed;
+    there is no ETag and no If-Match and identity is the server's, so nothing here could
+    ask whether an ambiguous failure had already been applied; and the Part 4 create
+    handler takes a single Feature. A partly-applied batch got re-sent whole, and the
+    founding dataset gained duplicates nothing could tell apart.
+
+    This endpoint is a different thing wearing a similar shape. Every feature is inserted
+    inside one transaction, so it lands whole or not at all; the response states how many
+    rows it created and every refusal states ``created: 0``; and it does not reach the
+    single-Feature handler at all. Those three are the answers to the three reasons, one
+    for one, and they are the only reason this function exists.
+
+    Still no identity is sent, for the reasons in :func:`create_feature`. What comes back
+    is the answer to "did that land?" -- the question the old batch path could not ask --
+    and :mod:`.core.bulk` reads it. `reason` must be unique to this chunk; it is what
+    makes an ambiguous *response* recoverable with one read.
+    """
+    return post_json(
+        urls.bulk_url(base_url, path, collection_id),
+        bulk.feature_collection(features),
+        authcfg=authcfg,
+        feedback=feedback,
+        track=track,
+        reason=reason,
+    )
+
+
+def fetch_capabilities(
+    base_url: str,
+    capabilities_path: str,
+    authcfg: str,
+    feedback: QgsFeedback | None = None,
+    track: str = "",
+) -> Any:
+    """Ask what this deployment can do, before deciding how to publish into it.
+
+    Returns the raw document; :func:`~.core.bulk.parse_capabilities` decides what it
+    means. A backend that predates the endpoint answers 404, which is not an error and
+    not a warning -- one feature per request is correct, only slower, and telling an
+    analyst mid-publish that their backend is out of date is noise about something they
+    cannot fix.
+    """
+    return request_json(
+        urls.capabilities_url(base_url, capabilities_path),
+        authcfg=authcfg,
+        feedback=feedback,
+        track=track,
+    )

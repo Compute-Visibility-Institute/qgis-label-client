@@ -14,6 +14,23 @@ from .errors import ConfigurationError
 
 _ALLOWED_SCHEMES = ("https", "http")
 
+#: Where a collection id goes in the bulk endpoint's advertised path template.
+COLLECTION_PLACEHOLDER = "{collectionId}"
+
+#: Path of the atomic bulk create, relative to the backend base URL.
+#:
+#: Under the backend's own ``v1/`` namespace, and that is load-bearing rather than tidy:
+#: everything outside the prefix is proxied verbatim to the feature service, while an
+#: unserved path *inside* it is answered with a plain 404 by the edge itself. That 404 is
+#: what lets a backend predating this endpoint be recognised as one -- exactly as
+#: ``v1/tracks`` already is -- instead of producing an OAPIF error about an unknown path,
+#: which a client can misread as "the endpoint exists and failed".
+#:
+#: A constant rather than a setting because it is only the fallback: the deployment
+#: advertises its own path in ``v1/capabilities``, and that is what is used when it can be
+#: substituted into.
+BULK_PATH = f"v1/collections/{COLLECTION_PLACEHOLDER}/bulk"
+
 
 def normalise_base_url(base_url: str) -> str:
     """Validate and canonicalise the API base URL.
@@ -88,6 +105,30 @@ def collection_url(base_url: str, collection_id: str) -> str:
 def items_url(base_url: str, collection_id: str) -> str:
     """Items endpoint for one collection."""
     return join_segments(base_url, "collections", collection_id, "items")
+
+
+def bulk_url(base_url: str, path: str, collection_id: str) -> str:
+    """The atomic bulk create for one collection.
+
+    The collection id is substituted as a whole *segment* rather than by string
+    replacement, so it is percent-encoded exactly like every other value this module puts
+    in a path -- an id containing a slash otherwise silently becomes two segments, and the
+    404 that follows points at a collection nobody named.
+    """
+    segments = [part for part in (path or BULK_PATH).strip("/").split("/") if part]
+    return join_segments(
+        base_url,
+        *(collection_id if part == COLLECTION_PLACEHOLDER else part for part in segments),
+    )
+
+
+def capabilities_url(base_url: str, capabilities_path: str) -> str:
+    """The service's own capability document.
+
+    Same argument as :func:`tracks_url` for the path being a setting: "what can this
+    deployment do?" is not a features question, so it is not an OGC endpoint.
+    """
+    return join_path(base_url, capabilities_path)
 
 
 def tracks_url(base_url: str, tracks_path: str) -> str:
