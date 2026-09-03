@@ -100,6 +100,28 @@ jobs:
             exit 1
           fi
 
+      # qgis-plugin-ci ATTACHES to a release; it does not create one. Given only a
+      # tag it looks the release up by name, gets a 404, and dies with
+      # GithubReleaseNotFound -- after the zip is built and the secret substituted,
+      # so everything looks fine right up to the last step. Pushing a tag is not
+      # publishing a release, and nothing earlier in this workflow notices.
+      #
+      # Idempotent on purpose: a re-run after a failure further down must not fail
+      # here because the release it is retrying already exists.
+      - name: Create the release for qgis-plugin-ci to attach to
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists; leaving it alone"
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes "Plugin ZIP and plugins.xml are attached below by qgis-plugin-ci." \
+              --verify-tag
+          fi
+
       - name: Release to GitHub, with a plugins.xml
         env:
           # No secret to configure: the automatic workflow token is enough because the
