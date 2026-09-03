@@ -54,28 +54,34 @@ reopen it. See :mod:`.core.recorded`.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import replace
 
 from qgis.core import (
     Qgis,
     QgsCategorizedSymbolRenderer,
     QgsDataProvider,
     QgsEditorWidgetSetup,
+    QgsFeatureRenderer,
     QgsFeatureRequest,
     QgsFillSymbol,
     QgsLineSymbol,
     QgsMapLayer,
     QgsMarkerSymbol,
+    QgsPainting,
     QgsProject,
     QgsProperty,
     QgsRendererCategory,
+    QgsSimpleMarkerSymbolLayerBase,
     QgsSymbolLayer,
+    QgsUnitTypes,
     QgsVectorDataProvider,
     QgsVectorLayer,
     QgsWkbTypes,
 )
+from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtXml import QDomDocument
 
-from .core import asof, recorded, routing, styling
+from .core import asof, recorded, routing, stylecapture, styling
 from .core import tracks as track_tools
 from .core.asof import AsOfMechanism
 from .core.errors import BackendError, MixedGeometryError
@@ -803,6 +809,356 @@ def _layer_geometry_family(layer: QgsVectorLayer) -> str:
         return ""
 
 
+# ── reading a renderer back into the registry's style vocabulary ─────────────
+#
+# The inverse of _symbol_for below, and of :mod:`.core.styling` generally: everything that
+# decides whether a symbol can be captured, and what it converts to, lives in
+# :mod:`.core.stylecapture` and is tested there without a QGIS import in sight. What
+# follows only extracts values out of real QGIS objects into that module's plain
+# dataclasses -- the same split :mod:`.core.styling` and this file already have on the way
+# out, run backwards.
+
+
+def describe_renderer(renderer: QgsFeatureRenderer) -> stylecapture.RendererDescription:
+    """Everything a bare ``QgsFeatureRenderer`` can answer about itself.
+
+    Deliberately not the whole picture. ``layer_opacity``, ``blend_mode``,
+    ``scale_visibility`` and ``labels_enabled`` are ``QgsMapLayer`` properties -- a
+    renderer object has no method that answers any of them, and asking one of its methods
+    for something it does not track would come back with a default that looks like an
+    honest zero. :func:`capture_layer_style` is what reads those off the layer and layers
+    them on before handing the description to :mod:`.core.stylecapture`.
+
+    Split out on its own so a ``QgsCategorizedSymbolRenderer`` test double is all a test
+    needs -- no ``QgsVectorLayer`` double required to exercise the renderer half of this.
+    """
+    renderer_type = str(renderer.type() or "")
+    symbol = None
+    category_field = ""
+    category_count = 0
+    if renderer_type == stylecapture.SINGLE_SYMBOL:
+        raw_symbol = renderer.symbol()
+        if raw_symbol is not None:
+            symbol = _describe_symbol(raw_symbol)
+    elif renderer_type in stylecapture.ATTRIBUTE_RENDERERS:
+        # Read even though stylecapture.py refuses every renderer of this shape: the
+        # refusal's own wording ("styled into 5 symbols") is what tells an analyst this is
+        # a "these are your classes" problem and not a bug, and only the renderer itself
+        # can supply the 5.
+        category_field = _category_field(renderer)
+        category_count = _category_count(renderer)
+    return stylecapture.RendererDescription(
+        renderer_type=renderer_type,
+        symbol=symbol,
+        category_count=category_count,
+        category_field=category_field,
+    )
+
+
+def capture_layer_style(layer: QgsVectorLayer) -> stylecapture.CaptureResult:
+    """Capture a loaded layer's renderer as a ``label_class.style`` proposal, or refuse it.
+
+    The one QGIS-facing entry point this reader exists for. Everything past
+    :func:`describe_renderer` -- refusing a categorized renderer, halving a marker's
+    diameter, converting millimetres, getting the colour byte order right -- is
+    :mod:`.core.stylecapture`'s job, tested there with no QGIS import at all; this
+    function's only job is to hand it a correct description of what the layer holds.
+    """
+    renderer = layer.renderer()
+    if renderer is None:
+        return stylecapture.CaptureResult(refusal=stylecapture.NO_SYMBOL)
+    description = replace(
+        describe_renderer(renderer),
+        layer_opacity=layer.opacity(),
+        blend_mode=_blend_mode_name(layer.blendMode()),
+        scale_visibility=bool(layer.hasScaleBasedVisibility()),
+        labels_enabled=bool(layer.labelsEnabled()),
+    )
+    return stylecapture.capture_style(description)
+
+
+def _category_field(renderer) -> str:
+    """The attribute an attribute-driven renderer classifies on, or ``""`` if it has none.
+
+    ``classAttribute()`` is common to a categorized and a graduated renderer; a rule-based
+    one has no single attribute at all. Guarded with ``getattr`` rather than branching on
+    ``renderer_type`` so that renderer falls straight through to stylecapture.py's generic
+    "by attribute value" wording instead of this reader calling a method that was never
+    going to exist.
+    """
+    getter = getattr(renderer, "classAttribute", None)
+    return str(getter()) if callable(getter) else ""
+
+
+def _category_count(renderer) -> int:
+    """How many symbols an attribute-driven renderer offers, or 0 if this reader cannot
+    count them.
+
+    Read for the refusal's own wording: "styled into 5 symbols" is the sentence that makes
+    "these are five classes" land, and "several symbols" is what stylecapture.py says
+    instead when this comes back 0 -- a rule-based renderer, say, which has no flat list of
+    symbols to count.
+
+    Two accessors, because ``classAttribute()``'s own docstring is right that a categorized
+    and a graduated renderer are both attribute-driven, but they do not share a method for
+    the list itself: ``QgsCategorizedSymbolRenderer.categories()`` returns
+    ``QgsRendererCategory`` objects, ``QgsGraduatedSymbolRenderer`` has no ``categories()``
+    at all and offers ``ranges()`` (``QgsRendererRange``) instead. Trying ``categories``
+    first and falling back to ``ranges`` costs nothing on a renderer with neither -- both
+    ``getattr``s come back ``None`` and this still returns 0, the same "cannot count them"
+    answer a rule-based renderer already got.
+    """
+    for name in ("categories", "ranges"):
+        getter = getattr(renderer, name, None)
+        if not callable(getter):
+            continue
+        try:
+            return len(getter())
+        except TypeError:  # pragma: no cover - binding shape, not logic
+            return 0
+    return 0
+
+
+def _describe_symbol(symbol) -> stylecapture.SymbolDescription:
+    """A ``QgsSymbol``'s layers, in ``symbolLayers()``'s own order, plus its own opacity.
+
+    Order is preserved rather than re-sorted because it has to be:
+    :func:`.core.stylecapture._first_simple_layer` picks the FIRST layer this vocabulary
+    can express and reports the rest as dropped, and "first" only means what an analyst
+    expects if this reader has not reshuffled the stack getting here.
+    """
+    layers = tuple(_describe_symbol_layer(layer) for layer in symbol.symbolLayers())
+    return stylecapture.SymbolDescription(
+        layers=layers, opacity=symbol.opacity(), symbol_type=_symbol_type_name(symbol)
+    )
+
+
+def _symbol_type_name(symbol) -> str:
+    """The symbol's own shape word -- "Fill", "Line" or "Marker" -- for a refusal's prose
+    only, e.g. "this fill symbol is built from GradientFill". Never branched on, so a
+    build where this fails answers ``""`` rather than losing the whole capture over one
+    sentence.
+    """
+    try:
+        return str(symbol.symbolTypeToString(symbol.type()) or "")
+    except (AttributeError, TypeError):  # pragma: no cover - binding shape, not logic
+        return ""
+
+
+def _describe_symbol_layer(layer) -> stylecapture.SymbolLayerDescription:
+    """One ``QgsSymbolLayer``, described without importing QGIS to describe it again.
+
+    Every accessor past ``type_name`` and ``enabled`` is scoped to
+    ``stylecapture.SIMPLE_LAYER_KINDS``: a ``QgsGradientFillSymbolLayer`` has none of
+    ``fillColor``/``strokeColor``/``strokeWidth`` and calling them would raise, and
+    stylecapture.py already knows what to do with a ``type_name`` it does not recognise --
+    it only needs to be handed one, not have this reader interrogate a symbol it is about
+    to refuse anyway.
+    """
+    type_name = layer.layerType()
+    enabled = bool(layer.enabled())
+    if type_name not in stylecapture.SIMPLE_LAYER_KINDS:
+        return stylecapture.SymbolLayerDescription(type_name=type_name, enabled=enabled)
+
+    is_line = type_name == "SimpleLine"
+    # SimpleLine has one colour, not a fill and a stroke -- QgsSimpleLineSymbolLayer.color()
+    # *is* the stroke. Reading it as a fill would leave every linear class with no visible
+    # line at all; see stylecapture.py's own accessor table for the same trap on the way in.
+    fill_color = None if is_line else _colour_string(layer.fillColor())
+    stroke_color = _colour_string(layer.color() if is_line else layer.strokeColor())
+    stroke_width = layer.width() if is_line else layer.strokeWidth()
+    stroke_width_unit = _unit_name(layer.widthUnit() if is_line else layer.strokeWidthUnit())
+    stroke_style = _pen_style_name(layer.penStyle() if is_line else layer.strokeStyle())
+
+    size = None
+    size_unit: stylecapture.Unit | str = stylecapture.Unit.MILLIMETRES
+    marker_shape = stylecapture.CIRCLE
+    if type_name == "SimpleMarker":
+        # size is a DIAMETER -- stylecapture.capture_style halves it into a radius on the
+        # way through. Handing the raw number across unconverted is the bug that draws 872
+        # cooling units at twice their size; this reader's only job is not to touch it
+        # before that halving happens.
+        size = layer.size()
+        size_unit = _unit_name(layer.sizeUnit())
+        marker_shape = _marker_shape_name(layer.shape())
+
+    brush_style = "solid" if is_line else _brush_style_name(layer.brushStyle())
+
+    dash_pattern: tuple[float, ...] = ()
+    dash_pattern_unit: stylecapture.Unit | str = stylecapture.Unit.MILLIMETRES
+    if type_name != "SimpleMarker" and layer.useCustomDashPattern():
+        # A "dash" pen style with an EMPTY vector is Qt's own built-in pattern, not a
+        # custom one, and has no pixel lengths in it to read -- see stylecapture.py's
+        # _dash_into. Reading the vector only when the flag says there is one keeps that
+        # distinction intact instead of inventing a dash from nothing.
+        dash_pattern = tuple(layer.customDashVector())
+        dash_pattern_unit = _unit_name(layer.customDashPatternUnit())
+
+    return stylecapture.SymbolLayerDescription(
+        type_name=type_name,
+        fill_color=fill_color,
+        stroke_color=stroke_color,
+        stroke_width=stroke_width,
+        stroke_width_unit=stroke_width_unit,
+        size=size,
+        size_unit=size_unit,
+        marker_shape=marker_shape,
+        brush_style=brush_style,
+        stroke_style=stroke_style,
+        dash_pattern=dash_pattern,
+        dash_pattern_unit=dash_pattern_unit,
+        enabled=enabled,
+        data_defined=_active_data_defined(layer),
+    )
+
+
+def _colour_string(color) -> str | None:
+    """A ``QColor`` as ``"r,g,b,a"`` -- never ``.name(QColor.HexArgb)``.
+
+    That form is ``#AARRGGBB``; it parses as a colour just as readily as CSS's
+    ``#RRGGBBAA`` and is not the same one -- see stylecapture.py's module docstring.
+    ``red()``/``green()``/``blue()``/``alpha()`` auto-convert from any colour spec and
+    return 0-255 ints by contract, so there is nothing to round or clamp on this side, only
+    the wrong four methods to call instead.
+    """
+    if color is None:
+        return None
+    return f"{color.red()},{color.green()},{color.blue()},{color.alpha()}"
+
+
+def _unit_name(unit) -> str:
+    """``QgsUnitTypes.encodeUnit()``'s own spelling -- "MM", "Pixel", "MapUnit", ....
+
+    A stable string-serialization encoder, not an enum whose shape moved between QGIS 3.44
+    and 4.x, so unlike :func:`_symbol_layer_property_key` there is nothing to resolve by
+    name here: calling it directly already returns exactly what
+    ``stylecapture.normalise_unit`` expects.
+    """
+    return QgsUnitTypes.encodeUnit(unit)
+
+
+def _marker_shape_name(shape) -> str:
+    """``QgsSimpleMarkerSymbolLayerBase.encodeShape()`` -- not ``.name()``.
+
+    stylecapture.py's own docstring assumed ``.name()``; that method does not exist on
+    QGIS 3.44.13. ``encodeShape`` is the real accessor, and -- like ``encodeUnit`` above --
+    a stable string encoder with no by-name resolution to do.
+    """
+    return QgsSimpleMarkerSymbolLayerBase.encodeShape(shape)
+
+
+def _qt_style_member(namespace: str, name: str):
+    """One ``Qt`` enum member, resolved by name across PyQt5's flat aliases and PyQt6's
+    scoped-only spellings.
+
+    PyQt5 keeps a flat top-level alias for each member (unscoped on ``Qt`` directly) beside
+    the scoped ``Qt.BrushStyle.SolidPattern`` form; PyQt6 -- which QGIS 4.x builds against
+    -- drops the flat alias. Same shape as :func:`_symbol_layer_property_key` and for the
+    same reason: this plugin builds against both lines, and neither spelling can be
+    assumed gone.
+    """
+    scoped = getattr(Qt, namespace, None)
+    value = getattr(scoped, name, None) if scoped is not None else None
+    if value is not None:
+        return value
+    return getattr(Qt, name, None)
+
+
+def _brush_style_name(style) -> str:
+    """``"solid"``, ``"no"``, or a generic ``"pattern"``.
+
+    stylecapture.py branches on exactly the first two -- ``"no"`` is how a polygon symbol
+    says outline-only -- and treats everything else as prose in a note, so a hatch and a
+    texture both read as ``"pattern"`` rather than needing a name each.
+    """
+    if style == _qt_style_member("BrushStyle", "NoBrush"):
+        return "no"
+    if style == _qt_style_member("BrushStyle", "SolidPattern"):
+        return "solid"
+    return "pattern"
+
+
+#: Pen styles worth a name of their own in the report; everything else becomes "pattern".
+#: stylecapture.py branches only on "solid"/"no" -- "dash"/"dot" exist purely to sharpen
+#: the note it writes about anything else being a Qt built-in pattern with no pixel
+#: lengths to read.
+_PEN_STYLE_WORDS: tuple[tuple[str, str], ...] = (
+    ("NoPen", "no"),
+    ("SolidLine", "solid"),
+    ("DashLine", "dash"),
+    ("DotLine", "dot"),
+)
+
+
+def _pen_style_name(style) -> str:
+    for name, word in _PEN_STYLE_WORDS:
+        if style == _qt_style_member("PenStyle", name):
+            return word
+    return "pattern"
+
+
+def _blend_mode_name(mode) -> str:
+    """QGIS's own name for a layer's blend mode, or ``""`` if this build cannot say.
+
+    ``QgsMapLayer.blendMode()`` answers in Qt's own compositing enum;
+    ``QgsPainting.getBlendModeEnum`` converts it to ``Qgis.BlendMode``, whose member names
+    are what stylecapture.py's note compares against
+    (``renderer.blend_mode.lower() != "normal"``). Whether ``.name`` resolves cleanly on a
+    live SIP-wrapped enum instance is unconfirmed -- see the design doc's risk list -- so
+    "Normal", the one value actually branched on, is checked by identity first, and
+    anything else falls back to a generic word rather than an ``AttributeError``.
+    """
+    try:
+        qgis_mode = QgsPainting.getBlendModeEnum(mode)
+    except (AttributeError, TypeError):  # pragma: no cover - binding shape, not logic
+        return ""
+    normal = getattr(getattr(Qgis, "BlendMode", None), "Normal", None)
+    if normal is not None and qgis_mode == normal:
+        return "Normal"
+    name = getattr(qgis_mode, "name", None)
+    return name if isinstance(name, str) else "custom"
+
+
+def _symbol_layer_property_key(name: str):
+    """One ``QgsSymbolLayer`` data-defined property key, across QGIS's enum spellings.
+
+    QGIS moved these from a flat ``QgsSymbolLayer.Property<Name>`` to a scoped
+    ``QgsSymbolLayer.Property`` enum and dropped the ``Property`` prefix on the way. The
+    plugin supports both the 3.44 LTR and the 4.x line, so the key is resolved by name
+    rather than written once and broken by whichever build the annotator has. ``None``
+    means this QGIS has neither spelling for `name`.
+    """
+    scoped = getattr(QgsSymbolLayer, "Property", None)
+    value = getattr(scoped, name, None) if scoped is not None else None
+    if value is not None:
+        return value
+    return getattr(QgsSymbolLayer, f"Property{name}", None)
+
+
+#: The four data-defined overrides stylecapture.py's vocabulary could otherwise have
+#: expressed. QgsPropertyCollection holds around 70 kinds of override; naming only these
+#: four keeps the report honest about what THIS vocabulary lost, rather than listing
+#: overrides on properties -- label placement, geometry generators -- it was never going
+#: to carry regardless of whether they are active.
+_DATA_DEFINED_NAMES: tuple[str, ...] = ("FillColor", "StrokeColor", "StrokeWidth", "Size")
+
+
+def _active_data_defined(layer) -> tuple[str, ...]:
+    """Names of the vocabulary's four properties carrying an active data-defined override.
+
+    An override that is set but not ACTIVE draws nothing different from the plain colour,
+    so ``isActive`` is what is checked -- a merely-present-but-off override reported as a
+    loss would be a false alarm the analyst cannot do anything about.
+    """
+    collection = layer.dataDefinedProperties()
+    active = []
+    for name in _DATA_DEFINED_NAMES:
+        key = _symbol_layer_property_key(name)
+        if key is not None and collection.isActive(key):
+            active.append(name)
+    return tuple(active)
+
+
 def _symbol_for(label_class: LabelClass, historical: bool = False, geom_type: str = ""):
     """Build a symbol in the class's registry style, for `geom_type` if one is given.
 
@@ -825,23 +1181,16 @@ def _symbol_for(label_class: LabelClass, historical: bool = False, geom_type: st
 
 
 def _stroke_colour_property():
-    """The symbol-layer property key for a stroke colour, across QGIS enum spellings.
+    """The symbol-layer property key for a stroke colour specifically.
 
-    QGIS moved these from ``QgsSymbolLayer.PropertyStrokeColor`` to a scoped
-    ``QgsSymbolLayer.Property`` enum and dropped the ``Property`` prefix on the way. The
-    plugin supports both the 3.44 LTR and the 4.x line, so the key is resolved by name
-    rather than written once and broken by whichever build the annotator has. ``None``
-    means this QGIS has neither, in which case the superseded colouring is skipped and the
-    layer is still correct -- just less legible.
+    A thin specialisation of :func:`_symbol_layer_property_key` (see the reader section
+    above, which needs the same by-name resolution for three more property names). Kept as
+    its own function because :func:`_apply_superseded_colour` calling ``_stroke_colour_property()``
+    says what it is for at the call site in a way ``_symbol_layer_property_key("StrokeColor")``
+    would not. ``None`` means this QGIS has neither spelling, in which case the superseded
+    colouring is skipped and the layer is still correct -- just less legible.
     """
-    scoped = getattr(QgsSymbolLayer, "Property", None)
-    for owner, name in ((scoped, "StrokeColor"), (scoped, "PropertyStrokeColor")):
-        if owner is None:
-            continue
-        value = getattr(owner, name, None)
-        if value is not None:
-            return value
-    return getattr(QgsSymbolLayer, "PropertyStrokeColor", None)
+    return _symbol_layer_property_key("StrokeColor")
 
 
 def _apply_superseded_colour(symbol, label_class: LabelClass, fields) -> None:
