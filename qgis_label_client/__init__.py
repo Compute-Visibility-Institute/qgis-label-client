@@ -18,7 +18,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.0.1"
 
 
 def classFactory(iface):  # noqa: N802 - name fixed by the QGIS plugin contract
