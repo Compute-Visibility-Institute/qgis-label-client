@@ -67,8 +67,9 @@ B64_ALPHABET = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz01
 #: characters; three is allowed for decoders that surrender a group earlier.
 #:
 #: The lower bound is the interesting one. A *single* trailing ASCII letter after a CJK
-#: character is a common, legitimate building designator -- 恒通数据中心-B is real data,
-#: not damage -- and flagging those would bury the 81 genuinely broken names in noise.
+#: character is a common, legitimate building designator -- 数据中心-B reads as "Data
+#: Center, Building B", not damage -- and flagging those would bury the genuinely broken
+#: names in noise.
 MIN_TAIL_LENGTH = 2
 MAX_TAIL_LENGTH = 3
 

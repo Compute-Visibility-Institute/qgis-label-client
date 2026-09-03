@@ -2,9 +2,9 @@
 
 The rule being protected: publishing a name that has lost its final character makes the
 damage authoritative in a system that will outlive the shapefiles. The detector therefore
-has to fire on the real damaged values -- which are in
-:mod:`snapshot_fixtures`, taken from the analysis rather than invented -- and stay silent
-on the shapes most likely to look like damage and not be it.
+has to fire on values shaped like the real damage -- see :mod:`snapshot_fixtures` for why
+those are invented rather than the real corpus -- and stay silent on the shapes most likely
+to look like damage and not be it.
 """
 
 from __future__ import annotations
@@ -48,8 +48,8 @@ def test_intact_and_look_alike_names_are_not_flagged(text):
 
 
 def test_a_single_trailing_letter_after_cjk_is_not_damage():
-    # 恒通数据中心-B is a real building designator. The truncation leaves the surviving
-    # high 12 bits of one character, which is two base64 characters, never one.
+    # 恒通数据中心-B reads as a building designator, not damage. The truncation leaves the
+    # surviving high 12 bits of one character, which is two base64 characters, never one.
     assert truncated_tail("恒通数据中心B") == ""
     assert truncated_tail("恒通数据中心BX") != ""
 
