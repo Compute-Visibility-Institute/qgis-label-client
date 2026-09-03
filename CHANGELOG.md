@@ -6,6 +6,8 @@ most recent entries into `metadata.txt` at release time.
 
 ## [Unreleased]
 
+## [0.0.1] - 2026-09-03
+
 ### Added
 
 - **Sign in with Google, and stay signed in.** The credential is no longer a token pasted
@@ -13,9 +15,18 @@ most recent entries into `metadata.txt` at release time.
   authorization-code flow with **PKCE (S256)** against a loopback listener, and stores the
   resulting Google ID token in `QgsAuthManager` exactly as before — same `APIHeader`
   method, same `Authorization: Bearer …` plus `X-Track` config map, same seven-character
-  id in every layer URI. **No client secret is embedded**: this is a Google *Desktop app*
-  client shipped in a public repository, so a secret in it would not be one, and PKCE is
-  what binds the exchange.
+  id in every layer URI.
+
+  **The client secret is embedded in the released ZIP, and PKCE does not replace it.**
+  That is the opposite of what this entry first claimed, and the correction is worth
+  keeping: Google refuses the code exchange for this Desktop client with
+  `invalid_request: client_secret is missing`, *after* the analyst has already approved
+  the consent screen — the most confusing place a flow can fail. PKCE is additional, not
+  a substitute. The secret is substituted into the ZIP by the release workflow and is
+  never committed, so a source checkout has `CLIENT_SECRET = ""` and asks the analyst to
+  supply one; an installed-app secret is a client *identifier* rather than a
+  confidential credential, which is what makes shipping it in a public artifact
+  acceptable.
 
   **Why the plugin runs the flow rather than QGIS's own OAuth2 auth method.** QGIS 3.44
   can carry an `id_token` into a header through `extraTokens`, and it was rejected for two
@@ -286,7 +297,14 @@ most recent entries into `metadata.txt` at release time.
   than being rewritten, so upgrading does not sign anybody out and downgrading still works.
   Signing out removes every entry.
 
-## [0.1.0] - 2026-08-23
+## [0.0.0] - 2026-08-23
+
+<!-- Renumbered from 0.1.0, which was written before anything was tagged and never
+     released -- `gh release list` was empty when v0.0.1 was cut. 0.1.0 is reserved
+     for the release after the europe-west1 move, when the default API URL stops
+     being a run.app hostname. Renumbering a version nobody ever installed costs
+     nothing; shipping two different 0.1.0s would cost the plugin manager's
+     upgrade detection, which keys on this number. -->
 
 ### Added
 

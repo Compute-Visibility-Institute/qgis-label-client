@@ -4,7 +4,7 @@ qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 supportsQt6=True
 description=Thin client for a bitemporal OGC API - Features labeling backend: Google sign-in, refreshed signed imagery URLs, a registry-driven class vocabulary, and a control for each time axis - as-of on valid time, and a read-only historical view on transaction time.
-version=0.1.0
+version=0.0.1
 author=Compute Visibility Institute
 email=opensource@example.org
 
