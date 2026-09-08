@@ -92,6 +92,8 @@ from .core.publish import (
     format_record,
     parse_record,
 )
+from .core.stylecapture import CaptureResult, Refusal
+from .core.styleproposals import resolve_styles
 from .log import log, log_warning
 
 #: How many features one damage scan reads before it stops and reports a floor rather than
@@ -261,6 +263,16 @@ def describe_layer(layer: QgsVectorLayer, scan_names: bool | None = None) -> Sou
     # That is "I do not know yet", not "there is nothing here", and the difference matters
     # because the preview makes an empty layer a blocking problem.
     counted = int(layer.featureCount())
+    try:
+        captured = layer_tools.capture_layer_style(layer)
+    except (AttributeError, TypeError, ValueError, RuntimeError) as exc:
+        log_warning(f"Could not capture style for {layer.name()}: {exc}")
+        captured = CaptureResult(
+            refusal=Refusal(
+                reason="This layer's style could not be read.",
+                remedy="Use a single simple symbol, or publish the labels with the current class style.",
+            )
+        )
     return SourceLayer(
         layer_id=layer.id(),
         name=layer.name(),
@@ -275,6 +287,7 @@ def describe_layer(layer: QgsVectorLayer, scan_names: bool | None = None) -> Sou
         damaged_names=damaged,
         scanned=scanned,
         previous=parse_record(layer.customProperty(PUBLISHED_PROPERTY, "")),
+        style_capture=captured,
     )
 
 
@@ -1234,7 +1247,14 @@ def publish(request: PublishRequest, feedback: QgsFeedback | None = None) -> Pub
             "features would join. Choose a track in the panel before publishing."
         )
 
-    report = PublishReport(track=request.track)
+    report = PublishReport(
+        track=request.track,
+        style_proposals=resolve_styles(
+            proposal
+            for prepared in request.layers
+            if (proposal := prepared.plan.style_proposal()) is not None
+        ),
+    )
     progress = _Progress(total=request.total_features(), feedback=feedback)
     # Once, before the run, and never inferred from a write that happened not to fail.
     # Every way of failing to get an answer here ends at the one-feature-per-request path,

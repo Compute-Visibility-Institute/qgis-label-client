@@ -63,6 +63,8 @@ from .legacy import (
 from .names import NameSet, build_names
 from .registry import ClassRegistry, LabelClass
 from .routing import DIMENSION_SUFFIXES, CollectionRoutes, base_geometry_type
+from .stylecapture import CaptureResult
+from .styleproposals import StyleProposal, proposals_json, propose_style, resolve_styles
 from .tracks import Track
 
 #: Layer custom property recording that this layer has already been published, and what
@@ -444,6 +446,7 @@ class SourceLayer:
     #: the count above is a floor, not a total.
     scanned: int = 0
     previous: PublishRecord | None = None
+    style_capture: CaptureResult | None = None
 
     @property
     def needs_reprojection(self) -> bool:
@@ -485,6 +488,7 @@ class LayerChoice:
     extent_completeness: str = ""
     #: Omit names carrying the truncation signature instead of publishing them.
     skip_damaged_names: bool = False
+    include_style: bool = True
 
     @property
     def declare_extent(self) -> bool:
@@ -516,6 +520,18 @@ class LayerPlan:
     @property
     def class_id(self) -> str:
         return self.label_class.class_id if self.label_class else ""
+
+    def style_proposal(self) -> StyleProposal | None:
+        if self.source.style_capture is None or self.label_class is None:
+            return None
+        return propose_style(
+            self.source.layer_id,
+            self.source.name,
+            self.class_id,
+            self.source.style_capture,
+            self.label_class.style,
+            self.choice.include_style,
+        )
 
     def problems(self) -> tuple[str, ...]:
         """Reasons this layer cannot be published as chosen. Blocking."""
@@ -682,6 +698,11 @@ class PublishPlan:
 
     def selected(self) -> tuple[LayerPlan, ...]:
         return tuple(plan for plan in self.layers if plan.publish)
+
+    def style_proposals(self) -> tuple[StyleProposal, ...]:
+        return resolve_styles(
+            proposal for plan in self.selected() if (proposal := plan.style_proposal()) is not None
+        )
 
     def total_features(self) -> int:
         return sum(plan.source.feature_count for plan in self.selected())
@@ -1042,6 +1063,10 @@ class PublishReport:
     #: exception: an unhandled failure on row 900 has already written 899 rows, and the
     #: user needs the report of those far more than they need a traceback in the log.
     error: str = ""
+    style_proposals: tuple[StyleProposal, ...] = ()
+
+    def styles_json(self) -> str:
+        return proposals_json(self.style_proposals)
 
     def outcome_for(
         self,
@@ -1144,6 +1169,16 @@ class PublishReport:
                 lines.append(f"{outcome.layer_name}: {outcome.extent_problem}")
             for message, issue in sorted(outcome.issues.items(), key=lambda kv: -kv[1].count):
                 lines.append(f"{outcome.layer_name}: {issue.describe(message)}")
+        if self.style_proposals:
+            lines.extend(
+                [
+                    "",
+                    "Style proposals — captured during preview; no class styles were changed.",
+                    "These proposals remain available even if label publishing stopped.",
+                ]
+            )
+            for proposal in self.style_proposals:
+                lines.extend(proposal.detail_lines())
         return lines
 
     def coverage_warning(self) -> str:

@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from datetime import date, datetime, timezone
 
+from qgis.core import QgsApplication
 from qgis.gui import QgsCollapsibleGroupBox
 from qgis.PyQt.QtCore import QDate, QDateTime, Qt, QTime, pyqtSignal
 from qgis.PyQt.QtWidgets import (
@@ -35,8 +36,10 @@ from qgis.PyQt.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -194,26 +197,21 @@ class LabelClientDock(QDockWidget):
         self._loading_tracks = False
         # Remembered so set_busy can re-enable only what set_connected allows.
         self._connected = False
+        self._busy = False
+        self._write_access: bool | None = None
         self.setAllowedAreas(
             Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
         )
 
-        scroll = QScrollArea(self)
+        shell = QWidget(self)
+        shell_layout = QVBoxLayout(shell)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea(shell)
+        self.scroll_area = scroll
         scroll.setWidgetResizable(True)
 
-        # WHY A MINIMUM WIDTH IS SET AT ALL, given nothing here is fixed-width.
-        #
-        # A dock can only be dragged as narrow as its content's minimumSizeHint, and Qt
-        # computes that from the widest child that cannot shrink -- here a QLineEdit and
-        # a form column, neither of which word-wraps. The panel therefore held roughly a
-        # third of a 2000px screen even with every group collapsed, which is what made
-        # collapsing them feel like it had not worked.
-        #
-        # 220px is narrower than the panel is comfortable at, deliberately: it is a floor
-        # for the analyst who wants the canvas, not a target. Anything that will not fit
-        # scrolls horizontally rather than widening the dock, which is the trade this
-        # whole change is making -- a scrollbar the analyst can ignore, instead of screen
-        # space they cannot reclaim.
+        # Wrapped forms and separate action rows keep controls reachable in a narrow
+        # dock. The canvas should not lose width just because a service title is long.
         scroll.setMinimumWidth(220)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         container = QWidget(scroll)
@@ -244,13 +242,30 @@ class LabelClientDock(QDockWidget):
         layout.addWidget(self._build_qa_group(container))
         layout.addWidget(self._build_vocabulary_group(container))
 
-        self.status_label = QLabel("Not connected.", container)
-        self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
         layout.addStretch(1)
+        for label in container.findChildren(QLabel):
+            if label.wordWrap():
+                label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        for combo in container.findChildren(QComboBox):
+            combo.setMinimumWidth(0)
+            combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
 
         scroll.setWidget(container)
-        self.setWidget(scroll)
+        shell_layout.addWidget(scroll, 1)
+        footer = QWidget(shell)
+        footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(8, 4, 8, 8)
+        self.status_label = QLabel("Not connected.", footer)
+        self.status_label.setWordWrap(True)
+        self.status_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
+        footer_layout.addWidget(self.status_label)
+        self.progress_bar = QProgressBar(footer)
+        self.progress_bar.setAccessibleName("Current operation progress")
+        self.progress_bar.setVisible(False)
+        footer_layout.addWidget(self.progress_bar)
+        shell_layout.addWidget(footer)
+        self.setWidget(shell)
 
         self.set_connected(False)
 
@@ -259,6 +274,7 @@ class LabelClientDock(QDockWidget):
     def _build_connection_group(self, parent: QWidget) -> QWidget:
         group = _collapsible("Backend", parent)
         form = QFormLayout(group)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
 
         self.url_edit = QLineEdit(group)
         # Without this the field's own sizeHint sets the dock's floor -- see the
@@ -280,10 +296,17 @@ class LabelClientDock(QDockWidget):
         # into an email. A message somebody has to retype is a message that gets
         # paraphrased, and the whole value of the server's 403 text is that it is exact.
         self.auth_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
-        form.addRow("Credential", self.auth_label)
+        form.addRow("Account", self.auth_label)
+
+        self.access_label = QLabel(
+            "Read-only access. Contact an administrator to enable editing.", group
+        )
+        self.access_label.setWordWrap(True)
+        self.access_label.setVisible(False)
+        form.addRow(self.access_label)
 
         buttons = QHBoxLayout()
-        self.sign_in_button = QPushButton("Sign in with Google", group)
+        self.sign_in_button = QPushButton("Sign in", group)
         self.sign_in_button.setToolTip(
             "Opens your browser to sign in with Google. The resulting token is stored "
             "encrypted in the QGIS authentication database and is never written to a "
@@ -294,19 +317,22 @@ class LabelClientDock(QDockWidget):
             "Removes every stored credential and revokes this plugin's access at Google, "
             "so 'signed out' is true on both sides."
         )
-        self.copy_address_button = QPushButton("Copy my address", group)
+        self.copy_address_button = QPushButton("Copy address", group)
+        self.copy_address_button.setIcon(QgsApplication.getThemeIcon("/mActionEditCopy.svg"))
         self.copy_address_button.setToolTip(
             "Copies the address you are signed in as. Paste it to an administrator if the "
             "backend says you are not on the access list."
         )
         self.connect_button = QPushButton("Connect", group)
+        self.connect_button.setIcon(QgsApplication.getThemeIcon("/mIconConnect.svg"))
         self.connect_button.setDefault(True)
         buttons.addWidget(self.sign_in_button)
         buttons.addWidget(self.sign_out_button)
-        buttons.addWidget(self.copy_address_button)
-        buttons.addStretch(1)
-        buttons.addWidget(self.connect_button)
         form.addRow(buttons)
+        actions = QHBoxLayout()
+        actions.addWidget(self.copy_address_button)
+        actions.addWidget(self.connect_button)
+        form.addRow(actions)
 
         self.sign_in_button.clicked.connect(self.signInRequested)
         self.sign_out_button.clicked.connect(self.signOutRequested)
@@ -327,9 +353,7 @@ class LabelClientDock(QDockWidget):
         layout = QVBoxLayout(group)
 
         hint = QLabel(
-            "An isolated dataset. Labels drawn on one track are invisible from another, "
-            "and the database enforces that - this panel only chooses which one you are "
-            "in. Track names come from the backend; none is built into the plugin.",
+            "Choose the dataset you want to work in.",
             group,
         )
         hint.setWordWrap(True)
@@ -355,8 +379,7 @@ class LabelClientDock(QDockWidget):
         layout = QVBoxLayout(group)
 
         hint = QLabel(
-            "Listed from the backend. QGIS's native OGC API - Features provider does the "
-            "reading and the editing; nothing here is hardcoded.",
+            "Choose which layers to add to your project.",
             group,
         )
         hint.setWordWrap(True)
@@ -365,9 +388,11 @@ class LabelClientDock(QDockWidget):
         self.collection_list = QListWidget(group)
         self.collection_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.collection_list.setMinimumHeight(110)
+        self.collection_list.setMaximumHeight(190)
         layout.addWidget(self.collection_list)
 
-        self.load_button = QPushButton("Load checked collections", group)
+        self.load_button = QPushButton("Add selected layers", group)
+        self.load_button.setIcon(QgsApplication.getThemeIcon("/mActionAddOgrLayer.svg"))
         self.load_button.clicked.connect(self._emit_load_layers)
         layout.addWidget(self.load_button)
         return group
@@ -377,9 +402,7 @@ class LabelClientDock(QDockWidget):
         layout = QVBoxLayout(group)
 
         hint = QLabel(
-            "One-time: send the vector layers already open in this project to the backend "
-            "as the founding dataset. Everything is previewed first, and the server - not "
-            "this plugin - assigns each feature its permanent identity.",
+            "Publish local layers to the shared dataset. Review the mapping and styles first.",
             group,
         )
         hint.setWordWrap(True)
@@ -403,18 +426,18 @@ class LabelClientDock(QDockWidget):
         layout = QVBoxLayout(group)
 
         hint = QLabel(
-            "Imagery is streamed straight from the bucket over signed URLs that expire. "
-            "Refresh at the start of a session, and whenever rasters stop drawing.",
+            "Refresh imagery access when images stop drawing.",
             group,
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        self.imagery_status = QLabel("No signed URLs fetched yet.", group)
+        self.imagery_status = QLabel("Imagery has not been refreshed yet.", group)
         self.imagery_status.setWordWrap(True)
         layout.addWidget(self.imagery_status)
 
-        self.refresh_imagery_button = QPushButton("Refresh imagery URLs", group)
+        self.refresh_imagery_button = QPushButton("Refresh imagery", group)
+        self.refresh_imagery_button.setIcon(QgsApplication.getThemeIcon("/mActionRefresh.svg"))
         self.refresh_imagery_button.clicked.connect(self.refreshImageryRequested)
         layout.addWidget(self.refresh_imagery_button)
         return group
@@ -424,9 +447,7 @@ class LabelClientDock(QDockWidget):
         layout = QVBoxLayout(group)
 
         hint = QLabel(
-            "Shows the world as it was on the ground on a chosen date. This is valid "
-            "time. Reproducing what we <i>believed</i> on a date is transaction time and "
-            "is a server-side query - it has no OGC parameter.",
+            "Show what was on the ground on a chosen date.",
             group,
         )
         hint.setWordWrap(True)
@@ -437,13 +458,18 @@ class LabelClientDock(QDockWidget):
         layout.addWidget(self.asof_enabled)
 
         form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
         self.asof_date = QDateEdit(group)
         self.asof_date.setCalendarPopup(True)
         self.asof_date.setDisplayFormat("yyyy-MM-dd")
         self.asof_date.setDate(QDate.currentDate())
         form.addRow("Date (UTC)", self.asof_date)
 
-        self.asof_mechanism = QComboBox(group)
+        layout.addLayout(form)
+        advanced = _collapsible("Advanced date options", group, collapsed=True)
+        advanced_form = QFormLayout(advanced)
+        advanced_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+        self.asof_mechanism = QComboBox(advanced)
         self.asof_mechanism.addItem("datetime (OGC standard)", AsOfMechanism.DATETIME.value)
         self.asof_mechanism.addItem("CQL2 filter on valid_from/valid_to", AsOfMechanism.CQL2.value)
         self.asof_mechanism.setToolTip(
@@ -451,8 +477,8 @@ class LabelClientDock(QDockWidget):
             "propagate it to item requests - CQL2 is sent on every request and cannot be "
             "silently dropped."
         )
-        form.addRow("Sent as", self.asof_mechanism)
-        layout.addLayout(form)
+        advanced_form.addRow("Date query method", self.asof_mechanism)
+        layout.addWidget(advanced)
 
         self.apply_asof_button = QPushButton("Apply to loaded layers", group)
         self.apply_asof_button.clicked.connect(self.asOfApplied)
@@ -484,20 +510,18 @@ class LabelClientDock(QDockWidget):
         layout = QVBoxLayout(group)
 
         hint = QLabel(
-            "Adds a layer showing the labels <i>as the team believed them</i> at one "
-            "instant - including labels deleted since, and the geometry of labels edited "
-            "since. This is transaction time; the box above is valid time, which is a "
-            "different question.",
+            "Add a read-only layer showing what the team believed at a chosen time.",
             group,
         )
         hint.setWordWrap(True)
         hint.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(hint)
 
-        self.recorded_enabled = QCheckBox("Pin a historical layer to an instant", group)
+        self.recorded_enabled = QCheckBox("Choose a historical instant", group)
         layout.addWidget(self.recorded_enabled)
 
         form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
         self.recorded_datetime = QDateTimeEdit(group)
         self.recorded_datetime.setCalendarPopup(True)
         # Seconds shown, because the wire format has them and a picker that hides them
@@ -512,13 +536,12 @@ class LabelClientDock(QDockWidget):
         layout.addLayout(form)
 
         self.add_recorded_button = QPushButton("Add historical layer", group)
+        self.add_recorded_button.setIcon(QgsApplication.getThemeIcon("/mActionHistory.svg"))
         self.add_recorded_button.clicked.connect(self._emit_recorded_view)
         layout.addWidget(self.add_recorded_button)
 
         note = QLabel(
-            "<b>Read-only.</b> A past belief is a record, not a draft, so QGIS greys the "
-            "pencil out on this layer - that is not a fault. Adds a layer; it does not "
-            "change the layers you already have.",
+            "Your current layers stay open for comparison.",
             group,
         )
         note.setWordWrap(True)
@@ -536,7 +559,9 @@ class LabelClientDock(QDockWidget):
         return group
 
     def _sync_recorded_button(self) -> None:
-        self.add_recorded_button.setEnabled(self._connected and self.recorded_enabled.isChecked())
+        self.add_recorded_button.setEnabled(
+            self._connected and not self._busy and self.recorded_enabled.isChecked()
+        )
 
     def _emit_recorded_view(self) -> None:
         moment = self.recorded_at()
@@ -547,7 +572,8 @@ class LabelClientDock(QDockWidget):
         group = _collapsible("QA", parent, collapsed=True)
         layout = QVBoxLayout(group)
 
-        self.history_button = QPushButton("History of selected label…", group)
+        self.history_button = QPushButton("Selected label history…", group)
+        self.history_button.setIcon(QgsApplication.getThemeIcon("/mActionHistory.svg"))
         self.history_button.setToolTip(
             "Every recorded belief about the selected label, keyed on its immutable label_id."
         )
@@ -572,8 +598,7 @@ class LabelClientDock(QDockWidget):
         layout = QVBoxLayout(group)
 
         hint = QLabel(
-            "Served by the backend, not built into the plugin. Attributes live in JSONB "
-            "governed by each class's JSON Schema, so adding one needs no plugin release.",
+            "Look up a class and its available fields.",
             group,
         )
         hint.setWordWrap(True)
@@ -593,27 +618,41 @@ class LabelClientDock(QDockWidget):
 
     def set_connected(self, connected: bool) -> None:
         self._connected = connected
+        self._sync_actions()
+
+    def _sync_actions(self) -> None:
+        available = self._connected and not self._busy
         for widget in (
             self.load_button,
-            self.publish_button,
             self.refresh_imagery_button,
             self.apply_asof_button,
             self.history_button,
             self.coverage_button,
         ):
-            widget.setEnabled(connected)
+            widget.setEnabled(available)
+        self.connect_button.setEnabled(not self._busy)
+        self.track_combo.setEnabled(available)
+        self.publish_button.setEnabled(available and self._write_access is not False)
         # Gated on the checkbox as well as the connection: it is the one button here that
         # adds a layer rather than changing one, and it sits next to "Apply to loaded
         # layers" on the other axis.
         self._sync_recorded_button()
 
     def set_busy(self, busy: bool) -> None:
-        self.connect_button.setEnabled(not busy)
-        # Publishing is the one action that must not be startable twice. A second run
-        # while the first is in flight doubles the data, and the server assigns identity
-        # so nothing can recognise the repeat afterwards.
-        self.publish_button.setEnabled(self._connected and not busy)
+        self._busy = busy
+        self._sync_actions()
+        self.progress_bar.setRange(0, 0 if busy else 100)
+        self.progress_bar.setVisible(busy)
         self.setCursor(Qt.CursorShape.BusyCursor if busy else Qt.CursorShape.ArrowCursor)
+
+    def set_write_access(self, allowed: bool | None) -> None:
+        self._write_access = allowed
+        self.access_label.setVisible(allowed is False)
+        self._sync_actions()
+
+    def set_progress(self, percent: float) -> None:
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(max(0, min(100, round(percent))))
 
     def set_status(self, message: str) -> None:
         self.status_label.setText(message)
@@ -623,12 +662,14 @@ class LabelClientDock(QDockWidget):
 
     def set_imagery_status(self, message: str) -> None:
         self.imagery_status.setText(message)
+        self.set_status(message)
 
     def set_qa_result(self, message: str) -> None:
         self.qa_result.setText(message)
 
     def set_publish_status(self, message: str) -> None:
         self.publish_status.setText(message)
+        self.set_status(message)
 
     def api_url(self) -> str:
         return self.url_edit.text().strip()
@@ -710,9 +751,7 @@ class LabelClientDock(QDockWidget):
         where = f" on track {track_name}" if track_name else ""
         if floor is None:
             self.recorded_floor_label.setText(
-                f"The backend did not say how far back the record{where} goes, so the "
-                "picker has no floor. An instant before the data existed is a valid "
-                "question; the answer is an empty layer."
+                f"Record start{where} is unknown. Earlier dates may show an empty layer."
             )
             return
         self.recorded_datetime.setMinimumDateTime(_as_qdatetime(floor))

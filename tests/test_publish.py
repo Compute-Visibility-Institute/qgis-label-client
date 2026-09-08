@@ -124,9 +124,7 @@ def test_a_drafted_feature_carries_no_identity_at_all():
 
 
 def test_names_and_attributes_land_in_their_json_containers():
-    result = _compound_draft(
-        {"Name:ch": "云汇数据中心", "Name_en": "Yunhui", "No. transf": "6"}
-    )
+    result = _compound_draft({"Name:ch": "云汇数据中心", "Name_en": "Yunhui", "No. transf": "6"})
     feature = result.draft.to_geojson()
     assert feature["properties"]["names"] == {"zh": "云汇数据中心", "en": "Yunhui"}
     assert feature["properties"]["attrs"] == {"transformer_count": 6}

@@ -626,14 +626,18 @@ There are **no imagery fixtures and there never will be**, and no test touches t
 ## Releasing
 
 ```bash
-# bump `version=` in qgis_label_client/metadata.txt and add a CHANGELOG entry, then:
-git tag v0.2.0 && git push --tags
+# Update metadata.txt, __init__.__version__, and CHANGELOG.md, then commit and test.
+git tag -a v0.0.2 -m "v0.0.2 — native QGIS workflow and reliable sessions"
+git push origin v0.0.2
 ```
 
 The release workflow verifies the tag matches `metadata.txt` (a mismatch means the plugin
 manager's upgrade detection silently never fires), runs the tests, and publishes both the
 zip and a `plugins.xml` to a GitHub Release. A semver pre-release suffix — `v0.2.0-beta1` —
 is flagged experimental automatically, which gives a canary channel for free.
+
+Follow [the release checklist](docs/releasing.md), including the OAuth substitution
+and archive checks, before announcing an update.
 
 ---
 

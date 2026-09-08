@@ -36,10 +36,13 @@ decides nothing. Every decision it renders comes from :mod:`.core.publish`.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from html import escape
 
-from qgis.PyQt.QtCore import Qt
+from qgis.core import QgsFillSymbol, QgsLineSymbol, QgsMarkerSymbol, QgsSymbolLayerUtils
+from qgis.PyQt.QtCore import QSize, Qt
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -47,12 +50,14 @@ from qgis.PyQt.QtWidgets import (
     QHeaderView,
     QLabel,
     QPlainTextEdit,
+    QPushButton,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
+from .core import styling
 from .core.fields import COMPLETENESS_EXHAUSTIVE, COMPLETENESS_PARTIAL
 from .core.publish import (
     LayerChoice,
@@ -73,11 +78,12 @@ _COLUMNS = (
     # Next to Geometry, because it is decided BY the geometry and by nothing else on this
     # screen. The class combo is the control people expect to change the destination, and
     # it does not; putting the two columns apart would invite exactly that reading.
-    "Collection (by geometry)",
+    "Collection",
     "CRS",
-    "Class (from the registry)",
+    "Class",
     "Fields",
-    "Surveyed this box?",
+    "Survey extent",
+    "Style proposal",
     "Notes",
 )
 
@@ -89,7 +95,8 @@ COL_CRS = 4
 COL_CLASS = 5
 COL_FIELDS = 6
 COL_EXTENT = 7
-COL_NOTES = 8
+COL_STYLE = 8
+COL_NOTES = 9
 
 #: Item data role carrying a layer id on a row.
 LAYER_ROLE = int(Qt.ItemDataRole.UserRole) + 1
@@ -133,8 +140,22 @@ class PublishDialog(QDialog):
         self.table = self._build_table()
         layout.addWidget(self.table, 1)
 
+        self.layer_details = QCheckBox("Show layer details", self)
+        self.layer_details.setToolTip("Show destination collection, CRS, field mapping and notes.")
+        self.layer_details.toggled.connect(self._show_layer_details)
+        layout.addWidget(self.layer_details)
+        self._show_layer_details(False)
+
+        self.style_label = QLabel("", self)
+        self.style_label.setWordWrap(True)
+        self.style_label.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(self.style_label)
+        self.style_details = QPushButton("Review style proposals…", self)
+        self.style_details.clicked.connect(self._show_styles)
+        layout.addWidget(self.style_details)
+
         self.skip_damaged = QCheckBox(
-            "Omit names that carry the truncation signature, rather than publishing them",
+            "Omit possibly truncated names",
             self,
         )
         self.skip_damaged.setToolTip(
@@ -177,11 +198,8 @@ class PublishDialog(QDialog):
 
     def _build_heading(self) -> QLabel:
         heading = QLabel(
-            "<b>Publishing sends these features to the backend as new labels.</b><br/>"
-            "The server assigns each one an immutable <code>label_id</code>; nothing here "
-            "invents an identity, and the source <code>id</code> column is not used. That "
-            "also means a second publish cannot be recognised as a repeat - it creates a "
-            "second copy. Check the class mapping before you confirm.",
+            "Select layers and confirm their classes. Publishing creates new labels; "
+            "publishing a layer again creates another copy.",
             self,
         )
         heading.setWordWrap(True)
@@ -234,6 +252,17 @@ class PublishDialog(QDialog):
 
             self.table.setItem(row, COL_EXTENT, _readonly(""))
             self.table.setCellWidget(row, COL_EXTENT, self._extent_combo())
+
+            available = source.style_capture is not None and source.style_capture.captured
+            style = QCheckBox("Include" if available else "Unavailable", self.table)
+            style.setChecked(layer_plan.choice.include_style)
+            style.setEnabled(available)
+            style.setToolTip(
+                "Include this layer's style in the report for administrator review. "
+                "Publishing never changes the shared class style."
+            )
+            style.toggled.connect(self._refresh)
+            self.table.setCellWidget(row, COL_STYLE, style)
 
             self.table.setItem(row, COL_NOTES, _readonly(""))
 
@@ -314,6 +343,7 @@ class PublishDialog(QDialog):
             return None
         combo = self.table.cellWidget(row, COL_CLASS)
         extent = self.table.cellWidget(row, COL_EXTENT)
+        style = self.table.cellWidget(row, COL_STYLE)
         class_id = str(combo.currentData() or "") if combo is not None else ""
         return LayerChoice(
             layer_id=str(item.data(LAYER_ROLE)),
@@ -321,6 +351,7 @@ class PublishDialog(QDialog):
             class_id=class_id or None,
             extent_completeness=str(extent.currentData() or "") if extent is not None else "",
             skip_damaged_names=self.skip_damaged.isChecked(),
+            include_style=style.isChecked() if style is not None else True,
         )
 
     def choices(self) -> dict[str, LayerChoice]:
@@ -341,6 +372,10 @@ class PublishDialog(QDialog):
     def _on_item_changed(self, _item: QTableWidgetItem) -> None:
         self._refresh()
 
+    def _show_layer_details(self, visible: bool) -> None:
+        for column in (COL_COLLECTION, COL_CRS, COL_FIELDS, COL_NOTES):
+            self.table.setColumnHidden(column, not visible)
+
     def _refresh(self) -> None:
         """Re-render everything derived from the current choices.
 
@@ -357,6 +392,7 @@ class PublishDialog(QDialog):
             self._render_damage(plan)
             self._render_coverage(plan)
             self._render_summary(plan)
+            self._render_styles(plan)
         finally:
             self._refreshing = False
 
@@ -385,7 +421,39 @@ class PublishDialog(QDialog):
                 + " was last published to a <i>different</i> track, so this is a first "
                 "publish here rather than a second copy."
             )
-        self.track_label.setText(f"<b>Track:</b> {claim}")
+        self.track_label.setText(
+            f"<b>Track:</b> {escape(plan.track_name)} — new labels will be added here."
+        )
+        self.track_label.setToolTip(claim)
+
+    def _render_styles(self, plan: PublishPlan) -> None:
+        proposals = plan.style_proposals()
+        conflicts = {p.class_id for p in proposals if p.status == "conflict"}
+        changed = {p.class_id for p in proposals if p.status == "proposed"}
+        refused = sum(p.status == "refused" for p in proposals)
+        text = f"{len(changed)} class style proposal(s). Shared styles will stay unchanged."
+        if conflicts:
+            text += (
+                " Conflicting layers for: "
+                + ", ".join(sorted(conflicts))
+                + ". Uncheck styles to choose one, or leave them for review."
+            )
+        if refused:
+            text += f" {refused} layer style(s) cannot be captured; see Review style proposals."
+        self.style_label.setText(text)
+        self.style_details.setEnabled(bool(proposals))
+
+    def _show_styles(self) -> None:
+        lines = [
+            "Proposals only. An administrator reviews and saves changes in the class console.",
+            "Class styles apply across all tracks. Review class history in the console before saving.",
+            "",
+        ]
+        proposals = self.plan().style_proposals()
+        for proposal in proposals:
+            lines.extend(proposal.detail_lines())
+            lines.append("")
+        _show_text("Style proposals", "\n".join(lines), self, proposals)
 
     def _render_rows(self, plan: PublishPlan) -> None:
         """Re-render the two cells that depend on which class the row is set to."""
@@ -400,6 +468,15 @@ class PublishDialog(QDialog):
             if layer_plan is None:
                 continue
             lines = list(layer_plan.problems()) + list(layer_plan.notes())
+            item.setToolTip(
+                "\n".join(
+                    [
+                        f"Collection: {layer_plan.collection_id or 'not resolved'}",
+                        f"CRS: {layer_plan.source.crs_authid}",
+                        *lines,
+                    ]
+                )
+            )
             note_item.setText(" ".join(lines))
             note_item.setToolTip("\n\n".join(lines))
             if field_item is not None:
@@ -422,15 +499,10 @@ class PublishDialog(QDialog):
             else "They will be <b>published exactly as they are</b> and become "
             "authoritative in the new system."
         )
-        self.damage_label.setText(
-            f"<b>Up to {damaged} feature(s) carry a name that has lost its final "
-            "character.</b> Six of the seven source layers declare UTF-7 and the encoder "
-            "never flushed its final escape run, so 数据中心 is stored as 数据中X8. The "
-            "lost bits are gone; nothing can recover them from these files. "
-            "<b>That number is an upper bound:</b> the residue of a cut escape run is "
-            "arbitrary, so a two-character site designator after a Chinese character "
-            "(数据中心B2) cannot be told apart from damage, and omitting it would destroy "
-            f"an intact name. {fate}"
+        self.damage_label.setText(f"<b>Up to {damaged} feature names may be truncated.</b> {fate}")
+        self.damage_label.setToolTip(
+            "Detection can also match intact site designators. "
+            "Review names at source before choosing to omit them."
         )
 
     def _render_coverage(self, plan: PublishPlan) -> None:
@@ -439,15 +511,10 @@ class PublishDialog(QDialog):
             self.coverage_label.setText("")
             return
         self.coverage_label.setText(
-            "<b>No survey extent is being declared for: "
-            + ", ".join(missing)
-            + ".</b> This publish records WHAT was found, not WHERE ANYONE LOOKED. Ground "
-            "outside a declared exhaustive extent is <i>unknown</i> to the export pipeline, "
-            "never negative - and it cannot be reconstructed later, because the knowledge "
-            "is in the surveyor's memory. Choose <i>exhaustive</i> only where the layer "
-            "really is a complete sweep of its whole bounding box; <i>partial</i> records "
-            "that you looked without licensing anything inside it to be sampled as "
-            "background."
+            "<b>No survey extent for: "
+            + escape(", ".join(missing))
+            + ".</b> Unlabelled ground remains unknown. Choose exhaustive only if the "
+            "whole bounding box was surveyed; partial records an incomplete survey."
         )
 
     def _render_summary(self, plan: PublishPlan) -> None:
@@ -492,6 +559,18 @@ class PublishReportDialog(QDialog):
         detail.setPlainText("\n".join(report.detail_lines()))
         layout.addWidget(detail, 1)
 
+        if report.style_proposals:
+            copy_styles = QPushButton("Copy style proposals", self)
+            copy_styles.setEnabled(any(p.status == "proposed" for p in report.style_proposals))
+            copy_styles.setToolTip(
+                "Copy resolved proposals for the class console's Import proposal field. "
+                "Conflicting and unchanged styles are excluded."
+            )
+            copy_styles.clicked.connect(
+                lambda: QApplication.clipboard().setText(report.styles_json())
+            )
+            layout.addWidget(copy_styles)
+
         warning = report.coverage_warning()
         if warning:
             coverage = QPlainTextEdit(self)
@@ -511,6 +590,43 @@ def _readonly(text: str) -> QTableWidgetItem:
     item.setFlags(Qt.ItemFlag.ItemIsEnabled)
     item.setToolTip(text)
     return item
+
+
+def _show_text(title: str, text: str, parent: QWidget, proposals=()) -> None:
+    dialog = QDialog(parent)
+    dialog.setWindowTitle(title)
+    dialog.resize(760, 480)
+    layout = QVBoxLayout(dialog)
+    captured = [p for p in proposals if p.proposed is not None]
+    if captured:
+        swatches = QTableWidget(len(captured), 3, dialog)
+        swatches.setHorizontalHeaderLabels(["Layer / class", "Current", "Proposed"])
+        swatches.verticalHeader().setVisible(False)
+        swatches.setIconSize(QSize(48, 32))
+        for row, proposal in enumerate(captured):
+            swatches.setItem(row, 0, _readonly(f"{proposal.layer_name} / {proposal.class_id}"))
+            kind = proposal.capture.kind
+            geom = {"marker": "Point", "line": "LineString"}.get(kind, "Polygon")
+            symbol_type = {"marker": QgsMarkerSymbol, "line": QgsLineSymbol}.get(
+                kind, QgsFillSymbol
+            )
+            for column, style in ((1, proposal.current), (2, proposal.proposed)):
+                symbol = symbol_type.createSimple(styling.symbol_properties(geom, style))
+                item = _readonly("")
+                item.setIcon(QgsSymbolLayerUtils.symbolPreviewIcon(symbol, QSize(48, 32)))
+                swatches.setItem(row, column, item)
+            swatches.setRowHeight(row, 40)
+        swatches.resizeColumnsToContents()
+        swatches.setMaximumHeight(180)
+        layout.addWidget(swatches)
+    detail = QPlainTextEdit(dialog)
+    detail.setReadOnly(True)
+    detail.setPlainText(text)
+    layout.addWidget(detail)
+    buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dialog)
+    buttons.rejected.connect(dialog.reject)
+    layout.addWidget(buttons)
+    dialog.exec()
 
 
 def _collection_cell(layer_plan: LayerPlan) -> QTableWidgetItem:

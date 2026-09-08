@@ -6,6 +6,40 @@ most recent entries into `metadata.txt` at release time.
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-09-08
+
+### Added
+
+- Publish through the backend's atomic bulk endpoint when available, with per-feature
+  fallback for older deployments and reports for partial or cancelled publishes.
+- Preview supported QGIS layer styles alongside the current class style. Choose which
+  styles to include and copy proposals for import into the administrator's class editor.
+  Unchanged proposals are omitted; conflicting proposals require an explicit choice.
+- Check caller scopes on connection, startup, project opening and credential changes.
+  Confirmed readers receive native read-only layers and cannot start publishing.
+
+### Changed
+
+- Use a responsive dock with QGIS theme icons, shorter instructions, expandable Advanced
+  controls, and status/progress that stay visible while scrolling. Both time axes remain
+  separate. QA findings use the native message bar with expandable details.
+- Group geometry collections into one checkbox per mode while loading each geometry as
+  its own QGIS layer. Partially loaded groups remain unchecked.
+- Retry plugin-owned read requests once after renewing the sign-in, retaining their
+  original request context. Native layer saves and publishing are never replayed
+  automatically.
+
+### Fixed
+
+- Preserve unsaved edits when changing valid time or discovering read-only access.
+  Apply the reader restriction after the native edit buffer closes.
+- Restore plugin-owned read-only flags when a saved reader project opens for a writer
+  or an unknown session, while preserving historical and manually read-only layers.
+- Ignore obsolete OAuth completions after sign-out, backend changes or a new sign-in,
+  and release renewal state so later requests cannot remain parked indefinitely.
+- Capture simple-fill styles using the APIs actually exposed by QGIS 3.44.
+- Remove real facility and company names from public test fixtures.
+
 ## [0.0.1] - 2026-09-03
 
 ### Added
@@ -322,5 +356,6 @@ most recent entries into `metadata.txt` at release time.
   that flags labels sitting outside any exhaustive `labeled_extent` for their class.
 - Dock panel, toolbar entry and Plugins-menu entries, all detached on unload.
 
-[Unreleased]: https://github.com/Compute-Visibility-Institute/qgis-label-client/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/Compute-Visibility-Institute/qgis-label-client/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Compute-Visibility-Institute/qgis-label-client/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/Compute-Visibility-Institute/qgis-label-client/compare/v0.0.1...v0.0.2
+[0.0.1]: https://github.com/Compute-Visibility-Institute/qgis-label-client/releases/tag/v0.0.1

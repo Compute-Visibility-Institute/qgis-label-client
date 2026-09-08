@@ -21,6 +21,7 @@ COLUMN_CONSTANTS = (
     publishdialog.COL_CLASS,
     publishdialog.COL_FIELDS,
     publishdialog.COL_EXTENT,
+    publishdialog.COL_STYLE,
     publishdialog.COL_NOTES,
 )
 
@@ -70,6 +71,9 @@ class _Recorder:
     def setEnabled(self, value):  # noqa: N802
         self.enabled = value
 
+    def setToolTip(self, value):  # noqa: N802
+        self.tooltip = value
+
 
 def _stand_in(track, routes=None, geometry_type="MultiPolygon"):
     """The attributes PublishDialog.plan and the renderers actually read."""
@@ -115,7 +119,8 @@ def test_the_banner_names_the_dataset_even_on_a_clean_plan():
         dialog, build_plan(dialog._sources, REGISTRY, None, TRACK)
     )
     assert TRACK.name in dialog.track_label.text
-    assert "cannot be undone" in dialog.track_label.text
+    assert "new labels" in dialog.track_label.text
+    assert "cannot be undone" in dialog.track_label.tooltip
 
 
 def test_the_banner_leads_with_the_problem_when_the_track_cannot_take_writes():

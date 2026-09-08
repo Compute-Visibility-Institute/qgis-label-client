@@ -33,6 +33,15 @@ SuccessCallable = Callable[[Any], None]
 ErrorCallable = Callable[[str], None]
 
 
+class TaskError(str):
+    """A printable task failure carrying an HTTP status across the thread boundary."""
+
+    def __new__(cls, message: str, status: int | None = None):
+        value = super().__new__(cls, message)
+        value.status = status
+        return value
+
+
 class FunctionTask(QgsTask):
     """Run a callable on a worker thread and report back on the main thread."""
 
@@ -73,7 +82,7 @@ class FunctionTask(QgsTask):
             # Formatting the traceback here, on the worker thread, is deliberate: the
             # exception object does not survive the thread boundary usefully but a string
             # does, and losing it is how a plugin becomes "the button does nothing".
-            self._message = f"{type(exc).__name__}: {exc}"
+            self._message = TaskError(f"{type(exc).__name__}: {exc}", getattr(exc, "status", None))
             self._traceback = traceback.format_exc()
             return False
 

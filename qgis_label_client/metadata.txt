@@ -4,7 +4,7 @@ qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 supportsQt6=True
 description=Thin client for a bitemporal OGC API - Features labeling backend: Google sign-in, refreshed signed imagery URLs, a registry-driven class vocabulary, and a control for each time axis - as-of on valid time, and a read-only historical view on transaction time.
-version=0.0.1
+version=0.0.2
 author=Compute Visibility Institute
 email=opensource@example.org
 
@@ -23,16 +23,17 @@ about=Connects QGIS to a labeling platform that serves OGC API - Features (Parts
       filter;
     * a historical view on transaction time - a read-only layer showing the labels as the team
       believed them at a chosen instant, including ones deleted since. Transaction time has no
-      OGC parameter, so the instant rides on a per-layer request header, which is also what
-      makes QGIS grey the pencil out on that layer by itself;
+      OGC parameter, so the instant is carried in the layer's landing URL. Historical
+      collections and the plugin's native read-only flag prevent editing that view;
     * QA: a label's edit history, and a check for labels drawn outside any declared
       exhaustive survey extent;
     * a one-time bootstrap that publishes the vector layers already open in the project as
       the founding dataset, previewing the class mapping, the damaged names and the missing
-      survey coverage before anything is sent.
+      survey coverage before anything is sent; supported layer styles can be previewed
+      and copied as proposals for an administrator to import into the class editor.
     .
-    Licensed under GPL v2 or later, as required for QGIS plugins. No credentials, imagery or
-    deployment hostnames are distributed with this plugin - the backend URL is a user setting.
+    Licensed under GPL v2 or later, as required for QGIS plugins. Account credentials stay
+    in the QGIS authentication database. The backend URL is configurable.
 
 tracker=https://github.com/Compute-Visibility-Institute/qgis-label-client/issues
 repository=https://github.com/Compute-Visibility-Institute/qgis-label-client
@@ -47,6 +48,8 @@ deprecated=False
 server=False
 hasProcessingProvider=no
 
-changelog=0.1.0
-    - First release: auth via QgsAuthManager, signed imagery URL refresh, registry-driven
-      collections and styling, as-of-date control, history and coverage QA.
+changelog=0.0.2
+    - Native responsive panel, visible progress, grouped collections and QGIS theme icons.
+    - One retry for plugin reads after renewal; caller-aware read-only layers and publishing.
+    - Preserve unsaved edits and restore saved reader projects for writers.
+    - Bulk publishing and previewable, copyable layer-style proposals.

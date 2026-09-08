@@ -24,10 +24,11 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any
 
-from qgis.core import Qgis, QgsFeedback, QgsProject
+from qgis.core import Qgis, QgsApplication, QgsFeedback, QgsProject
 from qgis.PyQt.QtCore import Qt, QTimer
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import (
@@ -41,6 +42,7 @@ from qgis.PyQt.QtWidgets import (
 from . import auth, client, imagery, network, oauth_flow, qa
 from . import layers as layer_tools
 from . import publish as publish_tools
+from .access import LayerAccess
 from .core import collections as collection_groups
 from .core import oauth, recorded, routing
 from .core.asof import AsOfMechanism, describe
@@ -116,6 +118,11 @@ class LabelClientPlugin:
         # the panel button both reach it, and two concurrent runs would double the data
         # with nothing able to tell afterwards which copy is which.
         self.publishing = False
+        self._session_generation = 0
+        self._write_access: bool | None = None
+        self._access_context = None
+        self._layer_access = LayerAccess()
+        self._access_edit_watches = set()
 
         # --- sign-in state ---------------------------------------------------
         #
@@ -174,7 +181,11 @@ class LabelClientPlugin:
             "menu: panel", lambda: self.iface.removePluginMenu(MENU_NAME, self.panel_action)
         )
 
-        self.refresh_action = QAction(icon, "Refresh imagery URLs", self.iface.mainWindow())
+        self.refresh_action = QAction(
+            QgsApplication.getThemeIcon("/mActionRefresh.svg"),
+            "Refresh imagery",
+            self.iface.mainWindow(),
+        )
         self.refresh_action.triggered.connect(self.refresh_imagery)
         self.iface.addPluginToMenu(MENU_NAME, self.refresh_action)
         self.teardown.add(
@@ -183,7 +194,9 @@ class LabelClientPlugin:
         )
 
         self.recorded_action = QAction(
-            icon, "Historical view (transaction time)…", self.iface.mainWindow()
+            QgsApplication.getThemeIcon("/mActionHistory.svg"),
+            "Historical view (transaction time)…",
+            self.iface.mainWindow(),
         )
         self.recorded_action.setToolTip(
             "Add a read-only layer showing the labels as the team believed them at a "
@@ -196,7 +209,11 @@ class LabelClientPlugin:
             lambda: self.iface.removePluginMenu(MENU_NAME, self.recorded_action),
         )
 
-        self.publish_action = QAction(icon, "Publish local layers…", self.iface.mainWindow())
+        self.publish_action = QAction(
+            QgsApplication.getThemeIcon("/mActionAddOgrLayer.svg"),
+            "Publish local layers…",
+            self.iface.mainWindow(),
+        )
         self.publish_action.setToolTip(
             "Send the vector layers open in this project to the backend as new labels."
         )
@@ -209,10 +226,17 @@ class LabelClientPlugin:
 
         self._connect_dock_signals()
         self._restore_settings()
+        self._apply_access()
+        project = QgsProject.instance()
+        project.readProject.connect(self._on_project_read)
+        self.teardown.add(
+            "project access state", lambda: project.readProject.disconnect(self._on_project_read)
+        )
         # Last, because it reads the settings this just restored. A profile whose token
         # expired while QGIS was closed arms a zero-delay timer and renews itself before
         # the analyst touches anything.
         self._arm_refresh_timer()
+        self._refresh_access()
         log("Plugin loaded.")
 
     def unload(self) -> None:
@@ -220,6 +244,8 @@ class LabelClientPlugin:
         # Tasks first: a request that completes after the dock is gone would call into a
         # destroyed widget, which is a crash rather than a warning.
         self.tasks.shutdown()
+        self._advance_session()
+        self._layer_access.apply(layer_tools.plugin_layers(), None)
         # Not on the teardown registry, because neither of these is an attachment to QGIS:
         # they are plugin-owned objects, the same category as the task runner above, and
         # the registry exists for things QGIS would otherwise keep after unload. The timer
@@ -232,6 +258,7 @@ class LabelClientPlugin:
         self._deferred.clear()
         for failure in self.teardown.run():
             log_error(f"Teardown step {failure.label!r} failed: {failure.error}")
+        self._access_edit_watches.clear()
         self.dock = None
         self.registry = None
         self.collections = []
@@ -312,8 +339,16 @@ class LabelClientPlugin:
 
     # ------------------------------------------------------------------- helpers
 
-    def _message(self, text: str, level: Qgis.MessageLevel = Qgis.MessageLevel.Info) -> None:
-        self.iface.messageBar().pushMessage("CVI Label Client", text, level, 8)
+    def _message(
+        self, text: str, level: Qgis.MessageLevel = Qgis.MessageLevel.Info, details: str = ""
+    ) -> None:
+        duration = 0 if level == Qgis.MessageLevel.Critical else -1
+        if details:
+            self.iface.messageBar().pushMessage(
+                "CVI Label Client", text, showMore=details, level=level, duration=duration
+            )
+        else:
+            self.iface.messageBar().pushMessage("CVI Label Client", text, level, duration)
 
     def _report(self, text: str) -> None:
         """Say a failure out loud, without trying to repair it.
@@ -324,14 +359,144 @@ class LabelClientPlugin:
         per turn, from a single expired credential.
         """
         log_error(text)
-        self._message(text, Qgis.MessageLevel.Critical)
+        summary = text if len(text) <= 240 else text[:237] + "…"
+        self._message(summary, Qgis.MessageLevel.Critical, text if summary != text else "")
         if self.dock is not None:
             self.dock.set_busy(False)
-            self.dock.set_status(text)
+            self.dock.set_status(summary)
 
     def _fail(self, text: str) -> None:
         self._report(text)
         self._repair_after_401(text)
+
+    def _run_read_task(self, description, work, on_success) -> None:
+        """Retry a captured GET task once after renewal, without reopening its UI."""
+        generation = self._session_generation
+        url = self.settings.api_base_url
+        identity = (self.settings.oauth_email, self.settings.authcfg_by_track)
+
+        def current():
+            configs = self.settings.authcfg_by_track
+            return (
+                self.dock is not None
+                and generation == self._session_generation
+                and url == self.settings.api_base_url
+                and identity[0] == self.settings.oauth_email
+                # Renewal may add configs for newly discovered tracks. Existing ids
+                # must remain stable, since those are what the captured worker uses.
+                and all(configs.get(track) == cfg for track, cfg in identity[1].items())
+            )
+
+        def succeeded(result):
+            if current():
+                on_success(result)
+
+        def submit(retried=False):
+            if not current():
+                return
+
+            def failed(message):
+                if not current():
+                    return
+                if (
+                    not retried
+                    and getattr(message, "status", None) == 401
+                    and self.settings.oauth_expires_at
+                ):
+                    if self.dock is not None:
+                        self.dock.set_status("Renewing sign-in…")
+                    self._refresh_credential(resume=lambda: submit(True))
+                    return
+                # A repeated 401 is final; it must not start another renewal.
+                self._report(message)
+
+            self.tasks.run(description, work, succeeded, failed)
+
+        submit()
+
+    def _permission_context(self):
+        return (
+            self.settings.api_base_url,
+            tuple(sorted(self.settings.authcfg_by_track.items())),
+            self.settings.oauth_email,
+            self.settings.oauth_expires_at,
+        )
+
+    def _advance_session(self):
+        """Invalidate callbacks and the renewal state owned by the previous session."""
+        self._session_generation += 1
+        self._refreshing = False
+        self._repairing = False
+        self._deferred.clear()
+
+    def _on_project_read(self, *_args):
+        self._refresh_access()
+
+    def _current_write_access(self):
+        expiry = self.settings.oauth_expires_at
+        if self._access_context != self._permission_context() or (expiry and expiry <= time.time()):
+            return None
+        return self._write_access
+
+    def _apply_access(self, targets=None):
+        writable = self._current_write_access()
+        targets = layer_tools.plugin_layers() if targets is None else targets
+        editing = self._layer_access.apply(targets, writable)
+        if editing:
+            for layer in targets:
+                if not layer.isEditable() or layer.id() in self._access_edit_watches:
+                    continue
+                layer.editingStopped.connect(self._apply_access)
+                self._access_edit_watches.add(layer.id())
+
+                def disconnect(target=layer):
+                    # A removed layer may already have been destroyed by QGIS.
+                    with suppress(RuntimeError):
+                        target.editingStopped.disconnect(self._apply_access)
+
+                self.teardown.add(f"access after editing: {layer.id()}", disconnect)
+        if self.dock is not None:
+            self.dock.set_write_access(writable)
+        if hasattr(self, "publish_action"):
+            self.publish_action.setEnabled(not self.publishing and writable is not False)
+        if editing:
+            self._message(
+                "Your account has read-only access. Unsaved edits were preserved in "
+                + ", ".join(editing)
+                + "; ask an administrator for write access before saving.",
+                Qgis.MessageLevel.Warning,
+            )
+        return writable
+
+    def _refresh_access(self):
+        context = self._permission_context()
+        generation = self._session_generation
+        self._write_access = None
+        self._access_context = None
+        self._apply_access()
+        url, authcfg = self.settings.api_base_url, self.settings.authcfg
+        if not url or not authcfg:
+            return
+
+        def work(feedback):
+            return self._fetch_access(url, authcfg, feedback)
+
+        def done(writable):
+            if generation != self._session_generation or context != self._permission_context():
+                return
+            self._write_access = writable
+            self._access_context = context
+            self._apply_access()
+
+        self.tasks.run("Check account access", work, done, lambda message: log_warning(message))
+
+    @staticmethod
+    def _fetch_access(url, authcfg, feedback):
+        try:
+            return client.fetch_write_access(url, authcfg, feedback)
+        except LabelClientError as exc:
+            log_warning(f"Could not check account access: {exc}")
+            return None
 
     def _repair_after_401(self, text: str) -> None:
         """Renew a rejected credential, once, on the way past a failure.
@@ -346,10 +511,9 @@ class LabelClientPlugin:
         (see :mod:`.tasks`). Matching on the rendered "HTTP 401" that
         :func:`.network._describe_status` writes is the seam that exists.
 
-        Note what it deliberately does NOT do: replay the request. Most 401s here come
-        from QGIS's own OAPIF provider, whose requests no plugin code is in the path of,
-        so the honest repair is a fresh credential plus a sentence telling the analyst to
-        reload the layer.
+        This fallback renews only. Plugin GET tasks use _run_read_task for one retry;
+        writes must be retried explicitly. Native provider errors do not pass through
+        this handler; timer renewal keeps their shared auth configuration fresh.
         """
         if "HTTP 401" not in text:
             return
@@ -464,6 +628,7 @@ class LabelClientPlugin:
             repointed += 1
             self._warn_on_track_mismatch(layer, track)
 
+        self._apply_access()
         self._refresh_track_banner()
         # The floor is a property of the track, not of the deployment: a track created last
         # week cannot answer a question about last year, and the picker should say so
@@ -543,7 +708,11 @@ class LabelClientPlugin:
         a different URL sits in the field is a confusing five minutes.
         """
         if self.dock is not None:
-            self.settings.set("api_base_url", self.dock.api_url())
+            url = self.dock.api_url()
+            if url != self.settings.api_base_url:
+                self._advance_session()
+            self.settings.set("api_base_url", url)
+            self._apply_access()
         return self.settings.api_base_url
 
     # ---------------------------------------------------------------- connection
@@ -653,6 +822,7 @@ class LabelClientPlugin:
         listens on a socket and talks to Google is one with two reasons to change.
         """
         self._abandon_sign_in()
+        generation = self._session_generation
         if self.dock is not None:
             self.dock.set_auth_status("Completing sign-in…")
 
@@ -669,9 +839,15 @@ class LabelClientPlugin:
             )
             return oauth.credential_from_token_response(payload, time.time())
 
-        self.tasks.run(
-            "Complete Google sign-in", work, self._store_credential, self._on_sign_in_failed
-        )
+        def signed_in(credential):
+            if generation == self._session_generation:
+                self._store_credential(credential)
+
+        def failed(message):
+            if generation == self._session_generation:
+                self._on_sign_in_failed(message)
+
+        self.tasks.run("Complete Google sign-in", work, signed_in, failed)
 
     def _store_credential(self, credential: oauth.Credential) -> None:
         """Write the new ID token into every auth config, reusing every id."""
@@ -693,8 +869,10 @@ class LabelClientPlugin:
 
         self.settings.set_authcfg_by_track(stored)
         self.settings.set_oauth_session(credential.email, credential.expires_at)
+        self._advance_session()
         self._refresh_auth_label()
         self._arm_refresh_timer()
+        self._refresh_access()
 
         covered = len([name for name in stored if name])
         note = f" Covers {covered} track(s)." if covered else ""
@@ -795,6 +973,7 @@ class LabelClientPlugin:
             )
 
         self._refreshing = True
+        generation = self._session_generation
 
         def work(feedback: QgsFeedback) -> oauth.Credential:
             payload = network.post_form(
@@ -811,7 +990,15 @@ class LabelClientPlugin:
                 payload, time.time(), refresh_token=refresh_token
             )
 
-        self.tasks.run("Renew Google sign-in", work, self._on_refreshed, self._on_refresh_failed)
+        def renewed(credential):
+            if generation == self._session_generation:
+                self._on_refreshed(credential)
+
+        def failed(message):
+            if generation == self._session_generation:
+                self._on_refresh_failed(message)
+
+        self.tasks.run("Renew Google sign-in", work, renewed, failed)
         return True
 
     def _on_refreshed(self, credential: oauth.Credential) -> None:
@@ -849,6 +1036,7 @@ class LabelClientPlugin:
         self._refresh_auth_label()
         self._arm_refresh_timer()
         log("Renewed the Google sign-in.")
+        self._refresh_access()
 
         if self._repairing:
             self._repairing = False
@@ -857,8 +1045,8 @@ class LabelClientPlugin:
             # un-fail it. Saying "signed in again" and stopping there leaves the analyst
             # looking at an empty layer that will stay empty.
             self._message(
-                "Your sign-in was renewed. Reload the layer (right-click the layer > "
-                "Reload) to see your data again.",
+                "Your sign-in was renewed. Reload the layer to retry a failed read. "
+                "If saving failed, use Save Layer Edits to retry; your edits were preserved.",
                 Qgis.MessageLevel.Warning,
             )
         self._run_deferred()
@@ -929,6 +1117,7 @@ class LabelClientPlugin:
         Google account after the panel said the sign-in was gone. "Signed out" has to be
         true on both sides or it is not a statement about anything.
         """
+        self._abandon_sign_in()
         stored = self.settings.authcfg_by_track
         refresh_token = ""
         try:
@@ -950,6 +1139,10 @@ class LabelClientPlugin:
                 log_warning(str(exc))
         self.settings.set_authcfg_by_track({})
         self.settings.clear_oauth_session()
+        self._advance_session()
+        self._write_access = None
+        self._access_context = None
+        self._apply_access()
         self._deferred.clear()
         self._arm_refresh_timer()
         self._refresh_auth_label()
@@ -1005,6 +1198,7 @@ class LabelClientPlugin:
 
         self.dock.set_busy(True)
         self.dock.set_status("Connecting…")
+        context = self._permission_context()
 
         def work(feedback: QgsFeedback) -> dict[str, Any]:
             # Worker thread. Nothing here may touch widgets, iface or QgsProject.
@@ -1020,9 +1214,11 @@ class LabelClientPlugin:
                 "registry": client.fetch_registry(
                     url, registry_path, authcfg, feedback, track=track
                 ),
+                "write_access": self._fetch_access(url, authcfg, feedback),
+                "access_context": context,
             }
 
-        self.tasks.run("Connect to labeling API", work, self._on_connected, self._fail)
+        self._run_read_task("Connect to labeling API", work, self._on_connected)
 
     def _on_connected(self, result: dict[str, Any]) -> None:
         if self.dock is None:
@@ -1030,6 +1226,12 @@ class LabelClientPlugin:
         self.collections = result["collections"]
         self.registry = result["registry"]
         self.tracks = result["tracks"] or []
+        if "write_access" in result:
+            self._write_access = result.get("write_access")
+            # _run_read_task already guards backend/account/config identity. Renewal
+            # may have advanced expiry while this captured connection was retried.
+            self._access_context = self._permission_context()
+        self._apply_access()
 
         # If the stored track has gone -- renamed, archived away, or this credential is no
         # longer permitted to use it -- the setting is NOT rewritten to the default. The
@@ -1131,6 +1333,7 @@ class LabelClientPlugin:
         finally:
             self.dock.set_busy(False)
 
+        self._apply_access()
         self._refresh_track_banner()
         where = f" on track {track.name}" if track else ""
         self.dock.set_status(f"Loaded {added} layer(s){where}.")
@@ -1168,6 +1371,20 @@ class LabelClientPlugin:
         """
         if self.dock is None:
             return
+        dirty = layer_tools.dirty_layers()
+        if dirty:
+            # Like a track switch, changing the valid-time view rebuilds the provider.
+            # Keep both the source and the controls at their current values until the
+            # analyst has dealt with the native QGIS edit buffer.
+            self.dock.set_as_of(self.settings.as_of)
+            self.dock.set_as_of_mechanism(self.settings.as_of_mechanism.value)
+            self._message(
+                "Save or discard your edits before changing the valid-time view: "
+                + ", ".join(sorted(layer.name() for layer in dirty))
+                + " have unsaved changes.",
+                Qgis.MessageLevel.Warning,
+            )
+            return
         as_of = self.dock.as_of()
         mechanism = AsOfMechanism.parse(self.dock.as_of_mechanism())
         self.settings.set_as_of(as_of)
@@ -1181,6 +1398,7 @@ class LabelClientPlugin:
             # silently drop the canary -- or turn a historical layer into a live one.
             layer_tools.repoint_for(layer, self.settings, self.registry, track)
 
+        self._apply_access()
         summary = describe(as_of, mechanism)
         self.dock.set_status(f"{summary} - {len(targets)} layer(s) updated.")
         self._refresh_axes()
@@ -1349,7 +1567,7 @@ class LabelClientPlugin:
         def work(feedback: QgsFeedback):
             return client.fetch_signed_assets(url, path, authcfg, feedback, track=track)
 
-        self.tasks.run("Refresh imagery URLs", work, self._on_signed_urls, self._fail)
+        self._run_read_task("Refresh imagery URLs", work, self._on_signed_urls)
 
     def _on_signed_urls(self, result) -> None:
         assets, expires_at = result
@@ -1452,11 +1670,10 @@ class LabelClientPlugin:
                 track=track,
             )
 
-        self.tasks.run(
+        self._run_read_task(
             "Fetch label history",
             work,
             lambda entries: self._on_history(str(label_id), entries, track),
-            self._fail,
         )
 
     def _ask_history_collection(self) -> str:
@@ -1600,9 +1817,9 @@ class LabelClientPlugin:
             {class_id for _name, report in reports for class_id in report.classes_without_extents}
         )
         if classes_without_extents:
-            QMessageBox.information(
-                self.iface.mainWindow(),
-                "No survey extent declared",
+            self._message(
+                f"{len(classes_without_extents)} class(es) have no survey extent in this view.",
+                Qgis.MessageLevel.Warning,
                 "These classes have labels here but no exhaustive labeled_extent among "
                 f"the extents checked on history track {track.name if track else '(unknown)'}:"
                 "\n\n"
@@ -1640,6 +1857,13 @@ class LabelClientPlugin:
         url = self._persist_url()
         if not url:
             self._fail("Enter the API URL first.")
+            return
+        if self._apply_access() is False:
+            self._message(
+                "Your account has read-only access. Ask an administrator for write access "
+                "before publishing labels.",
+                Qgis.MessageLevel.Warning,
+            )
             return
         if not self.registry:
             self._fail("Connect first: the class registry is what the layers are mapped onto.")
@@ -1749,7 +1973,7 @@ class LabelClientPlugin:
             self._end_publish()
             self._fail(message)
 
-        self.tasks.run(
+        task = self.tasks.run(
             f"Publish local layers to {track.name}",
             work,
             lambda report: self._on_published(selected, routes.untyped, report, track.name),
@@ -1758,10 +1982,13 @@ class LabelClientPlugin:
             # server, and the user needs the summary saying which part.
             deliver_when_cancelled=True,
         )
+        # QgsTask emits progress to the dock's QObject slot on the main thread. Qt
+        # disconnects it automatically when unload deletes the dock.
+        task.progressChanged.connect(self.dock.set_progress)
 
     def _end_publish(self) -> None:
         self.publishing = False
-        self.publish_action.setEnabled(True)
+        self._apply_access()
 
     def _confirm_republish(self, plan: PublishPlan) -> bool:
         """Make a second publish of the same layer a deliberate act.

@@ -75,7 +75,7 @@ class FakeInterface:
     def messageBar(self):  # noqa: N802
         return self
 
-    def pushMessage(self, title, text, level=None, duration=0):  # noqa: N802
+    def pushMessage(self, title, text, level=None, duration=0, showMore=""):  # noqa: N802, N803
         self.messages.append((title, text, level))
 
     def mapCanvas(self):  # noqa: N802

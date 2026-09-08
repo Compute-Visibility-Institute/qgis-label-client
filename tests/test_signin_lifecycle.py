@@ -29,6 +29,7 @@ from qgis_stubs import auth_manager
 
 from qgis_label_client import auth
 from qgis_label_client.core import oauth
+from qgis_label_client.core.errors import BackendError
 from qgis_label_client.core.tracks import Track
 from qgis_label_client.plugin import LabelClientPlugin
 
@@ -66,6 +67,104 @@ def _task_names(plugin) -> list[str]:
     # The stub task manager records submissions without running them, and the runner holds
     # a reference to each until it finishes -- which under the stubs is never.
     return [task.description() for task in plugin.tasks._tasks]
+
+
+def test_read_retries_once_with_the_same_captured_work_after_renewal(plugin):
+    plugin._store_credential(_credential(int(time.time()) + HOUR))
+    auth.store_refresh_token("refresh")
+    attempts, results = [], []
+
+    def work(feedback):
+        attempts.append("original track and feature")
+        if len(attempts) == 1:
+            raise BackendError("expired", status=401)
+        return "original result"
+
+    plugin._run_read_task("Read history", work, results.append)
+    first = plugin.tasks._tasks[-1]
+    first.finished(first.run())
+    assert results == [] and plugin._refreshing
+    plugin._on_refreshed(_credential(int(time.time()) + 2 * HOUR))
+    retry = plugin.tasks._tasks[-1]
+    retry.finished(retry.run())
+    assert attempts == ["original track and feature"] * 2
+    assert results == ["original result"]
+
+
+def test_second_read_401_reports_without_another_refresh(plugin, fake_iface):
+    plugin._store_credential(_credential(int(time.time()) + HOUR))
+    auth.store_refresh_token("refresh")
+
+    def work(feedback):
+        raise BackendError("still rejected", status=401)
+
+    plugin._run_read_task("Read history", work, lambda _: None)
+    first = plugin.tasks._tasks[-1]
+    first.finished(first.run())
+    plugin._on_refreshed(_credential(int(time.time()) + 2 * HOUR))
+    retry = plugin.tasks._tasks[-1]
+    retry.finished(retry.run())
+    assert _task_names(plugin).count("Renew Google sign-in") == 1
+    assert not plugin._refreshing and not plugin._deferred
+    assert "still rejected" in _texts(fake_iface)
+
+
+def test_signed_out_session_drops_parked_reads_and_late_renewal(plugin):
+    plugin.settings.set_oauth_session("analyst@example.org", int(time.time()) + HOUR)
+    auth.store_refresh_token("refresh")
+    plugin._refresh_credential(resume=lambda: pytest.fail("must not replay after sign out"))
+    renewal = plugin.tasks._tasks[-1]
+    plugin.sign_out()
+    renewal._on_success(_credential(int(time.time()) + HOUR))
+    assert plugin.settings.oauth_expires_at == 0
+    assert plugin._deferred == []
+
+
+def test_signout_ignores_a_late_first_signin_exchange(plugin):
+    plugin._exchange_code("code", "verifier", "http://localhost/callback")
+    exchange = plugin.tasks._tasks[-1]
+    plugin.sign_out()
+    exchange._on_success(_credential(int(time.time()) + HOUR))
+    assert plugin.settings.oauth_expires_at == 0
+    assert plugin.settings.authcfg_by_track == {}
+
+
+def test_backend_change_during_renewal_releases_old_state(plugin):
+    plugin._store_credential(_credential(int(time.time()) + HOUR))
+    plugin._refresh_credential(resume=lambda: pytest.fail("old work must not resume"))
+    renewal = plugin.tasks._tasks[-1]
+    plugin.dock.api_url = lambda: "https://new.example.org"
+    plugin._persist_url()
+    assert not plugin._refreshing and not plugin._deferred
+    renewal._on_success(_credential(int(time.time()) + 2 * HOUR))
+    assert not plugin._refreshing
+    assert plugin._refresh_credential()
+    assert plugin._refreshing
+
+
+def test_new_signin_during_renewal_cannot_leave_refresh_flag_stuck(plugin):
+    plugin._store_credential(_credential(int(time.time()) + HOUR))
+    plugin._refresh_credential(resume=lambda: pytest.fail("old work must not resume"))
+    renewal = plugin.tasks._tasks[-1]
+    plugin._store_credential(_credential(int(time.time()) + 3 * HOUR))
+    renewal._on_success(_credential(int(time.time()) + 2 * HOUR))
+    assert not plugin._refreshing and not plugin._deferred
+    assert plugin.settings.oauth_expires_at > int(time.time()) + 2 * HOUR
+
+
+def test_write_failure_renews_but_never_replays_work(plugin):
+    plugin.settings.set_oauth_session("analyst@example.org", int(time.time()) + HOUR)
+    auth.store_refresh_token("refresh")
+    attempts = []
+
+    def write(feedback):
+        attempts.append("POST")
+        raise BackendError("HTTP 401", status=401)
+
+    task = plugin.tasks.run("Publish", write, on_error=plugin._fail)
+    task.finished(task.run())
+    plugin._on_refreshed(_credential(int(time.time()) + 2 * HOUR))
+    assert attempts == ["POST"]
 
 
 # --- what a completed sign-in does -------------------------------------------

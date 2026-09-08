@@ -100,9 +100,6 @@ _ALLOWED_METHODS: dict[str, frozenset[str]] = {
             "strokeWidthUnit",
             "strokeStyle",
             "brushStyle",
-            "useCustomDashPattern",
-            "customDashVector",
-            "customDashPatternUnit",
         }
     ),
     "SimpleLine": frozenset(

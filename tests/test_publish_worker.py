@@ -316,6 +316,28 @@ def _request(prepared, *more, **kwargs) -> publish_tools.PublishRequest:
     )
 
 
+def test_worker_keeps_preflight_styles_when_cancelled_before_any_label(recorder):
+    from dataclasses import replace
+
+    from qgis_label_client.core.stylecapture import CaptureResult
+
+    prepared = _prepared(_features(1))
+    prepared.plan = replace(
+        prepared.plan,
+        source=replace(
+            prepared.plan.source,
+            style_capture=CaptureResult(style={"stroke": "#123456"}, kind="fill"),
+        ),
+    )
+    feedback = publish_tools.QgsFeedback()
+    feedback.cancel()
+    report = publish_tools.publish(_request(prepared), feedback)
+    assert report.cancelled
+    assert report.published == 0
+    assert len(report.style_proposals) == 1
+    assert report.style_proposals[0].proposed["stroke"] == "#123456"
+
+
 def _features(count: int, **kwargs) -> list[FakeFeature]:
     return [FakeFeature({"Name_en": f"Site {n}"}, **kwargs) for n in range(count)]
 
@@ -868,7 +890,9 @@ def test_a_refused_batch_names_the_row_and_blames_nobody_else(recorder):
     assert outcome.failed == 1
     assert outcome.not_created == 4
     assert outcome.published == 5  # the second chunk was untouched by the first's refusal
-    refusal = next(issue for message, issue in outcome.issues.items() if "refused a feature" in message)
+    refusal = next(
+        issue for message, issue in outcome.issues.items() if "refused a feature" in message
+    )
     assert any("Site 3" in subject for subject in refusal.subjects)
     assert "is not allowed" in next(
         message for message in outcome.issues if "refused a feature" in message
@@ -884,7 +908,9 @@ def test_a_refusal_on_the_first_row_of_a_batch_names_the_first_row(recorder):
     report = publish_tools.publish(_bulk_request(_prepared(_features(4)), chunk_size=4))
 
     refusal = next(
-        issue for message, issue in report.outcomes[0].issues.items() if "refused a feature" in message
+        issue
+        for message, issue in report.outcomes[0].issues.items()
+        if "refused a feature" in message
     )
     assert any("Site 0" in subject for subject in refusal.subjects)
 
@@ -1168,7 +1194,9 @@ def test_a_batch_is_closed_by_bytes_as_well_as_by_features(recorder):
 
     assert len(recorder.batches) > 1
     for _collection, features in recorder.batches:
-        assert publish_tools.bulk.encoded_size(publish_tools.bulk.feature_collection(features)) <= 4096
+        assert (
+            publish_tools.bulk.encoded_size(publish_tools.bulk.feature_collection(features)) <= 4096
+        )
 
 
 def test_a_feature_too_large_for_any_batch_travels_alone_and_is_named(recorder):

@@ -64,6 +64,18 @@ that said PKCE made the secret unnecessary was tested against Google and was wro
       tagged and had to be renumbered to `0.0.0` to free it. Two sections claiming one
       version is exactly what breaks upgrade detection.
 
+For a local packaging check, use a disposable clone of the committed release candidate.
+`qgis-plugin-ci package` rewrites metadata and restores Git state; its
+`--allow-uncommitted-changes` path uses internal hard resets. Do not run that path in a
+shared checkout containing work in progress. New package files must be committed or
+staged in the disposable clone, because the archive is assembled through Git and can
+omit untracked files.
+
+Check the ZIP contains every expected Python module, exactly one top-level
+`qgis_label_client/` directory, and no test fixtures, project files, licensed imagery,
+private keys, local paths or Python caches. Local artifacts retain the empty OAuth
+placeholder and are for packaging verification; the workflow builds the published ZIP.
+
 ## Cutting it
 
 ```sh
@@ -74,12 +86,15 @@ git push origin v0.0.2
 The push triggers `release.yml`. It can also be re-run without a new tag:
 
 ```sh
-gh workflow run release.yml --ref main -f tag=v0.0.2
+gh workflow run release.yml --ref v0.0.2 -f tag=v0.0.2
 ```
 
 That re-run path exists because of the failures below: once a tag is pushed, fixing a
 broken release means re-running against the existing tag, not burning a new version
 number.
+
+The dispatch ref must name the same tag as the input: the workflow checks out the
+dispatch ref. Running it from `main` could package later changes under an older tag.
 
 ## Verify, because green is not the same as working
 
@@ -94,12 +109,32 @@ Then confirm the secret actually landed — this is the check that separates an 
 plugin from one that fails after consent:
 
 ```sh
-gh release download v0.0.2 --pattern '*.zip' && unzip -q qgis_label_client.0.0.2.zip
-grep -c '^CLIENT_SECRET = ""$' qgis_label_client/core/oauth.py    # must print 0
+gh release download v0.0.2 --pattern '*.zip' --dir /tmp/cvi-release-verification
+python - <<'PY'
+import ast
+import zipfile
+with zipfile.ZipFile('/tmp/cvi-release-verification/qgis_label_client.0.0.2.zip') as archive:
+    tree = ast.parse(archive.read('qgis_label_client/core/oauth.py'))
+    values = [node.value.value for node in tree.body
+              if isinstance(node, ast.Assign)
+              and any(isinstance(t, ast.Name) and t.id == 'CLIENT_SECRET'
+                      for t in node.targets)
+              and isinstance(node.value, ast.Constant)]
+    assert len(values) == 1 and values[0], 'OAuth substitution is missing'
+print('OAuth application configuration is present (value not displayed).')
+PY
 ```
 
-`0` means substituted. `1` means the ZIP carries the empty placeholder and every analyst
-who installs it will fail to sign in, having first been sent through a browser.
+The check reports only whether substitution happened. A missing value means the ZIP
+carries the empty placeholder and installed copies cannot complete sign-in without
+manual configuration. Local packaging checks intentionally retain the empty placeholder;
+only the release workflow substitutes `OAUTH_CLIENT_SECRET`.
+
+Before tagging, confirm the repository has an `OAUTH_CLIENT_SECRET` Actions secret by
+name. `GITHUB_TOKEN` is supplied automatically with `contents: write`. The current
+workflow warns and continues when the OAuth value is absent, so a green workflow alone
+does not prove sign-in is configured. Verify both release assets, their version, the
+single `qgis_label_client/` archive root, and the OAuth-presence check above.
 
 ## The two failures cutting v0.0.1, both now fixed in the workflow
 

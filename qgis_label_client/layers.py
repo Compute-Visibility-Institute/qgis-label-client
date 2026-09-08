@@ -986,7 +986,7 @@ def _describe_symbol_layer(layer) -> stylecapture.SymbolLayerDescription:
 
     dash_pattern: tuple[float, ...] = ()
     dash_pattern_unit: stylecapture.Unit | str = stylecapture.Unit.MILLIMETRES
-    if type_name != "SimpleMarker" and layer.useCustomDashPattern():
+    if type_name == "SimpleLine" and layer.useCustomDashPattern():
         # A "dash" pen style with an EMPTY vector is Qt's own built-in pattern, not a
         # custom one, and has no pixel lengths in it to read -- see stylecapture.py's
         # _dash_into. Reading the vector only when the flag says there is one keeps that

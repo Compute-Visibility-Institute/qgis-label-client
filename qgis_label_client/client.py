@@ -54,6 +54,17 @@ from .core.tracks import Track, parse_tracks
 from .network import post_json, request_json
 
 
+def fetch_write_access(base_url: str, authcfg: str, feedback=None) -> bool | None:
+    """Read caller scopes. Missing/invalid scopes remain unknown, never read-only."""
+    payload = request_json(
+        urls.join_path(base_url, "v1/whoami"), authcfg=authcfg, feedback=feedback
+    )
+    scopes = payload.get("scopes") if isinstance(payload, Mapping) else None
+    if not isinstance(scopes, list) or not all(isinstance(scope, str) for scope in scopes):
+        return None
+    return "labels:write" in scopes
+
+
 def fetch_collections(
     base_url: str, authcfg: str, feedback: QgsFeedback | None = None, track: str = ""
 ) -> list[Collection]:

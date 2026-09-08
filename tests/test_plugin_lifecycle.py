@@ -8,6 +8,8 @@ rather than by someone noticing a duplicated panel.
 
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 
 from qgis_label_client.plugin import MENU_NAME, LabelClientPlugin
@@ -63,6 +65,7 @@ def test_every_attachment_registers_a_teardown(fake_iface):
         "menu: refresh imagery",
         "menu: historical view",
         "menu: publish local layers",
+        "project access state",
     ]
     plugin.unload()
     assert len(plugin.teardown) == 0
@@ -155,6 +158,31 @@ def _plugin(fake_iface) -> LabelClientPlugin:
     plugin.initGui()
     plugin.registry = REGISTRY
     return plugin
+
+
+def test_changing_valid_time_preserves_unsaved_edits_and_restores_controls(fake_iface, monkeypatch):
+    plugin = _plugin(fake_iface)
+    original_date = date(2026, 1, 1)
+    plugin.settings.set_as_of(original_date)
+    original_mechanism = plugin.settings.as_of_mechanism.value
+    monkeypatch.setattr(layer_tools, "dirty_layers", lambda: [_FakeLayer([])])
+    monkeypatch.setattr(
+        layer_tools,
+        "repoint_for",
+        lambda *_args: pytest.fail("a dirty provider must never be replaced"),
+    )
+    restored_dates, restored_mechanisms = [], []
+    plugin.dock.set_as_of = restored_dates.append
+    plugin.dock.set_as_of_mechanism = restored_mechanisms.append
+    plugin.dock.as_of = lambda: date(2026, 9, 1)
+
+    plugin.apply_as_of()
+
+    assert plugin.settings.as_of == original_date
+    assert restored_dates == [original_date]
+    assert restored_mechanisms == [original_mechanism]
+    assert any("Save or discard" in text for _, text, _ in fake_iface.messages)
+    plugin.unload()
 
 
 def test_a_transaction_time_collection_checked_in_the_list_is_refused(fake_iface):

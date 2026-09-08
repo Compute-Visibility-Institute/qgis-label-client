@@ -148,6 +148,9 @@ class FakeScannableLayer(FakeLayer):
     def name(self) -> str:
         return "Compounds"
 
+    def renderer(self):
+        return None
+
     def providerType(self) -> str:  # noqa: N802 - Qt naming
         return self._provider
 
@@ -221,6 +224,31 @@ def test_a_provider_that_cannot_count_in_advance_is_not_reported_as_empty(_no_wk
     # "I cannot tell you yet" must not become "there is nothing here", which the preview
     # makes a blocking problem.
     assert plan.problems() == ()
+
+
+def test_preview_captures_the_layer_style_on_description(_no_wkb, monkeypatch):
+    from qgis_label_client.core.stylecapture import CaptureResult
+
+    captured = CaptureResult(style={"stroke": "#123456"}, kind="fill")
+    layer = FakeScannableLayer("compounds", "ogr")
+    seen = []
+
+    def capture(source):
+        seen.append(source)
+        return captured
+
+    monkeypatch.setattr(publish_tools.layer_tools, "capture_layer_style", capture)
+    assert publish_tools.describe_layer(layer).style_capture is captured
+    assert seen == [layer]
+
+
+def test_unreadable_style_does_not_block_label_description(_no_wkb, monkeypatch):
+    def capture(_source):
+        raise RuntimeError("unsupported renderer")
+
+    monkeypatch.setattr(publish_tools.layer_tools, "capture_layer_style", capture)
+    source = publish_tools.describe_layer(FakeScannableLayer("compounds", "ogr"))
+    assert source.style_capture.refusal is not None
 
 
 # --- the thread boundary ----------------------------------------------------
