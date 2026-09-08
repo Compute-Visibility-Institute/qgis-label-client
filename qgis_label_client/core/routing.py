@@ -125,12 +125,17 @@ def _tokens(collection_id: str) -> list[str]:
     return [token for token in _SEPARATORS.split(str(collection_id).lower()) if token]
 
 
-def _typed(collection_id: str) -> tuple[str, str] | None:
+def typed(collection_id: str) -> tuple[str, str] | None:
     """``(family, stem)`` for a collection id that names one geometry family, else None.
 
     Exactly one family word, because two of them (``label_point_polygon``) says nothing
     about which one the collection stores, and choosing between them here would be a coin
     toss with permanent consequences.
+
+    Public because it has a second caller besides this module: :mod:`.collections` uses it
+    to decide whether a collection is a member of a geometry-typed trio (grouped into one
+    row in the "load label collections" panel) or stands alone (its own row, unchanged) --
+    the same family/stem recognition this module already owns, not a second copy of it.
     """
     tokens = _tokens(collection_id)
     found = [
@@ -152,8 +157,8 @@ def stem_of(collection_id: str) -> str:
     remembered from a pre-split deployment ("the labels are in ``label``") still points at
     the right group afterwards.
     """
-    typed = _typed(collection_id)
-    return typed[1] if typed else "_".join(_tokens(collection_id))
+    parsed = typed(collection_id)
+    return parsed[1] if parsed else "_".join(_tokens(collection_id))
 
 
 @dataclass(frozen=True)
@@ -276,17 +281,17 @@ def build_routes(collection_ids: Iterable[str], preferred: str = "") -> Collecti
 
     groups: dict[str, dict[str, str]] = {}
     for collection_id in offered:
-        typed = _typed(collection_id)
-        if typed is None:
+        parsed = typed(collection_id)
+        if parsed is None:
             continue
-        family, stem = typed
+        family, stem = parsed
         # First listing wins. Two collections claiming the same family under the same stem
         # is a deployment nothing here can choose between, and quietly taking the later one
         # would make the choice invisible in a flow whose writes cannot be undone.
         groups.setdefault(stem, {}).setdefault(family, collection_id)
 
     wanted = stem_of(preferred) if preferred else ""
-    untyped_preferred = preferred if preferred in offered and _typed(preferred) is None else ""
+    untyped_preferred = preferred if preferred in offered and typed(preferred) is None else ""
 
     if wanted and wanted in groups:
         stem = wanted
@@ -305,7 +310,7 @@ def build_routes(collection_ids: Iterable[str], preferred: str = "") -> Collecti
     # mixed-geometry layer has somewhere honest to go, and a geometry family the typed set
     # does not cover does not become unpublishable.
     untyped = next(
-        (c for c in offered if _typed(c) is None and stem_of(c) == stem),
+        (c for c in offered if typed(c) is None and stem_of(c) == stem),
         "",
     )
     return CollectionRoutes(

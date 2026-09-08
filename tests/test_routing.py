@@ -323,3 +323,12 @@ def test_the_stem_of_an_id_drops_only_the_geometry_word():
     assert routing.stem_of("label_point") == "label"
     assert routing.stem_of("label") == "label"
     assert routing.stem_of("labeled_extent") == "labeled_extent"
+
+
+def test_typed_is_public_for_the_panels_own_grouping():
+    # core.collections.group_by_mode is the second caller this rename was for: it needs
+    # exactly this family/stem split to decide which collections collapse into one row of
+    # the "load label collections" panel, and duplicating the parsing there would drift
+    # from this module's vocabulary the first time a deployment renamed a collection.
+    assert routing.typed("label_current_point") == (routing.POINT, "label_current")
+    assert routing.typed("labeled_extent") is None

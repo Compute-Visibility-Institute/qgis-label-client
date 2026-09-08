@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from qgis_label_client.core.collections import parse_collections
+from qgis_label_client.core.collections import Collection, group_by_mode, parse_collections
 from qgis_label_client.core.errors import BackendError
 from qgis_label_client.core.fields import CoreFields
 from qgis_label_client.core.history import parse_history
@@ -61,6 +61,140 @@ def test_transactional_is_tri_state():
 def test_non_collections_documents_raise(document):
     with pytest.raises(BackendError):
         parse_collections(document)
+
+
+# --- grouping typed siblings for the panel -----------------------------------
+#
+# The complaint this section protects against: a deployment serving label_current,
+# label_current_polygon/point/line (and the same for _asof and _history) put up to 12
+# checkboxes in the "load label collections" panel for what the analyst experiences as
+# three modes -- current, as-of, history. group_by_mode collapses each stem's typed
+# siblings into one row, using ids and vocabulary this deployment ACTUALLY listed, never
+# a word compiled into the plugin -- see core/routing.py's own docstring for why that
+# rule exists at all.
+
+
+def _collection(
+    collection_id: str,
+    title: str = "",
+    transactional: bool | None = None,
+    description: str | None = None,
+) -> Collection:
+    return Collection(
+        collection_id=collection_id,
+        title=title or collection_id,
+        transactional=transactional,
+        description=description,
+    )
+
+
+def test_three_typed_siblings_collapse_to_one_group_and_check_all_three_ids():
+    # "label_polygon"/"label_point"/"label_line": this deployment's editable stem, with no
+    # bare "label" collection alongside it at all. Collapsing must not depend on a mixed
+    # sibling existing to trigger on.
+    members = [
+        _collection("label_polygon", "CVI Labels — areas (editable)"),
+        _collection("label_point", "CVI Labels — points (editable)"),
+        _collection("label_line", "CVI Labels — lines (editable)"),
+    ]
+    groups = group_by_mode(members)
+    assert len(groups) == 1
+    group = groups[0]
+    assert set(group.collection_ids) == {"label_polygon", "label_point", "label_line"}
+
+
+def test_a_lone_mixed_collection_with_no_typed_siblings_stays_its_own_row():
+    # labeled_extent has no geometry word at all -- nothing to collapse it with, and
+    # nothing here may guess that it should disappear just because it stands alone.
+    members = [_collection("labeled_extent", "CVI Surveyed extents")]
+    groups = group_by_mode(members)
+    assert len(groups) == 1
+    assert groups[0].collection_ids == ("labeled_extent",)
+    assert groups[0].display_name == "CVI Surveyed extents"
+
+
+def test_an_untyped_sibling_alongside_a_typed_trio_is_dropped():
+    # label_current is REFUSED unconditionally by layers.mixes_geometry -- it carries a
+    # geom_family column by schema, on every deployment, not by sampling luck -- so it
+    # contributes its title to the collapsed row and is never itself a member.
+    members = [
+        _collection("label_current", "CVI Labels (current, read-only)"),
+        _collection("label_current_polygon", "CVI Labels — areas (current, read-only)"),
+        _collection("label_current_point", "CVI Labels — points (current, read-only)"),
+        _collection("label_current_line", "CVI Labels — lines (current, read-only)"),
+    ]
+    groups = group_by_mode(members)
+    assert len(groups) == 1
+    group = groups[0]
+    assert group.display_name == "CVI Labels (current, read-only)"
+    assert set(group.collection_ids) == {
+        "label_current_polygon",
+        "label_current_point",
+        "label_current_line",
+    }
+    assert "label_current" not in group.collection_ids
+
+
+def test_the_editable_stems_display_name_falls_back_to_the_stem_qualified_by_transactional():
+    # This deployment's typed titles say "areas"/"points"/"lines", vocabulary
+    # routing._FAMILY_TOKENS deliberately does not recognise (it knows "polygon"/"point"/
+    # "line", the id vocabulary). Deriving a group name by editing a typed title would
+    # need an English-synonym table this plugin refuses to hardcode -- the stem is the
+    # fallback instead, because it is always id-derived. A bare "Label" is silent on the
+    # one thing this exact row exists to answer, so every member agreeing `transactional`
+    # qualifies it -- this is the real deployment's own shape: label_polygon/point/line
+    # advertise `editable: true` and have no untyped sibling to borrow a title from.
+    members = [
+        _collection("label_polygon", "CVI Labels — areas (editable)", transactional=True),
+        _collection("label_point", "CVI Labels — points (editable)", transactional=True),
+        _collection("label_line", "CVI Labels — lines (editable)", transactional=True),
+    ]
+    assert group_by_mode(members)[0].display_name == "Label (editable)"
+
+
+def test_the_stem_fallback_stays_bare_when_members_disagree_or_are_all_unknown():
+    # Naming a state the row is not actually in is worse than naming none. A split
+    # verdict must not resolve to either qualifier by chance of iteration order, and
+    # pygeoapi not advertising the field at all (every member None) is not a report
+    # of "read-only" -- it is a report of "unstated".
+    disagreeing = [
+        _collection("odd_polygon", "Odd areas", transactional=True),
+        _collection("odd_point", "Odd points", transactional=False),
+    ]
+    assert group_by_mode(disagreeing)[0].display_name == "Odd"
+
+    unstated = [
+        _collection("odd_polygon", "Odd areas"),
+        _collection("odd_point", "Odd points"),
+    ]
+    assert group_by_mode(unstated)[0].display_name == "Odd"
+
+
+def test_a_collection_this_grouping_has_never_seen_is_neither_grouped_nor_dropped():
+    members = [
+        _collection("label_current", "CVI Labels (current, read-only)"),
+        _collection("label_current_polygon", "CVI Labels — areas (current, read-only)"),
+        _collection("label_current_point", "CVI Labels — points (current, read-only)"),
+        _collection("label_current_line", "CVI Labels — lines (current, read-only)"),
+        _collection("labeled_extent", "CVI Surveyed extents"),
+    ]
+    groups = group_by_mode(members)
+    by_stem = {group.stem: group for group in groups}
+    assert set(by_stem) == {"label_current", "labeled_extent"}
+    # Neither swept into the collapsed row nor removed for standing alone.
+    assert by_stem["labeled_extent"].collection_ids == ("labeled_extent",)
+
+
+def test_group_rows_are_sorted_like_parse_collections_sorts_plain_ones():
+    members = [
+        _collection("labeled_extent", "CVI Surveyed extents"),
+        _collection("label_polygon", "CVI Labels — areas (editable)"),
+        _collection("label_point", "CVI Labels — points (editable)"),
+        _collection("label_line", "CVI Labels — lines (editable)"),
+    ]
+    groups = group_by_mode(members)
+    names = [group.display_name.lower() for group in groups]
+    assert names == sorted(names)
 
 
 # --- history ----------------------------------------------------------------

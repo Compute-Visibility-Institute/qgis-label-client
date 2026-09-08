@@ -23,6 +23,13 @@ anything real, and each of those is real because a test depends on it:
   track reaching the server (required) and the OAuth refresh token reaching it too
   (never). It is also where the hourly token rotation is checked to reuse config ids, on
   which every saved ``.qgz`` and every loaded layer depends.
+* ``QListWidget`` / ``QListWidgetItem`` -- real check state, per-role data and a real
+  parent/child relationship, so the "load label collections" panel's grouped-checkbox
+  round trip (``set_collections`` in, ``checked_collections`` out) can be tested. The
+  generic auto-generated stub below is stateless -- ``item.setData(role, value)`` and
+  ``item.data(role)`` would each hand back an unrelated fresh stub -- which is fine for a
+  widget nothing reads back, but this is exactly the one dockwidget round trip this
+  change needs to prove.
 
 If a test starts needing more than that, it is probably a test that belongs against a
 real QGIS instead.
@@ -409,6 +416,72 @@ class QgsApplication(Stub):
         return _AUTH_MANAGER
 
 
+class QListWidgetItem(Stub):
+    """A row: text, check state and per-role data, real enough to round-trip.
+
+    ``QListWidgetItem(text, parent)`` appends itself to `parent` exactly like the real
+    constructor, because :meth:`LabelClientDock.set_collections` relies on that to build
+    the list and never calls an explicit ``addItem``.
+    """
+
+    def __init__(self, text: str = "", parent: Any = None) -> None:
+        super().__init__(text, parent)
+        self._text = text
+        self._flags = 0
+        self._check_state = 0
+        self._role_data: dict[int, Any] = {}
+        self._tooltip = ""
+        if parent is not None:
+            parent._rows.append(self)
+
+    def text(self) -> str:
+        return self._text
+
+    def setFlags(self, flags: Any) -> None:  # noqa: N802 - Qt naming
+        self._flags = flags
+
+    def flags(self) -> Any:
+        return self._flags
+
+    def setCheckState(self, state: Any) -> None:  # noqa: N802
+        self._check_state = state
+
+    def checkState(self) -> Any:  # noqa: N802
+        return self._check_state
+
+    def setData(self, role: Any, value: Any) -> None:  # noqa: N802
+        self._role_data[role] = value
+
+    def data(self, role: Any) -> Any:
+        return self._role_data.get(role)
+
+    def setToolTip(self, text: str) -> None:  # noqa: N802
+        self._tooltip = text
+
+    def toolTip(self) -> str:  # noqa: N802
+        return self._tooltip
+
+
+class QListWidget(Stub):
+    """Enough of the real list to hold the rows :class:`QListWidgetItem` appends itself to."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._rows: list[QListWidgetItem] = []
+
+    def clear(self) -> None:
+        self._rows.clear()
+
+    def count(self) -> int:
+        return len(self._rows)
+
+    def item(self, row: int) -> QListWidgetItem:
+        return self._rows[row]
+
+    def addItem(self, item: QListWidgetItem) -> None:  # noqa: N802
+        self._rows.append(item)
+
+
 # ---------------------------------------------------------------------------
 # Module assembly
 # ---------------------------------------------------------------------------
@@ -444,6 +517,11 @@ _QTCORE_EXPLICIT = {
     "pyqtSlot": pyqtSlot,
 }
 
+_QTWIDGETS_EXPLICIT = {
+    "QListWidget": QListWidget,
+    "QListWidgetItem": QListWidgetItem,
+}
+
 _MODULES = (
     "qgis",
     "qgis.core",
@@ -471,7 +549,11 @@ def install() -> None:
     except ImportError:
         pass
 
-    explicit = {"qgis.core": _CORE_EXPLICIT, "qgis.PyQt.QtCore": _QTCORE_EXPLICIT}
+    explicit = {
+        "qgis.core": _CORE_EXPLICIT,
+        "qgis.PyQt.QtCore": _QTCORE_EXPLICIT,
+        "qgis.PyQt.QtWidgets": _QTWIDGETS_EXPLICIT,
+    }
     for name in _MODULES:
         if name in sys.modules:
             continue

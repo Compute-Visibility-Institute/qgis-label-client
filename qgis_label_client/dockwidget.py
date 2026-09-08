@@ -43,7 +43,7 @@ from qgis.PyQt.QtWidgets import (
 
 from .core import recorded
 from .core.asof import AsOfMechanism
-from .core.collections import Collection
+from .core.collections import CollectionGroup
 from .core.registry import ClassRegistry
 from .core.tracks import Track
 from .settings import PLACEHOLDER_API_URL
@@ -88,6 +88,69 @@ def _collapsible(title: str, parent: QWidget, *, collapsed: bool = False) -> Qgs
     if collapsed:
         group.setCollapsed(True)
     return group
+
+
+def _collection_group_tooltip(group: CollectionGroup) -> str:
+    """The hover text for one row of the collection list.
+
+    A size-one group renders exactly as a single collection always has -- ``id:``, its
+    description, its own transactional line. A collapsed group cannot use an ``id:`` line
+    at all (no one id names the row any more), lists each member's description against its
+    own id rather than merging them (the per-geometry descriptions in this deployment name
+    different classes per family, which prose merging would lose), and states editability
+    as a single line only when every member agrees, naming the split otherwise -- a
+    checkbox is worse than useless if it is confidently wrong about part of what it means.
+    """
+    members = group.members
+    if len(members) == 1:
+        collection = members[0]
+        lines = [f"id: {collection.collection_id}"]
+        if collection.description:
+            lines.append(collection.description)
+        lines.append(_transactional_line(collection.transactional))
+        return "\n".join(line for line in lines if line)
+
+    lines = ["ids: " + ", ".join(sorted(group.collection_ids))]
+    lines.extend(
+        f"{member.collection_id}: {member.description}" for member in members if member.description
+    )
+    states = {member.transactional for member in members}
+    if len(states) == 1:
+        lines.append(_transactional_line(states.pop()))
+    else:
+        # Not expected in this deployment -- provider-identical siblings under one stem
+        # agree by construction -- but the OGC API - Features spec does not guarantee it,
+        # and a message naming the split ends an investigation instead of starting one.
+        named = ", ".join(
+            f"{member.collection_id}={_transactional_word(member.transactional)}"
+            for member in sorted(members, key=lambda m: m.collection_id)
+        )
+        lines.append(f"Editability disagrees between parts of this collection: {named}.")
+    return "\n".join(line for line in lines if line)
+
+
+def _transactional_line(transactional: bool | None) -> str:
+    """The one-line editability sentence, or ``""`` when there is nothing worth adding.
+
+    ``False`` adds no line at all, on purpose: a read-only collection needs no sentence
+    telling an analyst what they already know from not being able to edit it, and this
+    asymmetry is the one :func:`_collection_group_tooltip` has to preserve for both a
+    plain collection and a collapsed group.
+    """
+    if transactional is True:
+        return "Editable (OGC API - Features Part 4)."
+    if transactional is None:
+        return "Editability not advertised by the server."
+    return ""
+
+
+def _transactional_word(transactional: bool | None) -> str:
+    """One word per member, for the disagreement line only -- never shown on its own."""
+    if transactional is True:
+        return "editable"
+    if transactional is None:
+        return "not advertised"
+    return "read-only"
 
 
 class LabelClientDock(QDockWidget):
@@ -661,35 +724,51 @@ class LabelClientDock(QDockWidget):
         self.axes_label.setText(message)
 
     def set_collections(
-        self, collections: Sequence[Collection], checked: Iterable[str] = ()
+        self, groups: Sequence[CollectionGroup], checked: Iterable[str] = ()
     ) -> None:
-        """Populate the collection list, preserving which rows were checked."""
+        """Populate the collection list, preserving which rows were checked.
+
+        One row per :class:`CollectionGroup`, never per collection: a group of geometry-
+        typed siblings (``label_current_point``/``_line``/``_polygon``) is one checkbox
+        for one mode, which is the whole point of grouping upstream in
+        :func:`.core.collections.group_by_mode` rather than here. A group of size one
+        (every collection this deployment has not split by geometry) renders identically
+        to a plain collection before this method learned about groups.
+        """
         preselected = set(checked)
         self.collection_list.clear()
-        for collection in collections:
-            item = QListWidgetItem(collection.display_name, self.collection_list)
-            item.setData(COLLECTION_ROLE, collection.collection_id)
+        for group in groups:
+            item = QListWidgetItem(group.display_name, self.collection_list)
+            # A comma-joined STRING, not the tuple itself. Every other item-data role in
+            # this codebase (LAYER_ROLE in publishdialog.py, the combo boxes' userData)
+            # already stores a plain string -- one of them re-wraps with str() on read as
+            # a defensive habit -- and a collection id is an OGC API slug that cannot
+            # contain a comma, so the join is unambiguous and lossless. Composite Python
+            # objects are commonly said to survive Qt's QVariant marshaling, but nothing
+            # in this codebase has needed that yet and nothing here can execute against a
+            # real Qt binding to prove it does; matching the established plain-string
+            # convention costs one join/split and needs no such proof.
+            item.setData(COLLECTION_ROLE, ",".join(group.collection_ids))
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            # ALL members, not any: a group with two of three siblings on the map is a
+            # mode that is only PARTIALLY loaded, and a checked box asserting otherwise is
+            # worse than an unchecked one -- it hides the missing third rather than
+            # inviting a click that would complete it. See load_collections' per-id skip:
+            # checking this box again sends every id and only the missing ones get added.
             item.setCheckState(
                 Qt.CheckState.Checked
-                if collection.collection_id in preselected
+                if all(cid in preselected for cid in group.collection_ids)
                 else Qt.CheckState.Unchecked
             )
-            tooltip = [f"id: {collection.collection_id}"]
-            if collection.description:
-                tooltip.append(collection.description)
-            if collection.transactional is True:
-                tooltip.append("Editable (OGC API - Features Part 4).")
-            elif collection.transactional is None:
-                tooltip.append("Editability not advertised by the server.")
-            item.setToolTip("\n".join(tooltip))
+            item.setToolTip(_collection_group_tooltip(group))
 
     def checked_collections(self) -> list[str]:
-        return [
-            str(self.collection_list.item(row).data(COLLECTION_ROLE))
-            for row in range(self.collection_list.count())
-            if self.collection_list.item(row).checkState() == Qt.CheckState.Checked
-        ]
+        ids: list[str] = []
+        for row in range(self.collection_list.count()):
+            item = self.collection_list.item(row)
+            if item.checkState() == Qt.CheckState.Checked:
+                ids.extend(str(item.data(COLLECTION_ROLE)).split(","))
+        return ids
 
     def set_tracks(self, tracks: Sequence[Track], selected: str = "") -> None:
         """Populate the track combo, preserving the selection where it still exists.

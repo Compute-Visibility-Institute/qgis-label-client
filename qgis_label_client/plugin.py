@@ -41,6 +41,7 @@ from qgis.PyQt.QtWidgets import (
 from . import auth, client, imagery, network, oauth_flow, qa
 from . import layers as layer_tools
 from . import publish as publish_tools
+from .core import collections as collection_groups
 from .core import oauth, recorded, routing
 from .core.asof import AsOfMechanism, describe
 from .core.collections import Collection
@@ -1037,7 +1038,12 @@ class LabelClientPlugin:
         # feature exists to prevent.
         self.dock.set_tracks(self.tracks, self.settings.track)
         loaded = {layer_tools.collection_of(layer) for layer in layer_tools.plugin_layers()}
-        self.dock.set_collections(self.collections, checked=loaded)
+        # Grouped for the panel only: geometry-typed siblings collapse to one checkbox
+        # per mode here (see core.collections.group_by_mode), but self.collections stays
+        # the flat per-collection list load_collections and every title lookup below use --
+        # a QGIS layer is still typed per geometry, so its own layer-tree title stays
+        # per-geometry even though the panel's checkbox for it is not.
+        self.dock.set_collections(collection_groups.group_by_mode(self.collections), checked=loaded)
         self.dock.set_registry(self.registry)
         self.dock.set_connected(True)
         self.dock.set_busy(False)

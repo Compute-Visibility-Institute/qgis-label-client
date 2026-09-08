@@ -14,6 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from . import routing
 from .errors import BackendError
 
 
@@ -139,3 +140,103 @@ def parse_collections(document: Any) -> list[Collection]:
         )
     parsed.sort(key=lambda c: (c.display_name.lower(), c.collection_id))
     return parsed
+
+
+@dataclass(frozen=True)
+class CollectionGroup:
+    """One row in the "load label collections" panel.
+
+    A stem with two or more geometry-typed siblings (``label_current_point`` and its
+    typed neighbours) collapses to a single row here, because the panel is asking "is
+    this MODE loaded", not "is this geometry family loaded" -- see :func:`group_by_mode`.
+    Every other stem still gets one row per collection, with ``members`` of length one, so
+    the panel has exactly one shape to render and never branches on whether a row is a
+    collapsed group or a plain collection.
+    """
+
+    stem: str
+    display_name: str
+    members: tuple[Collection, ...]
+
+    @property
+    def collection_ids(self) -> tuple[str, ...]:
+        return tuple(member.collection_id for member in self.members)
+
+
+def group_by_mode(collections: Sequence[Collection]) -> list[CollectionGroup]:
+    """Collapse geometry-typed siblings into one row per mode, for the panel.
+
+    "Which collection is this checkbox" and "which collection does a layer publish into"
+    are different questions. :func:`.routing.build_routes` answers the second by picking
+    ONE stem-group when several are offered, refusing outright on ambiguity -- the right
+    move for a write that cannot be undone. This answers the first by listing EVERY
+    stem-group unconditionally: the panel is never choosing between modes, only showing
+    all of them, so there is no ambiguity here to refuse.
+
+    A stem's untyped member (``label_current`` alongside ``label_current_point`` /
+    ``_line`` / ``_polygon``) is dropped once two or more typed siblings share its stem.
+    Not merely redundant: this deployment builds the mixed collections to carry a
+    ``geom_family`` column precisely BECAUSE they mix geometries, so
+    :func:`~.layers.mixes_geometry` refuses one unconditionally, every time, by schema --
+    a row for it would be a checkbox that can warn and never load anything. A stem with
+    fewer than two typed members has no duplicate to collapse, so each of its collections
+    keeps the row it has always had; collapsing or hiding it would be solving a different,
+    unasked-for problem (a checkbox that fails) instead of the one complained about
+    (duplicate checkboxes for one mode).
+    """
+    by_stem: dict[str, list[Collection]] = {}
+    for collection in collections:
+        by_stem.setdefault(routing.stem_of(collection.collection_id), []).append(collection)
+
+    groups: list[CollectionGroup] = []
+    for stem, members in by_stem.items():
+        typed_members = [c for c in members if routing.typed(c.collection_id) is not None]
+        untyped_members = [c for c in members if routing.typed(c.collection_id) is None]
+
+        if len(typed_members) < 2:
+            # Nothing to collapse: a lone typed collection, a lone mixed one, or (in
+            # principle) several untyped collections sharing a stem nobody has split. Each
+            # keeps its own row, byte-for-byte the behaviour from before this function.
+            groups.extend(
+                CollectionGroup(stem=stem, display_name=c.display_name, members=(c,))
+                for c in members
+            )
+            continue
+
+        if untyped_members:
+            # Empirically already the generic form this deployment wants ("CVI Labels
+            # (current, read-only)"), with no geometry qualifier -- no synthesis needed.
+            display_name = untyped_members[0].display_name
+        else:
+            # No mixed sibling to borrow a title from (the "editable" stem has three typed
+            # members and none untyped). This deployment's own typed titles say
+            # "areas/points/lines", a prose vocabulary routing._FAMILY_TOKENS deliberately
+            # does not know -- inventing an English-synonym table to strip that word back
+            # out of a title would hardcode exactly the kind of deployment vocabulary this
+            # module already refuses to hardcode for ids, twice over instead of once. The
+            # stem is always available and already id-derived, so it is the fallback.
+            #
+            # A bare stem is silent on the one thing this exact row exists to answer --
+            # "read only / editable / etc", in the words that motivated collapsing these
+            # rows in the first place -- so it is qualified from `transactional`, which
+            # every member already carries. Only when every typed sibling AGREES does the
+            # qualifier get added: a split verdict (or every member merely unknown) means
+            # guessing which is right, and naming a state the row is not actually in would
+            # be a worse answer than naming none.
+            base = stem.replace("_", " ").strip().title() or stem
+            flags = {member.transactional for member in typed_members}
+            if flags == {True}:
+                display_name = f"{base} (editable)"
+            elif flags == {False}:
+                display_name = f"{base} (read-only)"
+            else:
+                display_name = base
+
+        groups.append(
+            CollectionGroup(stem=stem, display_name=display_name, members=tuple(typed_members))
+        )
+
+    # Mirrors parse_collections' own sort key, so collapsing rows never scrambles the
+    # panel's alphabetical order into something that reads as random.
+    groups.sort(key=lambda group: (group.display_name.lower(), group.stem))
+    return groups
