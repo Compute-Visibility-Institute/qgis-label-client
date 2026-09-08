@@ -6,6 +6,14 @@ most recent entries into `metadata.txt` at release time.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-08
+
+### Changed
+
+- New profiles use the reference deployment's custom API domain. Existing saved URLs
+  and project layer sources are preserved. Follow the README upgrade instructions to
+  move an existing profile and reload its remote layers after the deployment cutover.
+
 ## [0.0.2] - 2026-09-08
 
 ### Added
@@ -356,6 +364,7 @@ most recent entries into `metadata.txt` at release time.
   that flags labels sitting outside any exhaustive `labeled_extent` for their class.
 - Dock panel, toolbar entry and Plugins-menu entries, all detached on unload.
 
-[Unreleased]: https://github.com/Compute-Visibility-Institute/qgis-label-client/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/Compute-Visibility-Institute/qgis-label-client/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Compute-Visibility-Institute/qgis-label-client/compare/v0.0.2...v0.1.0
 [0.0.2]: https://github.com/Compute-Visibility-Institute/qgis-label-client/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/Compute-Visibility-Institute/qgis-label-client/releases/tag/v0.0.1

@@ -76,17 +76,24 @@ Check the ZIP contains every expected Python module, exactly one top-level
 private keys, local paths or Python caches. Local artifacts retain the empty OAuth
 placeholder and are for packaging verification; the workflow builds the published ZIP.
 
+## Cutover release gate for 0.1.0
+
+The source default points at the new custom API domain. Publish only after the operator
+has verified the new API, web setup and authentication on that domain. Packaging and
+unit tests cannot establish that production is ready. Existing users need the README's
+profile/project migration steps; installing the update alone does not move saved URLs.
+
 ## Cutting it
 
 ```sh
-git tag -a v0.0.2 -m "v0.0.2 — what changed"
-git push origin v0.0.2
+git tag -a v0.1.0 -m "v0.1.0 — what changed"
+git push origin v0.1.0
 ```
 
 The push triggers `release.yml`. It can also be re-run without a new tag:
 
 ```sh
-gh workflow run release.yml --ref v0.0.2 -f tag=v0.0.2
+gh workflow run release.yml --ref v0.1.0 -f tag=v0.1.0
 ```
 
 That re-run path exists because of the failures below: once a tag is pushed, fixing a
@@ -99,7 +106,7 @@ dispatch ref. Running it from `main` could package later changes under an older 
 ## Verify, because green is not the same as working
 
 ```sh
-gh release view v0.0.2 --json assets --jq '.assets[].name'
+gh release view v0.1.0 --json assets --jq '.assets[].name'
 ```
 
 Both `plugins.xml` and the ZIP must be present. A release with only one is a failure that
@@ -109,11 +116,11 @@ Then confirm the secret actually landed — this is the check that separates an 
 plugin from one that fails after consent:
 
 ```sh
-gh release download v0.0.2 --pattern '*.zip' --dir /tmp/cvi-release-verification
+gh release download v0.1.0 --pattern '*.zip' --dir /tmp/cvi-release-verification
 python - <<'PY'
 import ast
 import zipfile
-with zipfile.ZipFile('/tmp/cvi-release-verification/qgis_label_client.0.0.2.zip') as archive:
+with zipfile.ZipFile('/tmp/cvi-release-verification/qgis_label_client.0.1.0.zip') as archive:
     tree = ast.parse(archive.read('qgis_label_client/core/oauth.py'))
     values = [node.value.value for node in tree.body
               if isinstance(node, ast.Assign)

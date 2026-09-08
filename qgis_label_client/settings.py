@@ -2,10 +2,9 @@
 
 WHAT IS AND IS NOT ALLOWED IN HERE
 
-This repository is public. There are no deployment hostnames in it, so every backend URL
-is a user setting whose default is empty and whose *placeholder* -- the greyed-out hint in
-the field -- is an obviously fake example. An empty default is not laziness: a real
-default would be a hostname committed to a public repo.
+The reference deployment's public API URL is the default. An explicitly saved backend
+URL always takes precedence, including one saved by an earlier release. Upgrades do not
+rewrite user settings or the data sources stored in QGIS projects.
 
 No credential is stored here either. The only auth-related values are ``authcfg`` ids --
 seven-character references to entries in ``qgis-auth.db``, one per history track. The
@@ -33,19 +32,9 @@ SETTINGS_GROUP = "cvi-label-client"
 PLACEHOLDER_API_URL = "https://api.example.org/oapif"
 
 DEFAULTS: dict[str, Any] = {
-    # Landing page of the `api` Cloud Run service's OGC API - Features endpoint.
-    #
-    # PROVISIONAL, and deliberately so. This is the generated run.app hostname, which is
-    # stable for the life of the service but is not the address this deployment intends
-    # to keep: a custom domain is already delegated in Terraform and waiting on NS records
-    # at the registrar. When that lands, this default changes and every analyst who never
-    # touched the field follows automatically -- which is the reason to have a default at
-    # all rather than making each of them paste it.
-    #
-    # An analyst who HAS edited the field keeps their value: QgsSettings only falls back
-    # to this when the key is absent. So changing it later cannot silently repoint
-    # somebody who deliberately aimed at a different deployment.
-    "api_base_url": "https://api-xzuhhhdboa-zf.a.run.app",
+    # The reference deployment's public OGC API - Features landing page.
+    # Saved values take precedence; existing profiles must opt into a backend move.
+    "api_base_url": "https://api.labeling-platform.ops.computegov.com",
     # Google's client secret for the DESKTOP OAuth client in core.oauth.CLIENT_ID.
     #
     # NOT A SECRET, AND STILL NOT HARDCODED. Google documents an installed app's secret

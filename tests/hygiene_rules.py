@@ -55,6 +55,10 @@ FORBIDDEN_STRINGS = (
     "computegov",
 )
 
+#: The owner-approved public endpoint, permitted only as the settings default literal.
+#: Other deployment URLs and internal identifiers remain covered by the deny list.
+APPROVED_PUBLIC_API_URL = "https://api.labeling-platform.ops.computegov.com"
+
 #: The one file exempt from the string scan: this one.
 SELF = "hygiene_rules.py"
 

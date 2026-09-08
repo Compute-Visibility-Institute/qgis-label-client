@@ -10,32 +10,17 @@ from qgis_label_client.core.asof import AsOfMechanism
 from qgis_label_client.settings import DEFAULTS, PLACEHOLDER_API_URL, PluginSettings
 
 
-def test_the_backend_url_default_is_the_provisional_service_hostname():
-    """The default used to be empty, on the grounds that this repository is public and a
-    real default would put a deployment hostname in it. That reasoning was sound and the
-    trade has been made deliberately the other way, because the cost fell on the wrong
-    people: every analyst pasting a URL they cannot verify, forever, to withhold a name
-    that discloses very little.
+def test_the_backend_url_default_is_the_approved_public_api():
+    from hygiene_rules import APPROVED_PUBLIC_API_URL
 
-    WHAT IT DISCLOSES, stated so the next reader can re-judge it: that an API answers at
-    this address. Not who runs it -- the run.app name is generated and opaque, and the
-    organisation's own domain remains banned outright by the repo-hygiene deny list.
-    Reaching the service at all still requires a Google identity in the deployment's
-    domain (Cloud Run IAM), and being admitted still requires a row in `principal`.
+    assert DEFAULTS["api_base_url"] == APPROVED_PUBLIC_API_URL
 
-    So the guard that matters is unchanged; the one relaxed here was defence in depth
-    against a name. If a future deployment disagrees, the field is still editable and an
-    analyst's own value always wins over this default.
-    """
-    from hygiene_rules import FORBIDDEN_STRINGS
 
-    default = DEFAULTS["api_base_url"]
-    assert default.startswith("https://")
-    # Checked against the deny list rather than by restating a banned literal -- which is
-    # what this test did on its first attempt, and the hygiene scan duly failed it.
-    assert not any(needle.lower() in default.lower() for needle in FORBIDDEN_STRINGS), (
-        "the organisation's domain stays out of a public repository"
-    )
+def test_a_saved_backend_keeps_precedence_over_the_new_default():
+    settings = PluginSettings()
+    saved = "https://previous.example.org"
+    settings.set("api_base_url", saved)
+    assert PluginSettings().api_base_url == saved
 
 
 def test_the_placeholder_uses_a_reserved_example_domain():

@@ -55,8 +55,8 @@ and use **Install from ZIP**. No auto-updates this way.
 Open the **CVI Label Client** panel from the toolbar, then:
 
 1. **API URL** — the landing page of your deployment's OGC API - Features endpoint.
-   There is no default and there never will be one: this repository is public, so a real
-   hostname cannot live in it. The greyed-out hint is a reserved example domain.
+   New profiles default to the reference deployment's public API. A saved URL takes
+   precedence; use the API URL shown on your deployment's setup page for another backend.
 2. **Sign in with Google** — opens your browser. Pick your work account, approve the
    consent screen, close the tab. The resulting token goes straight into `QgsAuthManager`
    (`qgis-auth.db`, encrypted) and the plugin keeps only the seven-character reference.
@@ -73,6 +73,31 @@ Open the **CVI Label Client** panel from the toolbar, then:
 Nothing is stored anywhere except `QgsSettings` (URLs, page size, as-of state, the
 selected track, the signed-in address and the token's expiry instant — none of them a
 secret) and `qgis-auth.db` (the tokens). No credential is written to a project file.
+
+### Upgrading an existing profile after the deployment moves
+
+Version 0.1.0 changes the default API URL for new profiles. Existing profiles usually
+have a saved URL because signing in and connecting persist the field. Updating the
+plugin does not change that saved value or the sources in a saved QGIS project.
+
+After the operator confirms the new deployment is ready:
+
+1. Save or discard any outstanding edits while the old service is still available,
+   then save a backup copy of the QGIS project. Keep that copy for rollback.
+2. Copy the API URL from the new deployment's setup page into **API URL**, then click
+   **Connect**. Sign in again if prompted and select the same history track.
+3. Note the collections, each historical view's transaction-time instant, valid-time
+   settings, and any custom layer styling. Remove the old remote label/history/extent
+   layers from this project, keeping your local source layers. **Connect** alone does
+   not change existing layer sources, and already-loaded collections are skipped.
+4. Load the same checked collections, restore any historical views with their original
+   instants, and reapply your saved custom styling. Refresh imagery URLs.
+5. Check the layer sources show the new API, the intended track and time views are
+   selected, and your access permissions match expectations. Save the migrated project
+   separately before continuing work.
+
+An explicitly configured alternate backend stays unchanged. The plugin does not infer
+that two different hosts represent the same deployment.
 
 ### Staying signed in
 
@@ -627,8 +652,8 @@ There are **no imagery fixtures and there never will be**, and no test touches t
 
 ```bash
 # Update metadata.txt, __init__.__version__, and CHANGELOG.md, then commit and test.
-git tag -a v0.0.2 -m "v0.0.2 — native QGIS workflow and reliable sessions"
-git push origin v0.0.2
+git tag -a v0.1.0 -m "v0.1.0 — custom API domain"
+git push origin v0.1.0
 ```
 
 The release workflow verifies the tag matches `metadata.txt` (a mismatch means the plugin

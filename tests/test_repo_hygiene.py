@@ -7,7 +7,7 @@ or incidents rather than in bugs:
 * **No licensed imagery.** The imagery is Maxar Limited Rights Data. "Just add a small
   sample raster for the tests" is the reflex that breaks this, so the test forbids the
   file extensions rather than trusting the reflex.
-* **No deployment hostnames.** Backend URLs are user settings with placeholder defaults.
+* **No internal deployment hostnames.** One approved public API default is allowed.
 
 The remaining checks enforce the dual-Qt5/Qt6 rules and the "use the QGIS network stack"
 rule, both of which are cheap to keep and expensive to retrofit.
@@ -23,6 +23,7 @@ import re
 
 import pytest
 from hygiene_rules import (
+    APPROVED_PUBLIC_API_URL,
     DOMAIN_VOCABULARY,
     FORBIDDEN_STRINGS,
     FORBIDDEN_SUFFIXES,
@@ -66,6 +67,8 @@ def test_no_credentials_or_deployment_hostnames_anywhere(repo_root):
             text = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue
+        if path.relative_to(repo_root).as_posix() == "qgis_label_client/settings.py":
+            text = text.replace(f'    "api_base_url": "{APPROVED_PUBLIC_API_URL}",', "", 1)
         lowered = text.lower()
         offenders += [
             f"{path.relative_to(repo_root)}: {needle!r}"
