@@ -45,6 +45,7 @@ from . import publish as publish_tools
 from .access import LayerAccess
 from .core import collections as collection_groups
 from .core import oauth, recorded, routing
+from .core.activity import ActivityRegistry, ActivityState
 from .core.asof import AsOfMechanism, describe
 from .core.collections import Collection
 from .core.errors import LabelClientError, MixedGeometryError
@@ -105,7 +106,8 @@ class LabelClientPlugin:
     def __init__(self, iface) -> None:
         self.iface = iface
         self.settings = PluginSettings()
-        self.tasks = TaskRunner()
+        self.activities = ActivityRegistry(self._sync_activity)
+        self.tasks = TaskRunner(self.activities)
         self.teardown = Teardown()
 
         self.dock: LabelClientDock | None = None
@@ -244,6 +246,7 @@ class LabelClientPlugin:
         # Tasks first: a request that completes after the dock is gone would call into a
         # destroyed widget, which is a crash rather than a warning.
         self.tasks.shutdown()
+        self.activities.clear()
         self._advance_session()
         self._layer_access.apply(layer_tools.plugin_layers(), None)
         # Not on the teardown registry, because neither of these is an attachment to QGIS:
@@ -350,6 +353,12 @@ class LabelClientPlugin:
         else:
             self.iface.messageBar().pushMessage("CVI Label Client", text, level, duration)
 
+    def _sync_activity(self, state: ActivityState) -> None:
+        if self.dock is not None:
+            self.dock.set_busy(state.busy)
+            if state.progress is not None:
+                self.dock.set_progress(state.progress)
+
     def _report(self, text: str) -> None:
         """Say a failure out loud, without trying to repair it.
 
@@ -362,7 +371,6 @@ class LabelClientPlugin:
         summary = text if len(text) <= 240 else text[:237] + "…"
         self._message(summary, Qgis.MessageLevel.Critical, text if summary != text else "")
         if self.dock is not None:
-            self.dock.set_busy(False)
             self.dock.set_status(summary)
 
     def _fail(self, text: str) -> None:
@@ -488,7 +496,9 @@ class LabelClientPlugin:
             self._access_context = context
             self._apply_access()
 
-        self.tasks.run("Check account access", work, done, lambda message: log_warning(message))
+        self.tasks.run(
+            "Check account access", work, done, lambda message: log_warning(message), busy=False
+        )
 
     @staticmethod
     def _fetch_access(url, authcfg, feedback):
@@ -1196,7 +1206,6 @@ class LabelClientPlugin:
         tracks_path = str(self.settings.get("tracks_path"))
         track = self._track_name()
 
-        self.dock.set_busy(True)
         self.dock.set_status("Connecting…")
         context = self._permission_context()
 
@@ -1248,7 +1257,6 @@ class LabelClientPlugin:
         self.dock.set_collections(collection_groups.group_by_mode(self.collections), checked=loaded)
         self.dock.set_registry(self.registry)
         self.dock.set_connected(True)
-        self.dock.set_busy(False)
         self._refresh_track_banner()
         self._refresh_recorded_bounds()
         track = self.current_track()
@@ -1307,7 +1315,7 @@ class LabelClientPlugin:
         track = self.current_track()
 
         added = 0
-        self.dock.set_busy(True)
+        activity = self.activities.begin()
         try:
             for collection_id in collection_ids:
                 if collection_id in existing:
@@ -1331,7 +1339,7 @@ class LabelClientPlugin:
                 added += 1
                 self._warn_on_track_mismatch(layer, track)
         finally:
-            self.dock.set_busy(False)
+            activity.close()
 
         self._apply_access()
         self._refresh_track_banner()
@@ -1476,7 +1484,7 @@ class LabelClientPlugin:
         )
         name = recorded.layer_name(moment, recorded.base_name(title, collection_id))
 
-        self.dock.set_busy(True)
+        activity = self.activities.begin()
         try:
             layer = layer_tools.create_layer(
                 self.settings, collection_id, name, self.registry, track, recorded_at=moment
@@ -1493,7 +1501,7 @@ class LabelClientPlugin:
             self._fail(str(exc))
             return
         finally:
-            self.dock.set_busy(False)
+            activity.close()
 
         layer_tools.apply_registry(layer, self.registry, historical=True)
         QgsProject.instance().addMapLayer(layer)
@@ -1561,7 +1569,6 @@ class LabelClientPlugin:
         # track is sent for the edge's audit line, not to scope anything.
         track = self._track_name()
         if self.dock is not None:
-            self.dock.set_busy(True)
             self.dock.set_imagery_status("Requesting signed URLs…")
 
         def work(feedback: QgsFeedback):
@@ -1574,7 +1581,6 @@ class LabelClientPlugin:
         _, unmatched, applied = imagery.refresh_sources(assets)
         if self.dock is None:
             return
-        self.dock.set_busy(False)
         expiry = f" Valid until {expires_at.isoformat()}." if expires_at else ""
         note = (
             f" {len(unmatched)} raster layer(s) matched nothing - see the log." if unmatched else ""
@@ -1739,7 +1745,6 @@ class LabelClientPlugin:
     def _on_history(self, label_id: str, entries, track: str = "") -> None:
         if self.dock is None:
             return
-        self.dock.set_busy(False)
         if not entries:
             # Naming the track matters most on the empty answer. label_history is scoped to
             # one track by row-level security, so "no history" from the wrong track and
@@ -1958,7 +1963,6 @@ class LabelClientPlugin:
 
         self.publishing = True
         self.publish_action.setEnabled(False)
-        self.dock.set_busy(True)
         destinations = ", ".join(plan.collections()) or routes.untyped
         self.dock.set_publish_status(
             f"Publishing {plan.total_features()} feature(s) to {destinations} "
@@ -1973,7 +1977,7 @@ class LabelClientPlugin:
             self._end_publish()
             self._fail(message)
 
-        task = self.tasks.run(
+        self.tasks.run(
             f"Publish local layers to {track.name}",
             work,
             lambda report: self._on_published(selected, routes.untyped, report, track.name),
@@ -1982,9 +1986,6 @@ class LabelClientPlugin:
             # server, and the user needs the summary saying which part.
             deliver_when_cancelled=True,
         )
-        # QgsTask emits progress to the dock's QObject slot on the main thread. Qt
-        # disconnects it automatically when unload deletes the dock.
-        task.progressChanged.connect(self.dock.set_progress)
 
     def _end_publish(self) -> None:
         self.publishing = False
@@ -2024,7 +2025,6 @@ class LabelClientPlugin:
         self._end_publish()
         if self.dock is None:
             return
-        self.dock.set_busy(False)
         # Stamped on the main thread, after the fact, and after a partial run too: "some
         # of this is already up there" is exactly what a cancelled run leaves behind.
         # The track is passed explicitly rather than read from the panel: by now the

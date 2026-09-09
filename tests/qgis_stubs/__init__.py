@@ -244,6 +244,7 @@ class QgsFeedback(Stub):
 class QgsTask(Stub):
     """Enough of QgsTask to exercise the runner's reference-holding and shutdown."""
 
+    progressChanged = pyqtSignal(float)
     taskCompleted = pyqtSignal()
     taskTerminated = pyqtSignal()
 

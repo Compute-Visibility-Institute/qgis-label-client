@@ -25,6 +25,7 @@ from typing import Any
 
 from qgis.core import QgsApplication, QgsFeedback, QgsTask
 
+from .core.activity import ActivityRegistry
 from .log import log, log_error
 
 #: Work runs on a thread and receives only a cancellation handle.
@@ -52,8 +53,10 @@ class FunctionTask(QgsTask):
         on_success: SuccessCallable | None = None,
         on_error: ErrorCallable | None = None,
         deliver_when_cancelled: bool = False,
+        on_finished: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(description, QgsTask.Flag.CanCancel)
+        self._on_finished = on_finished
         self._work = work
         self._on_success = on_success
         self._on_error = on_error
@@ -95,29 +98,40 @@ class FunctionTask(QgsTask):
     # --- main thread -----------------------------------------------------------
 
     def finished(self, result: bool) -> None:
-        # ``detach()`` -- not this guard -- is what makes the unload path safe, so opting
-        # in here cannot resurrect a callback into a destroyed widget.
-        if self.isCanceled() and not self._deliver_when_cancelled:
-            return
-        if result:
-            if self._on_success is not None:
-                self._on_success(self._result)
-            return
-        if self._traceback:
-            log_error(f"{self.description()} failed\n{self._traceback}")
-        if self._on_error is not None:
-            self._on_error(self._message or f"{self.description()} failed.")
+        try:
+            # ``detach()`` -- not this guard -- is what makes the unload path safe, so opting
+            # in here cannot resurrect a callback into a destroyed widget.
+            if self.isCanceled() and not self._deliver_when_cancelled:
+                return
+            if result:
+                if self._on_success is not None:
+                    self._on_success(self._result)
+                return
+            if self._traceback:
+                log_error(f"{self.description()} failed\n{self._traceback}")
+            if self._on_error is not None:
+                self._on_error(self._message or f"{self.description()} failed.")
+
+        finally:
+            self._finish_activity()
+
+    def _finish_activity(self) -> None:
+        finished, self._on_finished = self._on_finished, None
+        if finished is not None:
+            finished()
 
     def detach(self) -> None:
         """Drop the callbacks so a task in flight cannot call into a destroyed widget."""
         self._on_success = None
         self._on_error = None
+        self._finish_activity()
 
 
 class TaskRunner:
     """Owns the strong references that keep tasks alive, and cancels them on unload."""
 
-    def __init__(self) -> None:
+    def __init__(self, activities: ActivityRegistry | None = None) -> None:
+        self._activities = activities
         self._tasks: list[FunctionTask] = []
 
     def run(
@@ -127,10 +141,25 @@ class TaskRunner:
         on_success: SuccessCallable | None = None,
         on_error: ErrorCallable | None = None,
         deliver_when_cancelled: bool = False,
+        *,
+        busy: bool = True,
     ) -> FunctionTask:
-        task = FunctionTask(description, work, on_success, on_error, deliver_when_cancelled)
+        activity = self._activities.begin() if self._activities is not None and busy else None
+        task = FunctionTask(
+            description,
+            work,
+            on_success,
+            on_error,
+            deliver_when_cancelled,
+            on_finished=activity.close if activity is not None else None,
+        )
+        if activity is not None:
+            # Connected on the main thread, like the completion callbacks below.
+            task.progressChanged.connect(activity.progress)
 
         def _release() -> None:
+            # Queued cancellation can terminate without delivering a result callback.
+            task._finish_activity()
             # Runs on the main thread via the task's own signals, so mutating the list
             # here needs no lock.
             if task in self._tasks:
@@ -142,7 +171,12 @@ class TaskRunner:
         # Append BEFORE handing the task to the manager: trap 2 is a race, and the window
         # where the only reference is the local variable is exactly where it bites.
         self._tasks.append(task)
-        QgsApplication.taskManager().addTask(task)
+        try:
+            QgsApplication.taskManager().addTask(task)
+        except Exception:
+            self._tasks.remove(task)
+            task.detach()
+            raise
         return task
 
     def shutdown(self) -> None:
