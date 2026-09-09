@@ -31,10 +31,31 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve and validate the release tag
+        id: tag
+        env:
+          REQUESTED_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          if [[ ! "$REQUESTED_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Expected a version tag such as v0.1.0 or v0.2.0-beta1."
+            exit 1
+          fi
+          echo "tag=$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${REQUESTED_TAG#v}" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
+          # Dispatch may run the workflow from main, but the artifact must come
+          # from the requested immutable tag, never the dispatch branch.
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
           # qgis-plugin-ci reads the changelog and tag history.
           fetch-depth: 0
+
+      - name: Verify the checkout matches the release tag
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
 
       - uses: actions/setup-python@v5
         with:
@@ -81,14 +102,6 @@ jobs:
               'CLIENT_SECRET = "%s"' % os.environ["OAUTH_CLIENT_SECRET"], 1))
           PY
           echo "substituted (value not echoed)"
-
-      - name: Resolve the tag
-        id: tag
-        run: |
-          TAG="${{ github.event.inputs.tag }}"
-          if [ -z "$TAG" ]; then TAG="${GITHUB_REF_NAME}"; fi
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Refuse a tag that does not match metadata.txt
         # Otherwise the plugin manager's upgrade detection, which keys on version=,

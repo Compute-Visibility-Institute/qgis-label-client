@@ -93,15 +93,18 @@ git push origin v0.1.0
 The push triggers `release.yml`. It can also be re-run without a new tag:
 
 ```sh
-gh workflow run release.yml --ref v0.1.0 -f tag=v0.1.0
+gh workflow run release.yml --ref main -f tag=v0.1.0
 ```
 
 That re-run path exists because of the failures below: once a tag is pushed, fixing a
 broken release means re-running against the existing tag, not burning a new version
 number.
 
-The dispatch ref must name the same tag as the input: the workflow checks out the
-dispatch ref. Running it from `main` could package later changes under an older tag.
+The dispatch ref selects the workflow version; the `tag` input selects the code
+being released. The workflow explicitly checks out that tag and verifies its commit
+before running tests or packaging, so a dispatch from `main` cannot package later
+branch changes under an older version. Running the workflow from an older tag uses
+the older workflow definition, which may lack this check; use `--ref main` for retries.
 
 ## Verify, because green is not the same as working
 
