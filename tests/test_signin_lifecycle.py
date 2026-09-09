@@ -83,7 +83,7 @@ def test_read_retries_once_with_the_same_captured_work_after_renewal(plugin):
     plugin._run_read_task("Read history", work, results.append)
     first = plugin.tasks._tasks[-1]
     first.finished(first.run())
-    assert results == [] and plugin._refreshing
+    assert results == [] and plugin._session.refreshing
     plugin._on_refreshed(_credential(int(time.time()) + 2 * HOUR))
     retry = plugin.tasks._tasks[-1]
     retry.finished(retry.run())
@@ -105,7 +105,7 @@ def test_second_read_401_reports_without_another_refresh(plugin, fake_iface):
     retry = plugin.tasks._tasks[-1]
     retry.finished(retry.run())
     assert _task_names(plugin).count("Renew Google sign-in") == 1
-    assert not plugin._refreshing and not plugin._deferred
+    assert not plugin._session.refreshing and not plugin._session.pending_count
     assert "still rejected" in _texts(fake_iface)
 
 
@@ -117,7 +117,7 @@ def test_signed_out_session_drops_parked_reads_and_late_renewal(plugin):
     plugin.sign_out()
     renewal._on_success(_credential(int(time.time()) + HOUR))
     assert plugin.settings.oauth_expires_at == 0
-    assert plugin._deferred == []
+    assert plugin._session.pending_count == 0
 
 
 def test_signout_ignores_a_late_first_signin_exchange(plugin):
@@ -135,11 +135,11 @@ def test_backend_change_during_renewal_releases_old_state(plugin):
     renewal = plugin.tasks._tasks[-1]
     plugin.dock.api_url = lambda: "https://new.example.org"
     plugin._persist_url()
-    assert not plugin._refreshing and not plugin._deferred
+    assert not plugin._session.refreshing and not plugin._session.pending_count
     renewal._on_success(_credential(int(time.time()) + 2 * HOUR))
-    assert not plugin._refreshing
+    assert not plugin._session.refreshing
     assert plugin._refresh_credential()
-    assert plugin._refreshing
+    assert plugin._session.refreshing
 
 
 def test_new_signin_during_renewal_cannot_leave_refresh_flag_stuck(plugin):
@@ -148,7 +148,7 @@ def test_new_signin_during_renewal_cannot_leave_refresh_flag_stuck(plugin):
     renewal = plugin.tasks._tasks[-1]
     plugin._store_credential(_credential(int(time.time()) + 3 * HOUR))
     renewal._on_success(_credential(int(time.time()) + 2 * HOUR))
-    assert not plugin._refreshing and not plugin._deferred
+    assert not plugin._session.refreshing and not plugin._session.pending_count
     assert plugin.settings.oauth_expires_at > int(time.time()) + 2 * HOUR
 
 
@@ -342,7 +342,7 @@ def test_only_a_401_provokes_a_repair(plugin):
     auth.store_refresh_token("r3fr3sh")
     plugin.settings.set_oauth_session("analyst@example.org", int(time.time()) + HOUR)
     plugin._fail("HTTP 500 from https://api.example.org/oapif")
-    assert plugin._refreshing is False
+    assert plugin._session.refreshing is False
 
 
 def test_a_401_without_a_google_session_is_not_dressed_up_as_a_renewal(plugin, fake_iface):
@@ -359,12 +359,12 @@ def test_a_dead_refresh_token_ends_the_session_rather_than_looping(plugin, fake_
     in testing mode, so this is a state a real deployment reaches on a schedule.
     """
     plugin.settings.set_oauth_session("analyst@example.org", int(time.time()) - 10)
-    plugin._deferred.append(lambda: pytest.fail("a dead session must not resume anything"))
+    plugin._session.defer(lambda: pytest.fail("a dead session must not resume anything"))
 
     plugin._on_refresh_failed(f"{oauth.SignInExpiredError.__name__}: sign in again")
 
-    assert plugin._deferred == []
-    assert plugin._refreshing is False
+    assert plugin._session.pending_count == 0
+    assert plugin._session.refreshing is False
 
 
 # --- signing out --------------------------------------------------------------
@@ -436,5 +436,62 @@ def test_a_renewal_refused_with_401_does_not_provoke_another_renewal(plugin):
 
     plugin._on_refresh_failed("BackendError: HTTP 401 from https://oauth2.googleapis.com/token")
 
-    assert plugin._refreshing is False
+    assert plugin._session.refreshing is False
     assert "Renew Google sign-in" not in _task_names(plugin)
+
+
+def test_deferred_submission_failure_reports_and_resumes_later_action(plugin, fake_iface):
+    calls = []
+
+    def failed_action():
+        raise RuntimeError("task submission failed")
+
+    plugin._session.defer(failed_action)
+    plugin._session.defer(lambda: calls.append("next action"))
+    plugin._run_deferred()
+    assert calls == ["next action"]
+    assert "task submission failed" in _texts(fake_iface)
+    assert not plugin._session.resuming
+
+
+def test_signout_while_resuming_cancels_remaining_requests(plugin):
+    calls = []
+    plugin._session.defer(plugin.sign_out)
+    plugin._session.defer(lambda: calls.append("request after signout"))
+    plugin._run_deferred()
+    assert calls == []
+
+
+def test_failed_renewal_submission_releases_flag_and_waiting_actions(
+    plugin, fake_iface, monkeypatch
+):
+    auth.store_refresh_token("refresh")
+    calls = []
+    run = plugin.tasks.run
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("task manager unavailable")
+
+    monkeypatch.setattr(plugin.tasks, "run", unavailable)
+    plugin._refresh_credential(resume=lambda: calls.append("abandoned request"))
+    assert not plugin._session.refreshing and plugin._session.pending_count == 0
+    assert "task manager unavailable" in _texts(fake_iface)
+    assert calls == []
+    monkeypatch.setattr(plugin.tasks, "run", run)
+    plugin._refresh_credential()
+    assert plugin._session.refreshing
+
+
+def test_access_task_submission_failure_after_renewal_does_not_drop_reads(
+    plugin, fake_iface, monkeypatch
+):
+    calls = []
+    plugin._session.defer(lambda: calls.append("read"))
+
+    def unavailable():
+        raise RuntimeError("access task unavailable")
+
+    monkeypatch.setattr(plugin, "_refresh_access", unavailable)
+    plugin._on_refreshed(_credential(int(time.time()) + HOUR))
+    assert calls == ["read"]
+    assert "access task unavailable" in _texts(fake_iface)

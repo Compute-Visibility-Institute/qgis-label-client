@@ -421,6 +421,23 @@ def apply_canaries(
     return True
 
 
+def validate_repoint(layer, settings, registry, track) -> None:
+    """Check a detached provider and its historical pin before changing project layers."""
+    recorded_at = recorded_at_of(layer)
+    uri = build_layer_uri(
+        settings,
+        collection_of(layer),
+        registry,
+        track,
+        track_filter=track_filter_for(layer, track, registry),
+        recorded_at=recorded_at,
+    )
+    candidate = QgsVectorLayer(uri, layer.name(), OAPIF_PROVIDER)
+    if not candidate.isValid():
+        raise BackendError(f"Could not open the proposed view for {layer.name()!r}.")
+    verify_recorded_echo(candidate, recorded_at, registry)
+
+
 def repoint_for(
     layer: QgsVectorLayer,
     settings: PluginSettings,
@@ -455,8 +472,7 @@ def repoint_for(
             recorded_at=recorded_at,
         ),
     )
-    if track is not None:
-        layer.setCustomProperty(TRACK_PROPERTY, track.name)
+    layer.setCustomProperty(TRACK_PROPERTY, track.name if track is not None else "")
     if recorded_at:
         # setDataSource rebuilt the provider, and QGIS recomputes a layer's read-only state
         # from the new provider's capabilities when it does. Without this, a track switch
@@ -783,14 +799,18 @@ def repoint_layer(layer: QgsVectorLayer, uri: str) -> None:
     agnostic way to hold on to all of it.
     """
     document = QDomDocument()
-    layer.exportNamedStyle(document)
+    if layer.exportNamedStyle(document):
+        raise BackendError(f"Could not save the style of {layer.name()!r} before re-pointing.")
 
     options = QgsDataProvider.ProviderOptions()
     layer.setDataSource(uri, layer.name(), OAPIF_PROVIDER, options, False)
 
-    restored, message = layer.importNamedStyle(document)
+    if not layer.isValid():
+        raise BackendError(f"Could not open the new provider for {layer.name()!r}.")
+
+    restored, _message = layer.importNamedStyle(document)
     if not restored:
-        log(f"Could not restore style on {layer.name()!r} after re-pointing: {message}")
+        raise BackendError(f"Could not restore style on {layer.name()!r} after re-pointing.")
     layer.triggerRepaint()
 
 

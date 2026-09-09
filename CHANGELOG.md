@@ -6,6 +6,21 @@ most recent entries into `metadata.txt` at release time.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-09
+
+### Fixed
+
+- Validate replacement providers before changing track or valid time, and save the
+  selected view only after every layer succeeds. Restore earlier sources, styles and
+  read-only state when a change fails, allowing the same selection to be retried.
+- Preserve unsaved edits and each historical layer's transaction-time pin during view
+  changes. Disable layers whose previous provider cannot be restored and identify
+  incomplete recovery explicitly so affected layers can be reloaded.
+- Coordinate session refresh and deferred reads through one lifecycle. A failed queued
+  action no longer drops later actions; cancelling renewal stops the remaining queue.
+  Reject old-session completions, retain stable authentication references during renewal,
+  and never replay writes automatically.
+
 ## [0.1.1] - 2026-09-09
 
 ### Fixed
@@ -380,7 +395,8 @@ most recent entries into `metadata.txt` at release time.
   that flags labels sitting outside any exhaustive `labeled_extent` for their class.
 - Dock panel, toolbar entry and Plugins-menu entries, all detached on unload.
 
-[Unreleased]: https://github.com/Compute-Visibility-Institute/qgis-label-client/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Compute-Visibility-Institute/qgis-label-client/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/Compute-Visibility-Institute/qgis-label-client/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Compute-Visibility-Institute/qgis-label-client/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Compute-Visibility-Institute/qgis-label-client/compare/v0.0.2...v0.1.0
 [0.0.2]: https://github.com/Compute-Visibility-Institute/qgis-label-client/compare/v0.0.1...v0.0.2

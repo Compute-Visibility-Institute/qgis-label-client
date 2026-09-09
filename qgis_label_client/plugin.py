@@ -51,6 +51,7 @@ from .core.collections import Collection
 from .core.errors import LabelClientError, MixedGeometryError
 from .core.publish import PublishPlan, PublishReport
 from .core.registry import ClassRegistry
+from .core.session import SessionCoordinator
 from .core.teardown import Teardown
 from .core.tracks import Track
 from .core.tracks import resolve as resolve_track
@@ -60,6 +61,7 @@ from .log import log, log_error, log_warning
 from .publishdialog import PublishDialog, PublishReportDialog
 from .settings import PluginSettings
 from .tasks import TaskRunner
+from .transitions import TransitionError, transition
 from .validtime import register_functions, unregister_functions
 
 MENU_NAME = "&CVI Label Client"
@@ -120,7 +122,7 @@ class LabelClientPlugin:
         # the panel button both reach it, and two concurrent runs would double the data
         # with nothing able to tell afterwards which copy is which.
         self.publishing = False
-        self._session_generation = 0
+        self._session = SessionCoordinator()
         self._write_access: bool | None = None
         self._access_context = None
         self._layer_access = LayerAccess()
@@ -141,18 +143,6 @@ class LabelClientPlugin:
         # The browser sign-in in flight. Held because a QObject with no Python reference is
         # collected mid-flow, and the flow is exactly one event loop turn long.
         self.signin: oauth_flow.GoogleSignIn | None = None
-        self._refreshing = False
-        # Actions parked behind a renewal, resumed once it lands. A list rather than one
-        # slot because the panel and the menu can both fire while a renewal is in flight,
-        # and dropping the second one silently is "the button does nothing".
-        self._deferred: list[Callable[[], None]] = []
-        # Set while a deferred action is being replayed, so an action that re-checks
-        # freshness on the way in cannot defer itself a second time and loop.
-        self._resuming = False
-        # True when the renewal was provoked by a 401 rather than by the clock, which
-        # changes the message: a repaired credential does not un-fail the request that
-        # already failed, and the analyst has to reload the layer.
-        self._repairing = False
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -258,7 +248,7 @@ class LabelClientPlugin:
             self.refresh_timer.stop()
             self.refresh_timer = None
         self._abandon_sign_in()
-        self._deferred.clear()
+        self._session.cancel_pending()
         for failure in self.teardown.run():
             log_error(f"Teardown step {failure.label!r} failed: {failure.error}")
         self._access_edit_watches.clear()
@@ -267,7 +257,7 @@ class LabelClientPlugin:
         self.collections = []
         self.tracks = []
         self.publishing = False
-        self._refreshing = False
+        self._session.refreshing = False
         log("Plugin unloaded.")
 
     def _detach_dock(self) -> None:
@@ -379,20 +369,18 @@ class LabelClientPlugin:
 
     def _run_read_task(self, description, work, on_success) -> None:
         """Retry a captured GET task once after renewal, without reopening its UI."""
-        generation = self._session_generation
-        url = self.settings.api_base_url
-        identity = (self.settings.oauth_email, self.settings.authcfg_by_track)
+        context = self._session.capture_read(
+            self.settings.api_base_url,
+            self.settings.oauth_email,
+            self.settings.authcfg_by_track,
+        )
 
         def current():
-            configs = self.settings.authcfg_by_track
-            return (
-                self.dock is not None
-                and generation == self._session_generation
-                and url == self.settings.api_base_url
-                and identity[0] == self.settings.oauth_email
-                # Renewal may add configs for newly discovered tracks. Existing ids
-                # must remain stable, since those are what the captured worker uses.
-                and all(configs.get(track) == cfg for track, cfg in identity[1].items())
+            return self.dock is not None and self._session.allows_read(
+                context,
+                self.settings.api_base_url,
+                self.settings.oauth_email,
+                self.settings.authcfg_by_track,
             )
 
         def succeeded(result):
@@ -432,10 +420,7 @@ class LabelClientPlugin:
 
     def _advance_session(self):
         """Invalidate callbacks and the renewal state owned by the previous session."""
-        self._session_generation += 1
-        self._refreshing = False
-        self._repairing = False
-        self._deferred.clear()
+        self._session.advance()
 
     def _on_project_read(self, *_args):
         self._refresh_access()
@@ -478,7 +463,7 @@ class LabelClientPlugin:
 
     def _refresh_access(self):
         context = self._permission_context()
-        generation = self._session_generation
+        generation = self._session.generation
         self._write_access = None
         self._access_context = None
         self._apply_access()
@@ -490,7 +475,7 @@ class LabelClientPlugin:
             return self._fetch_access(url, authcfg, feedback)
 
         def done(writable):
-            if generation != self._session_generation or context != self._permission_context():
+            if generation != self._session.generation or context != self._permission_context():
                 return
             self._write_access = writable
             self._access_context = context
@@ -527,13 +512,13 @@ class LabelClientPlugin:
         """
         if "HTTP 401" not in text:
             return
-        if self._refreshing or self._repairing:
+        if self._session.refreshing or self._session.repairing:
             return
         if not self.settings.oauth_expires_at:
             # A hand-pasted token or no credential at all. There is nothing to renew, and
             # "renewing your sign-in" would be a lie on top of a failure.
             return
-        self._repairing = True
+        self._session.repairing = True
         log_warning("A request was refused with 401; renewing the Google sign-in.")
         self._refresh_credential(quiet=True)
 
@@ -630,12 +615,17 @@ class LabelClientPlugin:
             )
             return
 
-        self.settings.set("track", name)
-        track = self.current_track()
-        repointed = 0
-        for layer in layer_tools.plugin_layers():
-            layer_tools.repoint_for(layer, self.settings, self.registry, track)
-            repointed += 1
+        track = resolve_track(self.tracks, name)
+        if name and track is None:
+            self.dock.set_tracks(self.tracks, self.settings.track)
+            self._fail("That history track is unavailable. Connect again to refresh the list.")
+            return
+        targets = layer_tools.plugin_layers()
+        repointed = self._transition_layers(targets, {"track": name}, track)
+        if repointed is None:
+            self.dock.set_tracks(self.tracks, self.settings.track)
+            return
+        for layer in targets:
             self._warn_on_track_mismatch(layer, track)
 
         self._apply_access()
@@ -832,7 +822,7 @@ class LabelClientPlugin:
         listens on a socket and talks to Google is one with two reasons to change.
         """
         self._abandon_sign_in()
-        generation = self._session_generation
+        generation = self._session.generation
         if self.dock is not None:
             self.dock.set_auth_status("Completing sign-in…")
 
@@ -850,11 +840,11 @@ class LabelClientPlugin:
             return oauth.credential_from_token_response(payload, time.time())
 
         def signed_in(credential):
-            if generation == self._session_generation:
+            if generation == self._session.generation:
                 self._store_credential(credential)
 
         def failed(message):
-            if generation == self._session_generation:
+            if generation == self._session.generation:
                 self._on_sign_in_failed(message)
 
         self.tasks.run("Complete Google sign-in", work, signed_in, failed)
@@ -903,7 +893,7 @@ class LabelClientPlugin:
 
     def _on_sign_in_failed(self, message: str) -> None:
         self._abandon_sign_in()
-        self._deferred.clear()
+        self._session.cancel_pending()
         if message.startswith(oauth.SignInCancelledError.__name__):
             # Closing the consent tab is a decision, not a fault, and reporting it in red
             # trains people to ignore red.
@@ -929,10 +919,10 @@ class LabelClientPlugin:
         after it, which matters because a 401 from QGIS's own provider cannot be retried.
 
         Callers pass a bound call to themselves, so a renewal simply re-runs the action
-        the analyst asked for. :attr:`_resuming` stops that re-run from deferring itself
+        the analyst asked for. :attr:`SessionCoordinator.resuming` stops that re-run from deferring itself
         again; without it a renewal that somehow did not move the expiry would loop.
         """
-        if self._resuming or not self._credential_needs_refresh():
+        if self._session.resuming or not self._credential_needs_refresh():
             return False
         return self._refresh_credential(resume=resume)
 
@@ -947,19 +937,19 @@ class LabelClientPlugin:
         waiting behind the renewal, the same condition is a hard failure and says so.
         """
         if resume is not None:
-            self._deferred.append(resume)
-        if self._refreshing:
+            self._session.defer(resume)
+        if self._session.refreshing:
             return True
 
         def refuse(message: str) -> bool:
-            self._deferred.clear()
+            self._session.cancel_pending()
             if quiet:
                 log_warning(message)
                 if self.dock is not None:
                     self.dock.set_auth_status(message)
             else:
                 self._fail(message)
-            self._repairing = False
+            self._session.repairing = False
             return True
 
         try:
@@ -982,8 +972,8 @@ class LabelClientPlugin:
                 "it cannot be renewed silently. Click Sign in with Google."
             )
 
-        self._refreshing = True
-        generation = self._session_generation
+        self._session.refreshing = True
+        generation = self._session.generation
 
         def work(feedback: QgsFeedback) -> oauth.Credential:
             payload = network.post_form(
@@ -1001,14 +991,17 @@ class LabelClientPlugin:
             )
 
         def renewed(credential):
-            if generation == self._session_generation:
+            if generation == self._session.generation:
                 self._on_refreshed(credential)
 
         def failed(message):
-            if generation == self._session_generation:
+            if generation == self._session.generation:
                 self._on_refresh_failed(message)
 
-        self.tasks.run("Renew Google sign-in", work, renewed, failed)
+        try:
+            self.tasks.run("Renew Google sign-in", work, renewed, failed)
+        except Exception as exc:  # noqa: BLE001 - task submission can fail before a callback exists
+            failed(str(exc))
         return True
 
     def _on_refreshed(self, credential: oauth.Credential) -> None:
@@ -1021,7 +1014,7 @@ class LabelClientPlugin:
         clears QGIS's cached copy of it, so the provider's next request carries the new
         token.
         """
-        self._refreshing = False
+        self._session.end_refresh()
         try:
             stored = auth.store_id_token_for_tracks(
                 credential.id_token,
@@ -1034,8 +1027,8 @@ class LabelClientPlugin:
                 # session die at the first rotation, a week or a month later.
                 auth.store_refresh_token(credential.refresh_token)
         except LabelClientError as exc:
-            self._deferred.clear()
-            self._repairing = False
+            self._session.cancel_pending()
+            self._session.repairing = False
             self._fail(f"Could not store the renewed sign-in: {exc}")
             return
 
@@ -1046,10 +1039,13 @@ class LabelClientPlugin:
         self._refresh_auth_label()
         self._arm_refresh_timer()
         log("Renewed the Google sign-in.")
-        self._refresh_access()
+        try:
+            self._refresh_access()
+        except Exception as exc:  # noqa: BLE001 - a failed access task must not discard queued reads
+            self._report(f"Could not check account access: {exc}")
 
-        if self._repairing:
-            self._repairing = False
+        if self._session.repairing:
+            self._session.repairing = False
             # The honest gap, stated in words. QGIS's OAPIF provider made the request that
             # failed and this plugin is not in its path, so a fresh credential cannot
             # un-fail it. Saying "signed in again" and stopping there leaves the analyst
@@ -1062,9 +1058,7 @@ class LabelClientPlugin:
         self._run_deferred()
 
     def _on_refresh_failed(self, message: str) -> None:
-        self._refreshing = False
-        self._repairing = False
-        self._deferred.clear()
+        self._session.end_refresh(discard_pending=True)
         # SignInExpired means the refresh token is dead -- revoked, or expired because the
         # OAuth consent screen is still in testing mode. Retrying cannot fix it and saying
         # "the backend failed" sends the analyst to the wrong place entirely.
@@ -1082,13 +1076,9 @@ class LabelClientPlugin:
 
     def _run_deferred(self) -> None:
         """Replay the actions that were waiting on a fresh credential."""
-        pending, self._deferred = self._deferred, []
-        self._resuming = True
-        try:
-            for action in pending:
-                action()
-        finally:
-            self._resuming = False
+        self._session.resume(
+            lambda exc: self._report(f"Could not resume the requested action: {exc}")
+        )
 
     def _arm_refresh_timer(self) -> None:
         """Schedule the silent renewal for five minutes before the token dies.
@@ -1153,7 +1143,7 @@ class LabelClientPlugin:
         self._write_access = None
         self._access_context = None
         self._apply_access()
-        self._deferred.clear()
+        self._session.cancel_pending()
         self._arm_refresh_timer()
         self._refresh_auth_label()
         self._message(f"Signed out. {removed} credential(s) removed.")
@@ -1395,22 +1385,38 @@ class LabelClientPlugin:
             return
         as_of = self.dock.as_of()
         mechanism = AsOfMechanism.parse(self.dock.as_of_mechanism())
-        self.settings.set_as_of(as_of)
-        self.settings.set("as_of_mechanism", mechanism.value)
-
         track = self.current_track()
         targets = layer_tools.plugin_layers()
-        for layer in targets:
-            # Carries the track clause and the transaction-time instant through with it:
-            # repoint_layer rebuilds the provider, so an as-of change would otherwise
-            # silently drop the canary -- or turn a historical layer into a live one.
-            layer_tools.repoint_for(layer, self.settings, self.registry, track)
+        changed = self._transition_layers(
+            targets,
+            {
+                "as_of_enabled": as_of is not None,
+                "as_of_date": as_of.isoformat() if as_of else "",
+                "as_of_mechanism": mechanism.value,
+            },
+            track,
+        )
+        if changed is None:
+            self.dock.set_as_of(self.settings.as_of)
+            self.dock.set_as_of_mechanism(self.settings.as_of_mechanism.value)
+            return
 
         self._apply_access()
         summary = describe(as_of, mechanism)
         self.dock.set_status(f"{summary} - {len(targets)} layer(s) updated.")
         self._refresh_axes()
         log(summary)
+
+    def _transition_layers(self, targets, changes, track):
+        """One foreground activity owns the complete change, including rollback."""
+        activity = self.activities.begin()
+        try:
+            return transition(targets, self.settings, changes, self.registry, track)
+        except TransitionError as exc:
+            self._fail(str(exc))
+            return None
+        finally:
+            activity.close()
 
     # --------------------------------------------------- transaction time
 
