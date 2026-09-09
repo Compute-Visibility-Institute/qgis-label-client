@@ -6,6 +6,22 @@ most recent entries into `metadata.txt` at release time.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-09
+
+### Fixed
+
+- Give each operation ownership of its busy state and progress. Completing or failing
+  one operation no longer enables controls while another operation is still running.
+- Show indeterminate progress for overlapping work, then restore the remaining
+  operation's progress. Ignore late progress from completed or detached tasks.
+- Release activity on canceled reads, queued termination, callback failures and unload.
+  Background permission checks continue without blocking the panel.
+
+### Changed
+
+- Manual release retries explicitly package the requested tag, even when the workflow
+  is launched from the main branch.
+
 ## [0.1.0] - 2026-09-08
 
 ### Changed
@@ -364,7 +380,8 @@ most recent entries into `metadata.txt` at release time.
   that flags labels sitting outside any exhaustive `labeled_extent` for their class.
 - Dock panel, toolbar entry and Plugins-menu entries, all detached on unload.
 
-[Unreleased]: https://github.com/Compute-Visibility-Institute/qgis-label-client/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Compute-Visibility-Institute/qgis-label-client/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/Compute-Visibility-Institute/qgis-label-client/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Compute-Visibility-Institute/qgis-label-client/compare/v0.0.2...v0.1.0
 [0.0.2]: https://github.com/Compute-Visibility-Institute/qgis-label-client/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/Compute-Visibility-Institute/qgis-label-client/releases/tag/v0.0.1
