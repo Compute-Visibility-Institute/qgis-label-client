@@ -41,7 +41,7 @@ def _collection_group(layer, groups: Sequence[CollectionGroup]) -> CollectionGro
 
 
 def _find_group(root, metadata: CollectionGroup, context: str):
-    for group in root.findGroups():
+    for group in root.findGroups(True):
         if group.customProperty(GROUP_PROPERTY, "") != metadata.stem:
             continue
         nodes = group.findLayers()
@@ -101,6 +101,10 @@ def group_existing_layers(project, groups: Sequence[CollectionGroup]) -> None:
             continue
         index = root.children().index(node)
         group = _ensure_group(root, metadata, _context(layer), index)
+        if node.isVisible() and not group.isVisible():
+            # Adopting a visible root layer into a group the user disabled would hide
+            # existing map content. Leave that arrangement for the user to resolve.
+            continue
         clone = node.clone()
         clone.setCustomProperty(PLACED_PROPERTY, True)
         group.addChildNode(clone)

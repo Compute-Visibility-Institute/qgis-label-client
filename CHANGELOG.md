@@ -6,6 +6,13 @@ most recent entries into `metadata.txt` at release time.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-09-10
+
+### Fixed
+
+- Reuse label groups moved inside another folder, avoiding duplicate groups.
+- Keep visible layers visible when an existing label group has been hidden.
+
 ## [0.1.6] - 2026-09-10
 
 ### Changed
