@@ -367,7 +367,7 @@ def test_a_backend_this_cannot_read_and_nobody_answers_for_routes_nothing(monkey
 def _bulk_capability(*ids):
     from qgis_label_client.core.bulk import BulkCapability
 
-    return BulkCapability("v1/collections/{collectionId}/items:bulk", tuple(ids), 500, 1000000)
+    return BulkCapability("v1/collections/{collectionId}/bulk", tuple(ids), 500, 1000000)
 
 
 def test_bulk_destinations_replace_a_saved_registry_preference(fake_iface, monkeypatch):
