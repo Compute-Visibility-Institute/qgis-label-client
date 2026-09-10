@@ -49,6 +49,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from .bootstrapstyles import StyleResult
 from .fields import DEFAULT_FIELDS, CoreFields
 from .legacy import (
     ClassGuess,
@@ -1064,6 +1065,8 @@ class PublishReport:
     #: user needs the report of those far more than they need a traceback in the log.
     error: str = ""
     style_proposals: tuple[StyleProposal, ...] = ()
+    style_results: list[StyleResult] = field(default_factory=list)
+    style_error: str = ""
 
     def styles_json(self) -> str:
         return proposals_json(self.style_proposals)
@@ -1117,6 +1120,7 @@ class PublishReport:
             and not self.unverified
             and not self.cancelled
             and not self.error
+            and not self.style_error
         )
 
     @property
@@ -1131,6 +1135,8 @@ class PublishReport:
         return f" on track {self.track}" if self.track else ""
 
     def summary(self) -> str:
+        if self.style_error:
+            return f"No labels uploaded{self._where}: {self.style_error}"
         if self.error:
             return (
                 f"Stopped by an unexpected error after publishing {self.published} "
@@ -1173,12 +1179,19 @@ class PublishReport:
             lines.extend(
                 [
                     "",
-                    "Style proposals — captured during preview; no class styles were changed.",
-                    "These proposals remain available even if label publishing stopped.",
+                    "Bootstrap styles — class styles apply across all tracks.",
                 ]
             )
+            results = {result.class_id: result for result in self.style_results}
             for proposal in self.style_proposals:
-                lines.extend(proposal.detail_lines())
+                result = results.get(proposal.class_id)
+                if result is not None and proposal.status in ("proposed", "unchanged"):
+                    lines.append(f"{proposal.layer_name} → {result.describe()}")
+                    lines.append(proposal.capture.summary())
+                else:
+                    lines.extend(proposal.detail_lines())
+            if self.style_error:
+                lines.append(self.style_error)
         return lines
 
     def coverage_warning(self) -> str:

@@ -1326,3 +1326,153 @@ def test_every_batch_names_the_track_it_is_for(recorder):
     publish_tools.publish(_bulk_request(_prepared(_features(9)), chunk_size=4))
 
     assert set(recorder.tracks) == {TRACK.name}
+
+
+# Bootstrap initialization is separate from label uploads, and completes first.
+def _styled(prepared, color="#95ff00"):
+    from dataclasses import replace
+
+    from qgis_label_client.core.stylecapture import CaptureResult
+
+    prepared.plan = replace(
+        prepared.plan,
+        source=replace(
+            prepared.plan.source,
+            style_capture=CaptureResult(style={"fill": color, "stroke": "#232323"}, kind="fill"),
+        ),
+    )
+    return prepared
+
+
+def test_bootstrap_saves_one_style_before_uploading_same_class_layers(recorder, monkeypatch):
+    calls = []
+
+    def initialize(url, class_id, style, expected, authcfg, feedback, *, track):
+        assert not recorder.sent
+        assert track == TRACK.name
+        assert expected == COMPOUND.style
+        assert style == {"fill": "#95ff00", "stroke": "#232323"}
+        calls.append(class_id)
+        return {"class_id": class_id, "status": "initialized", "style": style}
+
+    monkeypatch.setattr(client, "initialize_bootstrap_style", initialize)
+    report = publish_tools.publish(
+        _request(
+            _styled(_prepared(_features(1))),
+            _styled(_prepared(_features(1), name="More compounds")),
+            bootstrap_style_supported=True,
+        )
+    )
+    assert calls == ["compound"]
+    assert report.published == 2
+    assert report.style_results[0].status == "initialized"
+    assert "Style saved to the server" in "\n".join(report.detail_lines())
+    assert "no class styles were changed" not in "\n".join(report.detail_lines())
+
+
+@pytest.mark.parametrize("status", ["preserved", "unchanged"])
+def test_bootstrap_keeps_authoritative_existing_style_and_uploads(recorder, monkeypatch, status):
+    monkeypatch.setattr(
+        client,
+        "initialize_bootstrap_style",
+        lambda *args, **kwargs: {
+            "class_id": "compound",
+            "status": status,
+            "style": {"fill": "red"},
+        },
+    )
+    report = publish_tools.publish(
+        _request(_styled(_prepared(_features(1))), bootstrap_style_supported=True)
+    )
+    assert report.published == 1
+    assert report.style_results[0].style == {"fill": "red"}
+    assert report.style_results[0].status == status
+
+
+@pytest.mark.parametrize("unsupported", [True, False])
+def test_bootstrap_does_not_upload_when_style_support_missing_or_conflicting(
+    recorder, monkeypatch, unsupported
+):
+    def unexpected(*args, **kwargs):
+        pytest.fail("No style request should be sent")
+
+    monkeypatch.setattr(client, "initialize_bootstrap_style", unexpected)
+    prepared = [_styled(_prepared(_features(1)))]
+    if not unsupported:
+        prepared.append(_styled(_prepared(_features(1), name="Other"), "#abcdef"))
+    report = publish_tools.publish(_request(*prepared, bootstrap_style_supported=not unsupported))
+    assert report.published == 0
+    assert not recorder.sent
+    assert report.style_error
+    assert "No labels uploaded" in report.summary()
+
+
+def test_bootstrap_style_failure_retains_prior_initialization_without_uploading(
+    recorder, monkeypatch
+):
+    from dataclasses import replace
+
+    second = _styled(_prepared(_features(1), name="Buildings"))
+    second.plan = replace(second.plan, label_class=REGISTRY.get("datacenter_building"))
+
+    def initialize(url, class_id, style, expected, authcfg, feedback, **kwargs):
+        if class_id == "datacenter_building":
+            raise BackendError("timed out")
+        return {"class_id": class_id, "status": "initialized", "style": style}
+
+    monkeypatch.setattr(client, "initialize_bootstrap_style", initialize)
+    report = publish_tools.publish(
+        _request(_styled(_prepared(_features(1))), second, bootstrap_style_supported=True)
+    )
+    assert report.published == 0
+    assert not recorder.sent
+    assert len(report.style_results) == 1
+    assert report.style_results[0].class_id == "compound"
+    assert "datacenter_building" in report.style_error
+    assert not report.clean
+
+
+def test_bootstrap_cancel_before_start_never_saves_style(recorder, monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("Cancelled bootstrap must not save a style")
+
+    monkeypatch.setattr(client, "initialize_bootstrap_style", unexpected)
+    feedback = publish_tools.QgsFeedback()
+    feedback.cancel()
+    report = publish_tools.publish(
+        _request(_styled(_prepared(_features(1))), bootstrap_style_supported=True), feedback
+    )
+    assert report.cancelled
+    assert not report.style_results
+    assert not recorder.sent
+
+
+def test_bootstrap_opt_out_uploads_without_style_endpoint(recorder):
+    from dataclasses import replace
+
+    prepared = _styled(_prepared(_features(1)))
+    prepared.plan = replace(
+        prepared.plan, choice=replace(prepared.plan.choice, include_style=False)
+    )
+    report = publish_tools.publish(_request(prepared))
+    assert report.published == 1
+    assert not report.style_results
+    assert not report.style_error
+
+
+def test_bootstrap_style_retries_only_explicit_throttling(recorder, monkeypatch):
+    calls = []
+
+    def initialize(url, class_id, style, *args, **kwargs):
+        calls.append(class_id)
+        if len(calls) == 1:
+            raise BackendError("wait", status=429, retry_after=0.1)
+        return {"class_id": class_id, "status": "initialized", "style": style}
+
+    monkeypatch.setattr(client, "initialize_bootstrap_style", initialize)
+    report = publish_tools.publish(
+        _request(_styled(_prepared(_features(1))), bootstrap_style_supported=True)
+    )
+    assert calls == ["compound", "compound"]
+    assert report.published == 1
+    assert len(report.style_results) == 1

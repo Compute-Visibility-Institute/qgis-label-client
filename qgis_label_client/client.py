@@ -102,7 +102,9 @@ def fetch_registry(
     describes both datasets, and two registries would drift -- which is the exact defect
     this platform exists to fix. The track is sent for attribution, not for scoping.
     """
-    url = urls.join_path(base_url, registry_path)
+    # Explicit Connect must see newly initialized styles even when another server
+    # instance still holds the old registry in its short-lived cache.
+    url = urls.with_query(urls.join_path(base_url, registry_path), {"refresh": True})
     return parse_registry(
         request_json(url, authcfg=authcfg, feedback=feedback, track=track), source_url=url
     )
@@ -236,6 +238,25 @@ def create_features(
         feedback=feedback,
         track=track,
         reason=reason,
+    )
+
+
+def initialize_bootstrap_style(
+    base_url: str,
+    class_id: str,
+    style: Mapping[str, Any],
+    expected_style: Mapping[str, Any],
+    authcfg: str,
+    feedback: QgsFeedback | None = None,
+    track: str = "",
+) -> Any:
+    """Save captured symbology only when the server allows initial class styling."""
+    return post_json(
+        urls.join_segments(base_url, "v1", "classes", class_id, "bootstrap-style"),
+        {"style": dict(style), "expected_style": dict(expected_style)},
+        authcfg=authcfg,
+        feedback=feedback,
+        track=track,
     )
 
 

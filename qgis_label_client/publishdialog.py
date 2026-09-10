@@ -57,7 +57,7 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
 )
 
-from .core import styling
+from .core import bootstrapstyles, styling
 from .core.fields import COMPLETENESS_EXHAUSTIVE, COMPLETENESS_PARTIAL
 from .core.publish import (
     LayerChoice,
@@ -83,7 +83,7 @@ _COLUMNS = (
     "Class",
     "Fields",
     "Survey extent",
-    "Style proposal",
+    "Save style",
     "Notes",
 )
 
@@ -112,6 +112,7 @@ class PublishDialog(QDialog):
         parent: QWidget | None = None,
         track: Track | None = None,
         routes: CollectionRoutes | None = None,
+        bootstrap_style_supported: bool = False,
     ) -> None:
         super().__init__(parent)
         # The track is in the WINDOW TITLE as well, because a modal dialog's title bar is
@@ -126,6 +127,7 @@ class PublishDialog(QDialog):
         self._registry = registry
         self._track = track
         self._routes = routes
+        self._bootstrap_style_supported = bootstrap_style_supported
         # Set before the table is built: building it connects signals that fire while the
         # rows are being populated, and a refresh mid-build would read half a table.
         self._refreshing = True
@@ -150,7 +152,7 @@ class PublishDialog(QDialog):
         self.style_label.setWordWrap(True)
         self.style_label.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.style_label)
-        self.style_details = QPushButton("Review style proposals…", self)
+        self.style_details = QPushButton("Style details…", self)
         self.style_details.clicked.connect(self._show_styles)
         layout.addWidget(self.style_details)
 
@@ -258,8 +260,8 @@ class PublishDialog(QDialog):
             style.setChecked(layer_plan.choice.include_style)
             style.setEnabled(available)
             style.setToolTip(
-                "Include this layer's style in the report for administrator review. "
-                "Publishing never changes the shared class style."
+                "Save this layer's captured style when the class has no custom style. "
+                "Existing custom styles are preserved. Class styles apply across all tracks."
             )
             style.toggled.connect(self._refresh)
             self.table.setCellWidget(row, COL_STYLE, style)
@@ -431,29 +433,34 @@ class PublishDialog(QDialog):
         conflicts = {p.class_id for p in proposals if p.status == "conflict"}
         changed = {p.class_id for p in proposals if p.status == "proposed"}
         refused = sum(p.status == "refused" for p in proposals)
-        text = f"{len(changed)} class style proposal(s). Shared styles will stay unchanged."
+        text = (
+            "Included styles are saved automatically for classes without a custom style. "
+            "Existing custom styles are preserved. Class styles apply across all tracks."
+        )
+        if not self._bootstrap_style_supported and changed:
+            text = "Automatic style saving is unavailable on this connection. " + text
         if conflicts:
             text += (
                 " Conflicting layers for: "
                 + ", ".join(sorted(conflicts))
-                + ". Uncheck styles to choose one, or leave them for review."
+                + ". Keep Include checked for only one style per class."
             )
         if refused:
-            text += f" {refused} layer style(s) cannot be captured; see Review style proposals."
+            text += f" {refused} layer style(s) cannot be captured; see Style details."
         self.style_label.setText(text)
         self.style_details.setEnabled(bool(proposals))
 
     def _show_styles(self) -> None:
         lines = [
-            "Proposals only. An administrator reviews and saves changes in the class console.",
-            "Class styles apply across all tracks. Review class history in the console before saving.",
+            "Included styles are saved during bootstrap when the class has no custom style.",
+            "Existing custom styles are preserved. Class styles apply across all tracks.",
             "",
         ]
         proposals = self.plan().style_proposals()
         for proposal in proposals:
             lines.extend(proposal.detail_lines())
             lines.append("")
-        _show_text("Style proposals", "\n".join(lines), self, proposals)
+        _show_text("Bootstrap styles", "\n".join(lines), self, proposals)
 
     def _render_rows(self, plan: PublishPlan) -> None:
         """Re-render the two cells that depend on which class the row is set to."""
@@ -518,7 +525,9 @@ class PublishDialog(QDialog):
         )
 
     def _render_summary(self, plan: PublishPlan) -> None:
-        problems = plan.problems()
+        problems = plan.problems() + bootstrapstyles.problems(
+            plan.style_proposals(), getattr(self, "_bootstrap_style_supported", False)
+        )
         self.summary_label.setText(
             ("<b>" + " ".join(problems) + "</b><br/>" if problems else "") + plan.summary()
         )
@@ -560,11 +569,11 @@ class PublishReportDialog(QDialog):
         layout.addWidget(detail, 1)
 
         if report.style_proposals:
-            copy_styles = QPushButton("Copy style proposals", self)
+            copy_styles = QPushButton("Copy captured styles", self)
             copy_styles.setEnabled(any(p.status == "proposed" for p in report.style_proposals))
             copy_styles.setToolTip(
-                "Copy resolved proposals for the class console's Import proposal field. "
-                "Conflicting and unchanged styles are excluded."
+                "Copy captured changes for reference, or to request an intentional change "
+                "to an existing custom style. Initial styles are saved automatically."
             )
             copy_styles.clicked.connect(
                 lambda: QApplication.clipboard().setText(report.styles_json())

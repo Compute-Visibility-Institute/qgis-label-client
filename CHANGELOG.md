@@ -6,6 +6,16 @@ most recent entries into `metadata.txt` at release time.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-09-10
+
+### Added
+
+- Save supported source styling during bootstrap for classes with empty or
+  untouched default styles, using ordinary label-write access. Preserve custom
+  styles and report the actual saved style before uploading labels.
+- Use returned class styles immediately when loading server layers in the same
+  session. Report styling failures and conflicting source styles before upload.
+
 ## [0.1.4] - 2026-09-10
 
 ### Fixed

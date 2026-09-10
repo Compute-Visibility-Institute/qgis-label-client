@@ -183,3 +183,48 @@ def test_the_preview_routes_against_the_collections_it_was_given():
     routes = build_routes(["label_polygon", "label_point"])
     plan = publishdialog.PublishDialog.plan(_stand_in(TRACK, routes, "MultiPolygon"))
     assert plan.collections() == ("label_polygon",)
+
+
+def test_style_preview_blocks_missing_capability_until_opted_out():
+    from dataclasses import replace
+
+    from qgis_label_client.core.publish import LayerChoice
+    from qgis_label_client.core.stylecapture import CaptureResult
+
+    dialog = _stand_in(TRACK)
+    dialog._sources[0] = replace(
+        dialog._sources[0], style_capture=CaptureResult(style={"fill": "#95ff00"}, kind="fill")
+    )
+    button = _Recorder()
+    dialog.buttons = SimpleNamespace(button=lambda _standard: button)
+    dialog._bootstrap_style_supported = False
+    choices = {"c": LayerChoice("c", True, "compound")}
+    plan = build_plan(dialog._sources, REGISTRY, choices, TRACK)
+    publishdialog.PublishDialog._render_summary(dialog, plan)
+    assert button.enabled is False
+    assert "does not support saving bootstrap styles" in dialog.summary_label.text
+    choices["c"] = replace(choices["c"], include_style=False)
+    publishdialog.PublishDialog._render_summary(
+        dialog, build_plan(dialog._sources, REGISTRY, choices, TRACK)
+    )
+    assert button.enabled is True
+
+
+def test_style_preview_explains_automatic_save_without_admin_handoff():
+    from dataclasses import replace
+
+    from qgis_label_client.core.publish import LayerChoice
+    from qgis_label_client.core.stylecapture import CaptureResult
+
+    dialog = _stand_in(TRACK)
+    dialog._sources[0] = replace(
+        dialog._sources[0], style_capture=CaptureResult(style={"fill": "#95ff00"}, kind="fill")
+    )
+    dialog.style_label = _Recorder()
+    dialog.style_details = _Recorder()
+    dialog._bootstrap_style_supported = True
+    plan = build_plan(dialog._sources, REGISTRY, {"c": LayerChoice("c", True, "compound")}, TRACK)
+    publishdialog.PublishDialog._render_styles(dialog, plan)
+    assert "saved automatically" in dialog.style_label.text
+    assert "administrator" not in dialog.style_label.text
+    assert "across all tracks" in dialog.style_label.text

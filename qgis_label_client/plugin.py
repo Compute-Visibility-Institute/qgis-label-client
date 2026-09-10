@@ -43,7 +43,7 @@ from . import auth, client, imagery, network, oauth_flow, qa
 from . import layers as layer_tools
 from . import publish as publish_tools
 from .access import LayerAccess
-from .core import bulk, oauth, recorded, routing
+from .core import bootstrapstyles, bulk, oauth, recorded, routing
 from .core import collections as collection_groups
 from .core.activity import ActivityRegistry, ActivityState
 from .core.asof import AsOfMechanism, describe
@@ -102,16 +102,16 @@ def _fetch_tracks_or_none(
         raise
 
 
-def _fetch_bulk_or_none(url, path, authcfg, feedback, track="") -> bulk.BulkCapability | None:
+def _fetch_capabilities_or_empty(url, path, authcfg, feedback, track="") -> dict:
     """Discover publish destinations without preventing a read-only connection."""
     if not path:
-        return None
+        return {}
     try:
         document = client.fetch_capabilities(url, path, authcfg, feedback, track=track)
     except LabelClientError as exc:
-        log_warning(f"Could not discover bulk publish destinations: {exc}")
-        return None
-    return bulk.parse_capabilities(document)
+        log_warning(f"Could not discover bootstrap capabilities: {exc}")
+        return {}
+    return document if isinstance(document, dict) else {}
 
 
 class LabelClientPlugin:
@@ -128,6 +128,7 @@ class LabelClientPlugin:
         self.registry: ClassRegistry | None = None
         self.collections: list[Collection] = []
         self.bulk_capability: bulk.BulkCapability | None = None
+        self.bootstrap_style_supported = False
         self._publish_backend_url = ""
         # Every history track the backend offers. Empty until Connect: the plugin has no
         # opinion about what tracks exist, exactly as it has none about what classes do.
@@ -270,6 +271,7 @@ class LabelClientPlugin:
         self.registry = None
         self.collections = []
         self.bulk_capability = None
+        self.bootstrap_style_supported = False
         self._publish_backend_url = ""
         self.tracks = []
         self.publishing = False
@@ -438,6 +440,7 @@ class LabelClientPlugin:
         """Invalidate callbacks and the renewal state owned by the previous session."""
         self._session.advance()
         self.bulk_capability = None
+        self.bootstrap_style_supported = False
         self._publish_backend_url = ""
 
     def _on_project_read(self, *_args):
@@ -1215,6 +1218,7 @@ class LabelClientPlugin:
         capabilities_path = str(self.settings.get("capabilities_path"))
         track = self._track_name()
         self.bulk_capability = None
+        self.bootstrap_style_supported = False
         self._publish_backend_url = ""
 
         self.dock.set_status("Connecting…")
@@ -1228,15 +1232,18 @@ class LabelClientPlugin:
             # would make this plugin version unusable against it -- so the panel says
             # there are no tracks and every write is refused, which is the honest state
             # rather than a broken one.
+            tracks = _fetch_tracks_or_none(url, tracks_path, authcfg, feedback)
+            capabilities = _fetch_capabilities_or_empty(
+                url, capabilities_path, authcfg, feedback, track=track
+            )
             return {
-                "tracks": _fetch_tracks_or_none(url, tracks_path, authcfg, feedback),
+                "tracks": tracks,
                 "collections": client.fetch_collections(url, authcfg, feedback, track=track),
                 "registry": client.fetch_registry(
                     url, registry_path, authcfg, feedback, track=track
                 ),
-                "bulk_capability": _fetch_bulk_or_none(
-                    url, capabilities_path, authcfg, feedback, track=track
-                ),
+                "bulk_capability": bulk.parse_capabilities(capabilities),
+                "bootstrap_style_supported": bootstrapstyles.supported(capabilities),
                 "publish_backend_url": url,
                 "write_access": self._fetch_access(url, authcfg, feedback),
                 "access_context": context,
@@ -1249,6 +1256,7 @@ class LabelClientPlugin:
             return
         self.collections = result["collections"]
         self.bulk_capability = result.get("bulk_capability")
+        self.bootstrap_style_supported = result.get("bootstrap_style_supported", False)
         self._publish_backend_url = result.get("publish_backend_url", "")
         self.registry = result["registry"]
         self.tracks = result["tracks"] or []
@@ -1968,7 +1976,12 @@ class LabelClientPlugin:
             return
 
         dialog = PublishDialog(
-            sources, self.registry, self.iface.mainWindow(), track=track, routes=routes
+            sources,
+            self.registry,
+            self.iface.mainWindow(),
+            track=track,
+            routes=routes,
+            bootstrap_style_supported=self.bootstrap_style_supported,
         )
         try:
             accepted = dialog.exec() == QDialog.DialogCode.Accepted
@@ -2020,6 +2033,7 @@ class LabelClientPlugin:
             capabilities_path=self.settings.get("capabilities_path"),
             chunk_size=self.settings.get("publish_chunk_size"),
             verified_bulk=self.bulk_capability,
+            bootstrap_style_supported=self.bootstrap_style_supported,
         )
 
         self.publishing = True
@@ -2084,6 +2098,8 @@ class LabelClientPlugin:
         self, plans, collection_id: str, report: PublishReport, track: str = ""
     ) -> None:
         self._end_publish()
+        if self.registry is not None and report.style_results:
+            self.registry = bootstrapstyles.update_registry(self.registry, report.style_results)
         if self.dock is None:
             return
         # Stamped on the main thread, after the fact, and after a partial run too: "some

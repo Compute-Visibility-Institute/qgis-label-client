@@ -74,7 +74,7 @@ from qgis.core import (
 
 from . import client
 from . import layers as layer_tools
-from .core import bulk
+from .core import bootstrapstyles, bulk
 from .core.bulk import BulkCapability
 from .core.errors import BackendError, ConfigurationError
 from .core.fields import COMPLETENESS_EXHAUSTIVE, CoreFields
@@ -533,6 +533,7 @@ class PublishRequest:
     #: Capability used to choose label destinations during Connect. Carry that same
     #: authority into the worker so another failed probe cannot downgrade the upload.
     verified_bulk: BulkCapability | None = None
+    bootstrap_style_supported: bool = False
     #: Features per bulk request, before the deployment's own cap is applied. Zero means
     #: "as many as the backend allows"; see the ``publish_chunk_size`` setting for why the
     #: panel asks for fewer than that.
@@ -1215,6 +1216,57 @@ def _publish_layer(
     return outcome
 
 
+def _request_style(request, proposal, feedback):
+    attempts = max(1, request.max_throttle_retries + 1)
+    for attempt in range(attempts):
+        try:
+            return client.initialize_bootstrap_style(
+                request.base_url,
+                proposal.class_id,
+                proposal.capture.style,
+                proposal.current,
+                request.authcfg,
+                feedback,
+                track=request.track,
+            )
+        except BackendError as exc:
+            if not exc.throttled or attempt == attempts - 1:
+                raise
+            delay = exc.retry_after if exc.retry_after else 2.0 * (attempt + 1)
+            if not _wait(delay, feedback):
+                raise BackendError("Cancelled while waiting to save the style.") from exc
+
+
+def _initialize_styles(request, report, feedback) -> bool:
+    """Finish initial styling before sending labels; preserve every confirmed result."""
+    if feedback is not None and feedback.isCanceled():
+        report.cancelled = True
+        return False
+    problems = bootstrapstyles.problems(report.style_proposals, request.bootstrap_style_supported)
+    if problems:
+        report.style_error = " ".join(problems)
+        return False
+    seen = set()
+    for proposal in report.style_proposals:
+        if proposal.status not in ("proposed", "unchanged") or proposal.class_id in seen:
+            continue
+        if feedback is not None and feedback.isCanceled():
+            report.cancelled = True
+            return False
+        seen.add(proposal.class_id)
+        try:
+            payload = _request_style(request, proposal, feedback)
+            report.style_results.append(bootstrapstyles.parse_result(payload, proposal.class_id))
+        except Exception as exc:  # noqa: BLE001 - earlier style saves must remain in the report
+            report.style_error = (
+                f"Could not confirm the style for {proposal.class_id}: {exc} "
+                "No labels were sent. Reconnect and retry; confirmed style saves remain on "
+                "the server."
+            )
+            return False
+    return True
+
+
 def publish(request: PublishRequest, feedback: QgsFeedback | None = None) -> PublishReport:
     """Publish every prepared layer. **Worker thread.**
 
@@ -1274,6 +1326,8 @@ def publish(request: PublishRequest, feedback: QgsFeedback | None = None) -> Pub
             if (proposal := prepared.plan.style_proposal()) is not None
         ),
     )
+    if not _initialize_styles(request, report, feedback):
+        return report
     progress = _Progress(total=request.total_features(), feedback=feedback)
     # Once, before the run, and never inferred from a write that happened not to fail.
     # A capability already used by the preview is retained. Older callers without

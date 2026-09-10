@@ -443,18 +443,18 @@ def test_explicit_legacy_write_metadata_still_supports_untyped_publish(fake_ifac
 def test_bulk_discovery_failure_does_not_prevent_read_only_connection(monkeypatch):
     from qgis_label_client import client
     from qgis_label_client.core.errors import BackendError
-    from qgis_label_client.plugin import _fetch_bulk_or_none
+    from qgis_label_client.plugin import _fetch_capabilities_or_empty
 
     def unavailable(*args, **kwargs):
         raise BackendError("unavailable", status=503)
 
     monkeypatch.setattr(client, "fetch_capabilities", unavailable)
-    assert _fetch_bulk_or_none("https://example", "v1/capabilities", "", None) is None
+    assert _fetch_capabilities_or_empty("https://example", "v1/capabilities", "", None) == {}
 
 
 def test_bulk_discovery_keeps_server_limits_and_track(monkeypatch):
     from qgis_label_client import client
-    from qgis_label_client.plugin import _fetch_bulk_or_none
+    from qgis_label_client.plugin import _fetch_capabilities_or_empty
 
     def capability(url, path, authcfg, feedback, track):
         assert track == "dev"
@@ -468,7 +468,11 @@ def test_bulk_discovery_keeps_server_limits_and_track(monkeypatch):
         }
 
     monkeypatch.setattr(client, "fetch_capabilities", capability)
-    result = _fetch_bulk_or_none("https://example", "v1/capabilities", "", None, "dev")
+    from qgis_label_client.core import bulk
+
+    result = bulk.parse_capabilities(
+        _fetch_capabilities_or_empty("https://example", "v1/capabilities", "", None, "dev")
+    )
     assert result.collections == ("annotation_point",)
     assert result.max_features == 200
     assert result.max_body_bytes == 50000
@@ -477,8 +481,25 @@ def test_bulk_discovery_keeps_server_limits_and_track(monkeypatch):
 def test_new_session_discards_previous_publish_destination_authority(fake_iface):
     plugin = _connected(fake_iface, "annotation_point")
     plugin.bulk_capability = _bulk_capability("annotation_point")
+    plugin.bootstrap_style_supported = True
     plugin._advance_session()
     assert plugin.bulk_capability is None
+    assert plugin.bootstrap_style_supported is False
     assert plugin._publish_backend_url == ""
     assert not plugin._label_routes()
+    plugin.unload()
+
+
+def test_publish_completion_updates_registry_even_when_result_dialog_not_visible(fake_iface):
+    from qgis_label_client.core.bootstrapstyles import StyleResult
+    from qgis_label_client.core.publish import PublishReport
+
+    plugin = LabelClientPlugin(fake_iface)
+    plugin.registry = REGISTRY
+    report = PublishReport(
+        style_results=[StyleResult("compound", "initialized", {"fill": "#95ff00"})]
+    )
+    plugin._on_published([], "label_polygon", report, "dev")
+    assert plugin.registry.get("compound").style == {"fill": "#95ff00"}
+    assert REGISTRY.get("compound").style != {"fill": "#95ff00"}
     plugin.unload()

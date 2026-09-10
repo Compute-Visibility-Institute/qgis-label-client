@@ -1,4 +1,4 @@
-"""Reviewable style proposals; this module never writes the class registry."""
+"""Capture and resolve local styles before bootstrap initialization."""
 
 from __future__ import annotations
 
@@ -30,11 +30,11 @@ class StyleProposal:
 
     def detail_lines(self) -> list[str]:
         labels = {
-            "proposed": "Proposed for administrator review",
+            "proposed": "Captured for automatic initial styling when published",
             "unchanged": "Matches the current class style",
             "excluded": "Style proposal not included",
             "refused": "Style could not be captured",
-            "conflict": "Conflicting styles: choose one layer's proposal or leave for review",
+            "conflict": "Conflicting styles: include only one layer's style for this class",
         }
         lines = [f"{self.layer_name} → {self.class_id}: {labels[self.status]}."]
         lines.append(self.capture.summary())
