@@ -47,6 +47,7 @@ from qgis.PyQt.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QHBoxLayout,
     QHeaderView,
     QLabel,
     QPlainTextEdit,
@@ -143,10 +144,18 @@ class PublishDialog(QDialog):
         self.table = self._build_table()
         layout.addWidget(self.table, 1)
 
+        selection_controls = QHBoxLayout()
+        self.uncheck_all = QPushButton("Uncheck all", self)
+        self.uncheck_all.setAutoDefault(False)
+        self.uncheck_all.setToolTip("Uncheck every layer, then choose the layers to publish.")
+        self.uncheck_all.clicked.connect(self._uncheck_all)
+        selection_controls.addWidget(self.uncheck_all)
+        selection_controls.addStretch()
         self.layer_details = QCheckBox("Show layer details", self)
         self.layer_details.setToolTip("Show destination collection, CRS, field mapping and notes.")
         self.layer_details.toggled.connect(self._show_layer_details)
-        layout.addWidget(self.layer_details)
+        selection_controls.addWidget(self.layer_details)
+        layout.addLayout(selection_controls)
         self._show_layer_details(False)
 
         # A project's warnings can be much longer than its layer list. Keep that
@@ -374,6 +383,18 @@ class PublishDialog(QDialog):
         return combo
 
     # --- state ----------------------------------------------------------------
+
+    def _uncheck_all(self) -> None:
+        # Rebuild the preview once, not once per layer in a large project.
+        was_blocked = self.table.blockSignals(True)
+        try:
+            for row in range(self.table.rowCount()):
+                item = self.table.item(row, COL_LAYER)
+                if item is not None:
+                    item.setCheckState(Qt.CheckState.Unchecked)
+        finally:
+            self.table.blockSignals(was_blocked)
+        self._refresh()
 
     def _row_choice(self, row: int) -> LayerChoice | None:
         item = self.table.item(row, COL_LAYER)

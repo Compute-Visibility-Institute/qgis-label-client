@@ -6,6 +6,13 @@ most recent entries into `metadata.txt` at release time.
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-09-10
+
+### Added
+
+- An always-visible Uncheck all button in the bootstrap layer selection dialog.
+  Clear the selection in one update while preserving class, style and survey settings.
+
 ## [0.1.10] - 2026-09-10
 
 ### Changed
