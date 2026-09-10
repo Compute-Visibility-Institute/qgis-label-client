@@ -52,12 +52,13 @@ def test_the_nested_multilingual_label_shape_is_understood():
 
     Reading only the flat form does not fail loudly when the backend sends only the
     nested one: it falls through to ``class_id``, so the layer legend reads "widget"
-    instead of "Widget (小部件)" and looks like a deliberate choice.
+    instead of "Widget" and looks like a deliberate choice.
     """
     registry = parse_registry(
         {"classes": [{"class_id": "widget", "labels": {"en": "Widget", "zh": "小部件"}}]}
     )
-    assert registry.get("widget").display_name == "Widget (小部件)"
+    assert registry.get("widget").display_name == "Widget"
+    assert registry.get("widget").label_zh == "小部件"
 
 
 def test_retired_classes_are_kept_but_excluded_from_active():
@@ -68,12 +69,13 @@ def test_retired_classes_are_kept_but_excluded_from_active():
 
 def test_value_map_offers_only_classes_the_server_still_accepts():
     registry = parse_registry(DOC)
-    assert registry.value_map() == [("Widget (小部件)", "widget")]
+    assert registry.value_map() == [("Widget", "widget")]
 
 
-def test_display_name_pairs_both_languages_when_both_exist():
+def test_display_name_uses_english_without_discarding_the_source_translation():
     registry = parse_registry(DOC)
-    assert registry.get("widget").display_name == "Widget (小部件)"
+    assert registry.get("widget").display_name == "Widget"
+    assert registry.get("widget").label_zh == "小部件"
     assert registry.get("sprocket").display_name == "Sprocket"
 
 
@@ -165,3 +167,13 @@ def test_unusable_documents_raise(document):
 def test_entries_without_a_class_id_raise():
     with pytest.raises(RegistryError):
         parse_registry({"classes": [{"label_en": "no id"}]})
+
+
+@pytest.mark.parametrize("english", [None, "", "   "])
+def test_display_name_falls_back_to_class_id_when_english_is_missing(english):
+    registry = parse_registry(
+        {"classes": [{"class_id": "widget", "label_en": english, "label_zh": "小部件"}]}
+    )
+    assert registry.get("widget").display_name == "widget"
+    assert registry.get("widget").label_zh == "小部件"
+    assert registry.value_map() == [("widget", "widget")]

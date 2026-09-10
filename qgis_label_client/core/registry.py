@@ -127,14 +127,8 @@ class LabelClass:
 
     @property
     def display_name(self) -> str:
-        """Label for menus and the categorized renderer.
-
-        Both languages when both exist. The Chinese name is not decoration: the source
-        data is Chinese infrastructure and 82.6% of compounds have only a Chinese name.
-        """
-        if self.label_zh and self.label_zh != self.label_en:
-            return f"{self.label_en} ({self.label_zh})"
-        return self.label_en
+        """English UI label; translated source labels remain available for import matching."""
+        return self.label_en.strip() or self.class_id
 
     @property
     def accepts_any_geometry(self) -> bool:

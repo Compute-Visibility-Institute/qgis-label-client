@@ -16,6 +16,9 @@ most recent entries into `metadata.txt` at release time.
 - Preserve the server's editable/read-only wording when grouping geometry-specific
   layers, so the editable label group appears as "CVI Labels (editable)". Clarify
   that saving requires write access to the selected track.
+- Use English class names, field captions and generated map tips. Refresh known
+  generated bilingual captions on Connect while preserving custom styling and
+  stored source-language data.
 
 ## [0.1.2] - 2026-09-09
 

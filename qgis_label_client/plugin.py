@@ -1246,6 +1246,9 @@ class LabelClientPlugin:
         # per-geometry even though the panel's checkbox for it is not.
         self.dock.set_collections(collection_groups.group_by_mode(self.collections), checked=loaded)
         self.dock.set_registry(self.registry)
+        for layer in layer_tools.plugin_layers():
+            if layer_tools.refresh_generated_captions(layer, self.registry):
+                self.iface.layerTreeView().refreshLayerSymbology(layer.id())
         self.dock.set_connected(True)
         self._refresh_track_banner()
         self._refresh_recorded_bounds()

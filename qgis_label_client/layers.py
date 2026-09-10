@@ -1390,7 +1390,7 @@ def _apply_aliases(layer: QgsVectorLayer, registry: ClassRegistry, names: list[s
     aliases = {
         fields.label_id: "Label ID (immutable)",
         fields.class_id: "Class",
-        fields.name_zh: "Name (中文)",
+        fields.name_zh: "Name (Chinese)",
         fields.name_en: "Name (English)",
         fields.names: "Names (JSON, all languages)",
         fields.attrs: "Attributes (JSON, see class schema)",
@@ -1412,21 +1412,11 @@ def _apply_aliases(layer: QgsVectorLayer, registry: ClassRegistry, names: list[s
             )
 
 
-def _apply_map_tip(
-    layer: QgsVectorLayer, registry: ClassRegistry, names: list[str], historical: bool = False
-) -> None:
-    """A hover tip that answers the three questions asked most while labeling.
-
-    Chinese name first. 82.6% of compounds have a Chinese name and 8.9% an English one,
-    so an English-first tip is blank most of the time.
-
-    On a historical layer there is a fourth question, and it is the one the layer exists to
-    answer: *when did we stop thinking this?* Shown only where the belief actually ended,
-    so a label that is still believed today reads exactly as it does on the live layer.
-    """
+def _map_tip_template(registry, names, historical=False, legacy=False):
+    """Generate English display fields; legacy text is only for exact migration matching."""
     fields = registry.fields
     rows: list[str] = []
-    if fields.name_zh in names:
+    if legacy and fields.name_zh in names:
         rows.append(f'<b>[% "{fields.name_zh}" %]</b>')
     if fields.name_en in names:
         rows.append(f'[% "{fields.name_en}" %]')
@@ -1437,5 +1427,74 @@ def _apply_map_tip(
     if historical and fields.superseded in names and fields.belief_to in names:
         ended, until = identifier(fields.superseded), identifier(fields.belief_to)
         rows.append(f"[% if({ended}, 'believed until ' || {until}, '') %]")
-    if rows:
-        layer.setMapTipTemplate("<br/>".join(rows))
+    return "<br/>".join(rows)
+
+
+def _apply_map_tip(
+    layer: QgsVectorLayer, registry: ClassRegistry, names: list[str], historical: bool = False
+) -> None:
+    """Show English names, class and identity, plus ended beliefs on historical layers."""
+    template = _map_tip_template(registry, names, historical)
+    if template:
+        layer.setMapTipTemplate(template)
+
+
+def refresh_generated_captions(layer: QgsVectorLayer, registry: ClassRegistry) -> bool:
+    """Translate only exact old generated captions; preserve custom styles and source data."""
+    if not is_plugin_layer(layer):
+        return False
+    legacy = {
+        label.class_id: (f"{label.label_en} ({label.label_zh})", label.display_name)
+        for label in registry
+        if label.label_zh and label.label_zh != label.label_en
+    }
+    changed = False
+    renderer_changed = False
+    renderer = layer.renderer()
+    if (
+        isinstance(renderer, QgsCategorizedSymbolRenderer)
+        and renderer.classAttribute() == registry.fields.class_id
+    ):
+        for index, category in enumerate(renderer.categories()):
+            pair = legacy.get(category.value()) if isinstance(category.value(), str) else None
+            if pair and category.label() == pair[0]:
+                renderer.updateCategoryLabel(index, pair[1])
+                changed = True
+                renderer_changed = True
+
+    index = layer.fields().indexOf(registry.fields.class_id)
+    if index >= 0:
+        setup = layer.editorWidgetSetup(index)
+        config = setup.config()
+        entries = config.get("map")
+        if setup.type() == "ValueMap" and isinstance(entries, list):
+            replacement = []
+            for entry in entries:
+                if isinstance(entry, dict) and len(entry) == 1:
+                    caption, value = next(iter(entry.items()))
+                    pair = legacy.get(value) if isinstance(value, str) else None
+                    if pair and caption == pair[0]:
+                        entry = {pair[1]: value}
+                replacement.append(entry)
+            if replacement != entries:
+                layer.setEditorWidgetSetup(
+                    index, QgsEditorWidgetSetup("ValueMap", {**config, "map": replacement})
+                )
+                changed = True
+
+    index = layer.fields().indexOf(registry.fields.name_zh)
+    if index >= 0 and layer.attributeAlias(index) == "Name (中文)":
+        layer.setFieldAlias(index, "Name (Chinese)")
+        changed = True
+    names = [field.name() for field in layer.fields()]
+    historical = is_historical(layer)
+    old_tip = _map_tip_template(registry, names, historical, legacy=True)
+    new_tip = _map_tip_template(registry, names, historical)
+    if old_tip != new_tip and layer.mapTipTemplate() == old_tip:
+        layer.setMapTipTemplate(new_tip)
+        changed = True
+    if changed:
+        if renderer_changed:
+            layer.rendererChanged.emit()
+        layer.triggerRepaint()
+    return changed

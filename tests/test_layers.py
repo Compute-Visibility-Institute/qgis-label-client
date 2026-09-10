@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -772,3 +773,128 @@ def test_the_geometry_family_is_never_a_layer_filter() -> None:
     assert "geom_family" not in layer_tools.build_layer_uri(_settings(), "label", REGISTRY, TRACK)
     for function in (layer_tools.build_layer_uri, layer_tools.create_layer):
         assert "geom_family" not in inspect.signature(function).parameters
+
+
+def test_core_field_aliases_use_english_without_removing_chinese_name_field():
+    fields = REGISTRY.fields
+    names = [fields.name_en, fields.name_zh]
+    layer = _FakeLayer("labels", names)
+    aliases = {}
+    layer.setFieldAlias = lambda index, text: aliases.update({names[index]: text})
+    layer_tools._apply_aliases(layer, REGISTRY, names)
+    assert aliases == {fields.name_en: "Name (English)", fields.name_zh: "Name (Chinese)"}
+    assert [field.name() for field in layer.fields()] == names
+
+
+def test_renderer_labels_use_english_and_keep_category_ids(monkeypatch):
+    registry = parse_registry(
+        {"classes": [{"class_id": "widget", "label_en": "Widget", "label_zh": "小部件"}]}
+    )
+    layer = _FakeLayer("labels", [registry.fields.class_id])
+    renderers = []
+    layer.setRenderer = renderers.append
+    layer.triggerRepaint = lambda: None
+    monkeypatch.setattr(layer_tools, "_layer_geometry_family", lambda _layer: "")
+    monkeypatch.setattr(layer_tools, "_symbol_for", lambda *_args: "symbol")
+    monkeypatch.setattr(layer_tools, "QgsRendererCategory", lambda *args: args)
+    monkeypatch.setattr(layer_tools, "QgsCategorizedSymbolRenderer", lambda *args: args)
+    layer_tools._apply_class_renderer(layer, registry)
+    assert renderers == [(registry.fields.class_id, [("widget", "symbol", "Widget", True)])]
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_connect_refresh_preserves_custom_captions_and_only_updates_generated_text(
+    monkeypatch, custom
+):
+    registry = parse_registry(
+        {"classes": [{"class_id": "widget", "label_en": "Widget", "label_zh": "小部件"}]}
+    )
+    fields = registry.fields
+    names = [fields.class_id, fields.name_en, fields.name_zh, fields.label_id]
+    layer = _FakeLayer("labels", names)
+    layer.properties[layer_tools.COLLECTION_PROPERTY] = "label"
+    original = "Custom caption" if custom else "Widget (小部件)"
+
+    class Category:
+        def value(self):
+            return "widget"
+
+        def label(self):
+            return original
+
+    class Renderer:
+        def classAttribute(self):  # noqa: N802
+            return fields.class_id
+
+        def categories(self):
+            return [Category()]
+
+        def updateCategoryLabel(self, index, text):  # noqa: N802
+            captions.append((index, text))
+
+    class Setup:
+        def __init__(self, kind, config):
+            self.kind, self.configuration = kind, config
+
+        def type(self):
+            return self.kind
+
+        def config(self):
+            return self.configuration
+
+    renderer = Renderer()
+    captions, widgets, aliases, tips, signals = [], [], [], [], []
+    layer.rendererChanged = SimpleNamespace(emit=lambda: signals.append(True))
+    layer.renderer = lambda: renderer
+    layer.editorWidgetSetup = lambda _index: Setup(
+        "ValueMap", {"map": [{original: "widget"}], "custom-option": True}
+    )
+    layer.setEditorWidgetSetup = lambda index, setup: widgets.append((index, setup.config()))
+    layer.attributeAlias = lambda _index: "Custom alias" if custom else "Name (中文)"
+    layer.setFieldAlias = lambda index, text: aliases.append((index, text))
+    original_tip = (
+        "Custom source tip 中文"
+        if custom
+        else layer_tools._map_tip_template(registry, names, legacy=True)
+    )
+    layer.mapTipTemplate = lambda: original_tip
+    layer.setMapTipTemplate = tips.append
+    layer.triggerRepaint = lambda: None
+    monkeypatch.setattr(layer_tools, "QgsCategorizedSymbolRenderer", Renderer)
+    monkeypatch.setattr(layer_tools, "QgsEditorWidgetSetup", Setup)
+
+    assert layer_tools.refresh_generated_captions(layer, registry) is not custom
+    assert layer.renderer() is renderer
+    assert [field.name() for field in layer.fields()] == names
+    if custom:
+        assert (captions, widgets, aliases, tips) == ([], [], [], [])
+        assert signals == []
+    else:
+        assert signals == [True]
+        assert captions == [(0, "Widget")]
+        assert widgets == [(0, {"map": [{"Widget": "widget"}], "custom-option": True})]
+        assert aliases == [(2, "Name (Chinese)")]
+        assert tips == [layer_tools._map_tip_template(registry, names)]
+        assert fields.name_zh not in tips[0]
+
+
+def test_refresh_does_not_touch_unowned_layers():
+    layer = _FakeLayer("user layer", [])
+    assert layer_tools.refresh_generated_captions(layer, REGISTRY) is False
+
+
+def test_generated_map_tip_uses_english_and_keeps_historical_context():
+    fields = REGISTRY.fields
+    names = [
+        fields.name_zh,
+        fields.name_en,
+        fields.class_id,
+        fields.label_id,
+        fields.superseded,
+        fields.belief_to,
+    ]
+    template = layer_tools._map_tip_template(REGISTRY, names, historical=True)
+    assert fields.name_zh not in template
+    assert fields.name_en in template
+    assert fields.class_id in template and fields.label_id in template
+    assert "believed until" in template
