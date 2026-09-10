@@ -51,6 +51,7 @@ from qgis.PyQt.QtWidgets import (
     QLabel,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -148,13 +149,34 @@ class PublishDialog(QDialog):
         layout.addWidget(self.layer_details)
         self._show_layer_details(False)
 
+        # A project's warnings can be much longer than its layer list. Keep that
+        # explanation behind one disclosure and scroll it independently, so neither
+        # opening it nor selecting more layers can squeeze the table out of view.
+        self._review_summary = ""
+        self.review_details = QPushButton("Show review details", self)
+        self.review_details.setCheckable(True)
+        self.review_details.setObjectName("publishReviewDetails")
+        self.review_details.toggled.connect(self._show_review_details)
+        layout.addWidget(self.review_details)
+        self.review_scroll = QScrollArea(self)
+        self.review_scroll.setObjectName("publishReviewScroll")
+        self.review_scroll.setWidgetResizable(True)
+        self.review_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.review_scroll.setMinimumHeight(100)
+        self.review_scroll.setMaximumHeight(180)
+        review_body = QWidget(self.review_scroll)
+        review_layout = QVBoxLayout(review_body)
+        self.review_scroll.setWidget(review_body)
+        self.review_scroll.setVisible(False)
+        layout.addWidget(self.review_scroll)
+
         self.style_label = QLabel("", self)
         self.style_label.setWordWrap(True)
         self.style_label.setTextFormat(Qt.TextFormat.PlainText)
-        layout.addWidget(self.style_label)
+        review_layout.addWidget(self.style_label)
         self.style_details = QPushButton("Style details…", self)
         self.style_details.clicked.connect(self._show_styles)
-        layout.addWidget(self.style_details)
+        review_layout.addWidget(self.style_details)
 
         self.skip_damaged = QCheckBox(
             "Omit possibly truncated names",
@@ -166,22 +188,22 @@ class PublishDialog(QDialog):
             "it protects. Correct the names at source if you can; this is the fallback."
         )
         self.skip_damaged.toggled.connect(self._refresh)
-        layout.addWidget(self.skip_damaged)
+        review_layout.addWidget(self.skip_damaged)
 
         self.damage_label = QLabel("", self)
         self.damage_label.setWordWrap(True)
         self.damage_label.setTextFormat(Qt.TextFormat.RichText)
-        layout.addWidget(self.damage_label)
+        review_layout.addWidget(self.damage_label)
 
         self.coverage_label = QLabel("", self)
         self.coverage_label.setWordWrap(True)
         self.coverage_label.setTextFormat(Qt.TextFormat.RichText)
-        layout.addWidget(self.coverage_label)
+        review_layout.addWidget(self.coverage_label)
 
         self.summary_label = QLabel("", self)
         self.summary_label.setWordWrap(True)
         self.summary_label.setTextFormat(Qt.TextFormat.RichText)
-        layout.addWidget(self.summary_label)
+        review_layout.addWidget(self.summary_label)
 
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
@@ -210,6 +232,7 @@ class PublishDialog(QDialog):
 
     def _build_table(self) -> QTableWidget:
         table = QTableWidget(len(self._sources), len(_COLUMNS), self)
+        table.setMinimumHeight(260)
         table.setHorizontalHeaderLabels(list(_COLUMNS))
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -269,6 +292,19 @@ class PublishDialog(QDialog):
             self.table.setItem(row, COL_NOTES, _readonly(""))
 
         self.table.resizeColumnsToContents()
+        # A full source path is useful in a tooltip, but must not push the class
+        # selector off screen. Initial widths remain adjustable by the user.
+        for column, width in (
+            (COL_LAYER, 280),
+            (COL_FEATURES, 70),
+            (COL_GEOMETRY, 105),
+            (COL_CLASS, 190),
+            (COL_EXTENT, 195),
+            (COL_STYLE, 105),
+            (COL_FIELDS, 220),
+            (COL_NOTES, 360),
+        ):
+            self.table.setColumnWidth(column, width)
 
     def _extent_combo(self) -> QComboBox:
         """The survey-extent claim, as a value rather than a tick.
@@ -378,6 +414,11 @@ class PublishDialog(QDialog):
         for column in (COL_COLLECTION, COL_CRS, COL_FIELDS, COL_NOTES):
             self.table.setColumnHidden(column, not visible)
 
+    def _show_review_details(self, visible: bool) -> None:
+        self.review_scroll.setVisible(visible)
+        action = "Hide" if visible else "Show"
+        self.review_details.setText(f"{action} review details — {self._review_summary}")
+
     def _refresh(self) -> None:
         """Re-render everything derived from the current choices.
 
@@ -395,6 +436,7 @@ class PublishDialog(QDialog):
             self._render_coverage(plan)
             self._render_summary(plan)
             self._render_styles(plan)
+            self._render_review_details(plan)
         finally:
             self._refreshing = False
 
@@ -450,6 +492,31 @@ class PublishDialog(QDialog):
         self.style_label.setText(text)
         self.style_details.setEnabled(bool(proposals))
 
+    def _render_review_details(self, plan: PublishPlan) -> None:
+        proposals = plan.style_proposals()
+        problems = plan.problems() + bootstrapstyles.problems(
+            proposals, self._bootstrap_style_supported
+        )
+        issue_count = len(problems)
+        parts = [
+            f"{issue_count} blocking {'issue' if issue_count == 1 else 'issues'}"
+            if problems
+            else "Ready to publish"
+        ]
+        if not plan.selected():
+            parts = ["No layers selected"]
+        missing = len(plan.classes_without_extent())
+        if missing:
+            parts.append(f"{missing} survey {'warning' if missing == 1 else 'warnings'}")
+        damaged = plan.damaged_name_count()
+        if damaged:
+            parts.append(f"{damaged} name {'warning' if damaged == 1 else 'warnings'}")
+        unavailable = sum(proposal.status == "refused" for proposal in proposals)
+        if unavailable:
+            parts.append(f"{unavailable} {'style' if unavailable == 1 else 'styles'} unavailable")
+        self._review_summary = "; ".join(parts)
+        self._show_review_details(self.review_details.isChecked())
+
     def _show_styles(self) -> None:
         lines = [
             "Included styles are saved during bootstrap when the class has no custom style.",
@@ -478,6 +545,7 @@ class PublishDialog(QDialog):
             item.setToolTip(
                 "\n".join(
                     [
+                        layer_plan.source.name,
                         f"Collection: {layer_plan.collection_id or 'not resolved'}",
                         f"CRS: {layer_plan.source.crs_authid}",
                         *lines,
@@ -529,7 +597,12 @@ class PublishDialog(QDialog):
             plan.style_proposals(), getattr(self, "_bootstrap_style_supported", False)
         )
         self.summary_label.setText(
-            ("<b>" + " ".join(problems) + "</b><br/>" if problems else "") + plan.summary()
+            (
+                "<b>" + "<br/><br/>".join(escape(p) for p in problems) + "</b><br/>"
+                if problems
+                else ""
+            )
+            + escape(plan.summary())
         )
         ok = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
         if ok is not None:

@@ -6,6 +6,15 @@ most recent entries into `metadata.txt` at release time.
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-09-10
+
+### Fixed
+
+- Collapse publish-preview warnings and guidance by default, with scrollable
+  details that leave room for selecting layers even when many have issues.
+- Limit the initial layer-name column width so long names do not crowd out
+  class selection. Full names remain available in tooltips.
+
 ## [0.1.7] - 2026-09-10
 
 ### Fixed
