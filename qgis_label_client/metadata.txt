@@ -4,7 +4,7 @@ qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 supportsQt6=True
 description=Thin client for a bitemporal OGC API - Features labeling backend: Google sign-in, refreshed signed imagery URLs, a registry-driven class vocabulary, and a control for each time axis - as-of on valid time, and a read-only historical view on transaction time.
-version=0.1.2
+version=0.1.3
 author=Compute Visibility Institute
 email=opensource@example.org
 
@@ -48,7 +48,5 @@ deprecated=False
 server=False
 hasProcessingProvider=no
 
-changelog=0.1.2
-    - Validate track and valid-time changes before saving settings; roll back failed layer changes.
-    - Preserve styles, historical pins and unsaved edits; report layers that need reloading.
-    - Ignore stale session callbacks and cancel deferred reads without replaying writes.
+changelog=0.1.3
+    - Show the loaded plugin version in the dock and floating window title.

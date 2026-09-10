@@ -6,6 +6,14 @@ most recent entries into `metadata.txt` at release time.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-10
+
+### Added
+
+- Show the loaded plugin version in the dock and floating window title, so saved
+  connection settings cannot be mistaken for an old installation. Existing saved
+  API URLs remain unchanged when upgrading.
+
 ## [0.1.2] - 2026-09-09
 
 ### Fixed

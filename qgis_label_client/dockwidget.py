@@ -44,6 +44,7 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
 )
 
+from . import __version__
 from .core import recorded
 from .core.asof import AsOfMechanism
 from .core.collections import CollectionGroup
@@ -185,7 +186,7 @@ class LabelClientDock(QDockWidget):
     trackChanged = pyqtSignal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__("CVI Label Client", parent)
+        super().__init__(f"CVI Label Client — v{__version__}", parent)
         self.setObjectName("CviLabelClientDock")
         # Set before the groups are built: _build_vocabulary_group connects a signal that
         # can fire during construction.
