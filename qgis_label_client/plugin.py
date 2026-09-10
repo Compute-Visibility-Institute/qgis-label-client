@@ -39,7 +39,7 @@ from qgis.PyQt.QtWidgets import (
     QMessageBox,
 )
 
-from . import auth, client, imagery, network, oauth_flow, qa
+from . import auth, client, imagery, layertree, network, oauth_flow, qa
 from . import layers as layer_tools
 from . import publish as publish_tools
 from .access import LayerAccess
@@ -1274,12 +1274,11 @@ class LabelClientPlugin:
         # feature exists to prevent.
         self.dock.set_tracks(self.tracks, self.settings.track)
         loaded = {layer_tools.collection_of(layer) for layer in layer_tools.plugin_layers()}
-        # Grouped for the panel only: geometry-typed siblings collapse to one checkbox
-        # per mode here (see core.collections.group_by_mode), but self.collections stays
-        # the flat per-collection list load_collections and every title lookup below use --
-        # a QGIS layer is still typed per geometry, so its own layer-tree title stays
-        # per-geometry even though the panel's checkbox for it is not.
-        self.dock.set_collections(collection_groups.group_by_mode(self.collections), checked=loaded)
+        # The same mode metadata drives both the panel checkbox and native layer-tree
+        # group. Individual layers retain their geometry-specific providers and titles.
+        groups = collection_groups.group_by_mode(self.collections)
+        self.dock.set_collections(groups, checked=loaded)
+        layertree.group_existing_layers(QgsProject.instance(), groups)
         self.dock.set_registry(self.registry)
         for layer in layer_tools.plugin_layers():
             if layer_tools.refresh_generated_captions(layer, self.registry):
@@ -1331,6 +1330,7 @@ class LabelClientPlugin:
             return
 
         titles = {c.collection_id: c.display_name for c in self.collections}
+        groups = collection_groups.group_by_mode(self.collections)
         project = QgsProject.instance()
         # Historical layers deliberately do not count as "already loaded". The whole use
         # case is the live layer and one or more past-belief layers open together, and a
@@ -1363,7 +1363,7 @@ class LabelClientPlugin:
                 if self._refuse_unpinned_historical(layer, collection_id):
                     continue
                 layer_tools.apply_registry(layer, self.registry)
-                project.addMapLayer(layer)
+                layertree.add_collection_layer(project, layer, groups)
                 added += 1
                 self._warn_on_track_mismatch(layer, track)
         finally:

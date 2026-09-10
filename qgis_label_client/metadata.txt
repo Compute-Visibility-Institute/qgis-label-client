@@ -4,7 +4,7 @@ qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 supportsQt6=True
 description=Thin client for a bitemporal OGC API - Features labeling backend: Google sign-in, refreshed signed imagery URLs, a registry-driven class vocabulary, and a control for each time axis - as-of on valid time, and a read-only historical view on transaction time.
-version=0.1.5
+version=0.1.6
 author=Compute Visibility Institute
 email=opensource@example.org
 
@@ -48,6 +48,6 @@ deprecated=False
 server=False
 hasProcessingProvider=no
 
-changelog=0.1.5
-    - Save supported bootstrap styles automatically for empty or untouched default styles.
-    - Preserve customized class styles and show saved styling immediately after upload.
+changelog=0.1.6
+    - Put geometry layers under collapsible groups in the QGIS Layers panel.
+    - Keep editable and read-only label modes separate.

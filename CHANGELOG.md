@@ -6,6 +6,15 @@ most recent entries into `metadata.txt` at release time.
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-09-10
+
+### Changed
+
+- Put geometry-specific label layers under a single collapsible group per mode
+  in the QGIS Layers panel, keeping native geometry layers and their styles.
+- Group existing top-level server layers on Connect while preserving manual
+  layer groups and individual visibility settings.
+
 ## [0.1.5] - 2026-09-10
 
 ### Added
