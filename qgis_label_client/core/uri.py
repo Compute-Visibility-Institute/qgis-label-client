@@ -56,18 +56,10 @@ HTTP_HEADER_PREFIX = "http-header:"
 def header_params(headers: Mapping[str, str] | None) -> dict[str, str]:
     """Render a header mapping as ``http-header:`` URI parameters.
 
-    WHY A HEADER GOES IN THE URI AT ALL
-
-    Because the native OAPIF provider makes the requests, not this plugin -- including the
-    Part 4 writes -- so anything that has to ride on every one of them must be somewhere
-    the *provider* will look. There are exactly two such places: the ``authcfg``
-    credential, and these.
-
-    That matters for history tracks specifically. The track has to reach the auth edge on
-    every read and every write, and putting it here means it is part of the layer's own
-    data source: a layer cannot be pointed at the wrong track by a stale setting, and a
-    saved ``.qgz`` reopens on the track it was saved on rather than on whatever the person
-    who opens it happens to have selected.
+    URI headers are retained for provider versions that support them, but QGIS 3.44
+    drops them. Native writes rely on the track-specific APIHeader auth config created
+    after Connect discovers tracks. The landing URL's query covers reads only; neither
+    it nor these URI parameters is a substitute for the authentication header on PUT.
 
     Empty values are dropped rather than sent blank -- a blank ``X-Track`` is not "no
     track", it is a header the edge has to decide what to do with.
@@ -111,7 +103,7 @@ def build_oapif_uri(
         reference into ``qgis-auth.db``. Never a token.
     ``http-header:*``
         extra request headers, one parameter each -- see :func:`header_params`. This is
-        how the history track reaches the auth edge on the provider's own requests.
+        optional compatibility metadata. Track-specific auth configs carry native writes.
     """
     if not collection_id:
         raise ValueError("collection_id is required")

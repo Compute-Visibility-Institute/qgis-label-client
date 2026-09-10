@@ -495,3 +495,26 @@ def test_access_task_submission_failure_after_renewal_does_not_drop_reads(
     plugin._on_refreshed(_credential(int(time.time()) + HOUR))
     assert calls == ["read"]
     assert "access task unavailable" in _texts(fake_iface)
+
+
+def test_first_connect_binds_tracks_before_enabling_native_layers(plugin, monkeypatch):
+    from qgis_label_client import layers
+    from qgis_label_client.core.registry import parse_registry
+
+    plugin._store_credential(_credential(int(time.time()) + HOUR))
+    assert list(plugin.settings.authcfg_by_track) == [""]
+    monkeypatch.setattr(layers, "plugin_layers", lambda *_: [])
+    for method in ("set_tracks", "set_collections", "set_registry"):
+        monkeypatch.setattr(plugin.dock, method, lambda *_args, **_kwargs: None)
+    plugin._on_connected(
+        {
+            "tracks": [TRACK],
+            "collections": [],
+            "registry": parse_registry({"classes": [{"class_id": "building"}]}),
+            "write_access": True,
+        }
+    )
+    stored = plugin.settings.authcfg_by_track
+    assert stored[TRACK.name] != stored[""]
+    assert auth_manager().configs[stored[TRACK.name]].configMap()["X-Track"] == TRACK.name
+    assert plugin._current_write_access() is True

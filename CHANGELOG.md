@@ -6,6 +6,15 @@ most recent entries into `metadata.txt` at release time.
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-09-10
+
+### Fixed
+
+- Bind discovered tracks to QGIS authentication configurations on the first
+  Connect so native geometry saves carry the selected track and avoid HTTP403.
+- Repair existing idle layer connections without changing filters or styling;
+  preserve active edit sessions and explain how to keep a local edited copy.
+
 ## [0.1.8] - 2026-09-10
 
 ### Fixed

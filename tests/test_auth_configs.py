@@ -165,6 +165,43 @@ def test_a_first_sign_in_before_connect_writes_only_the_untracked_entry(manager)
     assert list(stored) == [""]
 
 
+def test_discovery_binds_native_writes_without_a_second_signin(manager):
+    initial = auth.store_id_token_for_tracks("fresh-id-token", [])
+    stored = auth.ensure_track_configs([TRACK, OTHER_TRACK], initial)
+    assert stored[""] == initial[""]
+    assert len(set(stored.values())) == 3
+    assert manager.configs[stored[""]].configMap() == {"Authorization": "Bearer fresh-id-token"}
+    for name in (TRACK, OTHER_TRACK):
+        assert manager.configs[stored[name]].configMap() == {
+            "Authorization": "Bearer fresh-id-token",
+            "X-Track": name,
+        }
+    assert auth.ensure_track_configs([TRACK, OTHER_TRACK], stored) == stored
+    assert len(manager.configs) == 3
+
+
+def test_discovery_replaces_shared_legacy_ids_without_retargeting_existing_credentials(manager):
+    initial = auth.store_id_token_for_tracks("fresh-id-token", [])
+    initial[TRACK] = initial[OTHER_TRACK] = initial[""]
+    stored = auth.ensure_track_configs([TRACK, OTHER_TRACK], initial)
+    assert len(set(stored.values())) == 3
+    assert "X-Track" not in manager.configs[initial[""]].configMap()
+
+
+def test_discovery_does_not_copy_unrelated_auth_headers(manager):
+    initial = auth.store_id_token_for_tracks("fresh-id-token", [])
+    manager.configs[initial[""]].setConfigMap(
+        {"Authorization": "Bearer fresh-id-token", "Unrelated": "not-for-the-track"}
+    )
+    stored = auth.ensure_track_configs([TRACK], initial)
+    assert set(manager.configs[stored[TRACK]].configMap()) == {"Authorization", "X-Track"}
+
+
+def test_discovery_missing_credential_refuses_instead_of_pinning_nothing(manager):
+    with pytest.raises(ConfigurationError, match="Sign in again"):
+        auth.ensure_track_configs([TRACK], {"": "missing"})
+
+
 def test_a_track_missing_from_the_list_keeps_its_credential(manager):
     """Absent from the list usually means the panel has not connected yet.
 

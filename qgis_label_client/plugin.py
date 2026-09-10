@@ -875,8 +875,8 @@ class LabelClientPlugin:
         try:
             # One config per KNOWN track, plus one naming none. On the first sign-in of a
             # fresh profile the track list is empty -- you need a credential to discover
-            # it -- so only the un-tracked entry is written, and a later sign-in fans it
-            # out. Passing the existing map is what makes every id be REUSED, so saved
+            # it -- so only the un-tracked entry is written. Connect fans it out after
+            # discovery. Passing the existing map is what makes every id be REUSED, so saved
             # .qgz projects and already-loaded layers survive the rotation.
             stored = auth.store_id_token_for_tracks(
                 credential.id_token,
@@ -1254,12 +1254,23 @@ class LabelClientPlugin:
     def _on_connected(self, result: dict[str, Any]) -> None:
         if self.dock is None:
             return
+        tracks = result["tracks"] or []
+        try:
+            stored = auth.ensure_track_configs(
+                [track.name for track in tracks], self.settings.authcfg_by_track
+            )
+        except LabelClientError as exc:
+            self.dock.set_connected(False)
+            self._fail(str(exc))
+            return
+        self.settings.set_authcfg_by_track(stored)
+        self._refresh_auth_label()
         self.collections = result["collections"]
         self.bulk_capability = result.get("bulk_capability")
         self.bootstrap_style_supported = result.get("bootstrap_style_supported", False)
         self._publish_backend_url = result.get("publish_backend_url", "")
         self.registry = result["registry"]
-        self.tracks = result["tracks"] or []
+        self.tracks = tracks
         if "write_access" in result:
             self._write_access = result.get("write_access")
             # _run_read_task already guards backend/account/config identity. Renewal
@@ -1281,6 +1292,12 @@ class LabelClientPlugin:
         layertree.group_existing_layers(QgsProject.instance(), groups)
         self.dock.set_registry(self.registry)
         for layer in layer_tools.plugin_layers():
+            track_authcfg = stored.get(layer_tools.track_of(layer))
+            if track_authcfg:
+                try:
+                    layer_tools.repair_track_auth(layer, track_authcfg, self.settings.api_base_url)
+                except LabelClientError as exc:
+                    self._message(str(exc), Qgis.MessageLevel.Warning)
             if layer_tools.refresh_generated_captions(layer, self.registry):
                 self.iface.layerTreeView().refreshLayerSymbology(layer.id())
         self.dock.set_connected(True)

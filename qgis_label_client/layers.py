@@ -24,11 +24,11 @@ WHERE THE TRACK GOES, AND WHY IN THREE PLACES
 The provider makes the requests, including the Part 4 writes, so anything that must ride
 on all of them has to be somewhere the provider looks. The track is put in all three:
 
-* the ``X-Track`` header in the URI (:func:`build_oapif_uri`) -- the one that always
-  survives, because it is attached per request rather than followed from a link;
-* the same header on the credential (:mod:`.auth`), so it holds even if a URI is edited;
-* a ``?track=`` query parameter on the landing URL, which is the weakest and is there for
-  the landing request only -- see :func:`landing_url`.
+* the ``X-Track`` header on a track-specific authentication config (:mod:`.auth`).
+  This is required on native writes; Connect creates these after discovering tracks;
+* a ``?track=`` query on the landing URL, which QGIS preserves on reads but drops on
+  native writes and the OPTIONS probe;
+* the same header as a URI parameter for compatibility. QGIS 3.44 drops these entirely.
 
 None of the three is the isolation. The isolation is row-level security in the database;
 these are how the database is told which track this session is, and
@@ -36,19 +36,11 @@ these are how the database is told which track this session is, and
 
 WHERE THE TRANSACTION-TIME INSTANT GOES, AND WHY IT IS THE SAME ANSWER
 
-A historical layer -- what the team *believed* at some instant -- carries an
-``X-Recorded-At`` header in exactly the same place, for a stronger version of the same
-reason. A track scopes a session; an instant scopes one layer, and an ``http-header:`` URI
-parameter is per layer by construction. So a live layer and a historical one coexist over
-one connection, two historical layers at different instants coexist too, and a saved
-``.qgz`` reopens on the instant it was saved with rather than on whatever a setting says.
-
-The instant is also what makes a layer **read-only**, and that is enforced rather than
-documented: it is on the ``OPTIONS`` probe QGIS uses to decide whether a layer is editable
-(``sendOPTIONS`` installs the URI's headers; ``computeCapabilities`` appends no query
-parameters), the server answers without the write verbs, and :func:`mark_read_only` then
-holds the layer read-only on this side as well so a stale capability decision cannot
-reopen it. See :mod:`.core.recorded`.
+Historical layers carry a ``recorded_at`` query on their landing URL. QGIS preserves
+it on reads, but not on OPTIONS or native writes. The historical collection is read-only
+on the server and :func:`mark_read_only` also enforces that locally. URI headers remain
+compatibility metadata; they do not enforce the historical pin on QGIS 3.44. See
+:mod:`.core.recorded` for the measured transport behavior.
 """
 
 from __future__ import annotations
@@ -60,6 +52,7 @@ from qgis.core import (
     Qgis,
     QgsCategorizedSymbolRenderer,
     QgsDataProvider,
+    QgsDataSourceUri,
     QgsEditorWidgetSetup,
     QgsFeatureRenderer,
     QgsFeatureRequest,
@@ -84,7 +77,7 @@ from qgis.PyQt.QtXml import QDomDocument
 from .core import asof, recorded, routing, stylecapture, styling
 from .core import tracks as track_tools
 from .core.asof import AsOfMechanism
-from .core.errors import BackendError, MixedGeometryError
+from .core.errors import BackendError, ConfigurationError, MixedGeometryError
 from .core.expressions import all_of, identifier
 from .core.fields import DEFAULT_FIELDS, CoreFields
 from .core.registry import ClassRegistry, LabelClass
@@ -138,10 +131,8 @@ def landing_url(settings: PluginSettings, track: Track | None = None, recorded_a
         ``OPTIONS`` editability probe, which costs nothing because the historical
         collection is read-only on the server anyway.
     ``track``
-        the *weakest* of the three ways the track reaches the backend, and the one that
-        matters least: the credential carries ``X-Track`` (:mod:`..auth`) and that is what
-        has always done the work. Kept because it makes the landing request explicit and
-        costs nothing.
+        carries the selected track on reads. Native writes drop this query and rely on
+        the track-specific ``X-Track`` authentication header instead (:mod:`.auth`).
     """
     base = normalise_base_url(settings.api_base_url)
     params: dict[str, object] = {}
@@ -812,6 +803,35 @@ def repoint_layer(layer: QgsVectorLayer, uri: str) -> None:
     if not restored:
         raise BackendError(f"Could not restore style on {layer.name()!r} after re-pointing.")
     layer.triggerRepaint()
+
+
+def repair_track_auth(layer: QgsVectorLayer, authcfg: str, backend_url: str) -> bool:
+    """Replace only an old authentication reference, preserving every view parameter.
+
+    Rebuilding a provider destroys its edit buffer. Refuse even an unmodified editing
+    session so Connect cannot silently stop editing or discard pending changes.
+    """
+    if not is_plugin_layer(layer) or layer.providerType() != OAPIF_PROVIDER:
+        return False
+    uri = QgsDataSourceUri(layer.source())
+    try:
+        if normalise_base_url(uri.param("url")) != normalise_base_url(backend_url):
+            return False
+    except ConfigurationError:
+        return False
+    if uri.authConfigId() == authcfg:
+        return False
+    if layer.isEditable():
+        raise ConfigurationError(
+            f"{layer.name()}: its old connection cannot save to the selected track. "
+            "Your edits are still open. Export an edited local copy before stopping "
+            "editing, then Connect again to repair the connection."
+        )
+    read_only = layer.readOnly()
+    uri.setAuthConfigId(authcfg)
+    repoint_layer(layer, uri.uri(False))
+    layer.setReadOnly(read_only)
+    return True
 
 
 def _layer_geometry_family(layer: QgsVectorLayer) -> str:

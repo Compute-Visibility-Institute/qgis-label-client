@@ -34,14 +34,10 @@ A track is an isolated dataset sharing one deployment, and it reaches the backen
 the credential itself say which dataset a request is for, so a layer holding an
 ``authcfg`` cannot be talking to the wrong track.
 
-That is belt; the brace is :func:`qgis_label_client.core.uri.header_params`, which puts
-``X-Track`` in the layer URI as well. Both exist because of an ordering problem with no
-tidy answer: **signing in happens before Connect**, since you need a credential to
-discover what tracks exist, so the first sign-in cannot know the track names. It writes
-one config under the ``""`` key -- a credential naming no track -- and a later sign-in,
-once tracks are known, fans out. Nothing here ever reads a stored token back out to clone
-it into a new config: the token is passed in, used once and dropped, and that property is
-worth more than the convenience of an automatic fan-out.
+Signing in precedes track discovery, so the first config names no track. Connect
+creates separate configs with :func:`ensure_track_configs` once track names are known.
+The URI also carries a track query for reads, but QGIS 3.44 drops URI header parameters
+and does not carry that query onto native writes. The auth config is required for saves.
 """
 
 from __future__ import annotations
@@ -280,9 +276,8 @@ def store_id_token_for_tracks(
 
     The ``""`` entry is always written. It is what a sign-in performed before Connect
     produces, it is the fallback :meth:`PluginSettings.authcfg_for` reaches for, and
-    keeping it means a track added on the server after the last sign-in still has a
-    working credential -- the track then travels in the layer URI's ``X-Track`` header
-    instead, which is why that second mechanism exists.
+    keeping it lets Connect discover newly added tracks. ``ensure_track_configs`` then
+    creates their own credentials before a native layer can use them.
     """
     existing = dict(existing or {})
     wanted = [DEFAULT_TRACK_KEY, *(name for name in tracks if name)]
@@ -294,6 +289,50 @@ def store_id_token_for_tracks(
     # deleting a credential over that guess is not recoverable.
     for name, authcfg in existing.items():
         stored.setdefault(name, authcfg)
+    return stored
+
+
+def ensure_track_configs(tracks: Sequence[str], existing: Mapping[str, str]) -> dict[str, str]:
+    """Bind newly discovered tracks before a native provider receives a credential.
+
+    First sign-in precedes discovery. QGIS 3.44 drops URI headers on native requests,
+    so the unnamed discovery credential must never be the fallback for a tracked layer.
+    Copy only its bearer header inside the auth manager; never copy arbitrary config
+    keys or return a token. Each track gets an independent, encrypted APIHeader config.
+    """
+    stored = dict(existing)
+    wanted = list(dict.fromkeys(name for name in tracks if name))
+    if not stored or not wanted:
+        return stored
+    manager = auth_manager()
+    if not master_password_ready():
+        raise ConfigurationError("Unlock QGIS authentication before connecting history tracks.")
+    source = QgsAuthMethodConfig()
+    source_id = stored.get("") or next(iter(stored.values()))
+    loaded, source = manager.loadAuthenticationConfig(source_id, source, True)
+    header = source.configMap().get(AUTH_HEADER, "") if loaded else ""
+    if not loaded or source.method() != AUTH_METHOD or not header.startswith("Bearer "):
+        raise ConfigurationError(
+            "Sign in again: the stored API credential cannot bind history tracks."
+        )
+    token = header.removeprefix("Bearer ").strip()
+    for track in wanted:
+        config_id = stored.get(track, "")
+        config = QgsAuthMethodConfig()
+        loaded, config = (
+            manager.loadAuthenticationConfig(config_id, config, True)
+            if config_id
+            else (False, config)
+        )
+        if (
+            loaded
+            and config.method() == AUTH_METHOD
+            and config.configMap().get(TRACK_HEADER) == track
+        ):
+            continue
+        # A legacy/shared id may still authenticate other layers. Never mutate it to
+        # name one track; create a separate config instead.
+        stored[track] = store_id_token(token, track=track)
     return stored
 
 

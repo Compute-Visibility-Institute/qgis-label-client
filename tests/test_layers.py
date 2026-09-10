@@ -898,3 +898,65 @@ def test_generated_map_tip_uses_english_and_keeps_historical_context():
     assert fields.name_en in template
     assert fields.class_id in template and fields.label_id in template
     assert "believed until" in template
+
+
+@pytest.mark.parametrize("editing", [False, True])
+def test_auth_repair_preserves_edits_and_changes_only_the_auth_reference(monkeypatch, editing):
+    from qgis_label_client.core.errors import ConfigurationError
+
+    class Uri:
+        def __init__(self, source):
+            self.source = source
+            self.config = "old"
+
+        def authConfigId(self):  # noqa: N802
+            return self.config
+
+        def param(self, key):
+            return "https://example.org/api?track=alpha&recorded_at=2026-01-01"
+
+        def setAuthConfigId(self, config):  # noqa: N802
+            self.config = config
+
+        def uri(self, expand):
+            assert expand is False
+            return self.source + " AUTH=" + self.config
+
+    layer = _FakeLayer("Unsaved polygon", [])
+    layer.properties[layer_tools.COLLECTION_PROPERTY] = "label_polygon"
+    layer.editable = editing
+    layer.source = lambda: "original-filter-and-historical-pin"
+    layer.providerType = lambda: "OAPIF"
+    layer.readOnly = lambda: True
+    changed = []
+    monkeypatch.setattr(layer_tools, "QgsDataSourceUri", Uri)
+    monkeypatch.setattr(layer_tools, "repoint_layer", lambda layer, uri: changed.append(uri))
+    if editing:
+        with pytest.raises(ConfigurationError, match="edits are still open"):
+            layer_tools.repair_track_auth(layer, "new", "https://example.org/api")
+        assert changed == []
+        assert layer.editable is True
+    else:
+        assert layer_tools.repair_track_auth(layer, "new", "https://example.org/api")
+        assert changed == ["original-filter-and-historical-pin AUTH=new"]
+        assert layer.read_only is True
+
+
+@pytest.mark.parametrize(
+    "provider,url",
+    [
+        ("OAPIF", "https://other.example.org/api"),
+        ("OAPIF", "https://example.org/another-api"),
+        ("ogr", "https://example.org/api"),
+    ],
+)
+def test_auth_repair_never_attaches_credentials_to_another_backend(monkeypatch, provider, url):
+    layer = _FakeLayer("foreign", [])
+    layer.properties[layer_tools.COLLECTION_PROPERTY] = "label_polygon"
+    layer.providerType = lambda: provider
+    layer.source = lambda: "foreign source"
+    monkeypatch.setattr(
+        layer_tools, "QgsDataSourceUri", lambda _: SimpleNamespace(param=lambda _: url)
+    )
+    monkeypatch.setattr(layer_tools, "repoint_layer", lambda *_: pytest.fail("must not rebind"))
+    assert not layer_tools.repair_track_auth(layer, "current-secret-ref", "https://example.org/api")

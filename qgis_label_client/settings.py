@@ -280,11 +280,9 @@ class PluginSettings:
     def authcfg_for(self, track: str = "") -> str:
         """The credential a request on `track` should use.
 
-        Falls back to the unnamed default entry, and that fallback is load-bearing rather
-        than tidy: sign-in happens *before* Connect -- you need a credential to discover
-        what tracks exist -- so the common case is one credential stored under ``""`` and
-        used by every track. The track itself travels in the ``X-Track`` header, which
-        does not depend on this at all.
+        Falls back to the unnamed entry for discovery and plugin requests, which send
+        an explicit header themselves. Connect creates track-specific configs before
+        native layers are loaded: QGIS 3.44 native writes drop URI track headers/query.
         """
         mapping = self.authcfg_by_track
         return mapping.get(track) or mapping.get("", "")
