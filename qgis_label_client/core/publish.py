@@ -1179,7 +1179,7 @@ class PublishReport:
             lines.extend(
                 [
                     "",
-                    "Bootstrap styles — class styles apply across all tracks.",
+                    "Bootstrap styles — class styles apply only to the selected track.",
                 ]
             )
             results = {result.class_id: result for result in self.style_results}

@@ -284,7 +284,7 @@ class PublishDialog(QDialog):
             style.setEnabled(available)
             style.setToolTip(
                 "Save this layer's captured style when the class has no custom style. "
-                "Existing custom styles are preserved. Class styles apply across all tracks."
+                "Existing custom styles are preserved. Class styles apply only to the selected track."
             )
             style.toggled.connect(self._refresh)
             self.table.setCellWidget(row, COL_STYLE, style)
@@ -477,7 +477,7 @@ class PublishDialog(QDialog):
         refused = sum(p.status == "refused" for p in proposals)
         text = (
             "Included styles are saved automatically for classes without a custom style. "
-            "Existing custom styles are preserved. Class styles apply across all tracks."
+            "Existing custom styles are preserved. Class styles apply only to the selected track."
         )
         if not self._bootstrap_style_supported and changed:
             text = "Automatic style saving is unavailable on this connection. " + text
@@ -520,7 +520,7 @@ class PublishDialog(QDialog):
     def _show_styles(self) -> None:
         lines = [
             "Included styles are saved during bootstrap when the class has no custom style.",
-            "Existing custom styles are preserved. Class styles apply across all tracks.",
+            "Existing custom styles are preserved. Class styles apply only to the selected track.",
             "",
         ]
         proposals = self.plan().style_proposals()

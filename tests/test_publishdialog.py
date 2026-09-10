@@ -227,4 +227,4 @@ def test_style_preview_explains_automatic_save_without_admin_handoff():
     publishdialog.PublishDialog._render_styles(dialog, plan)
     assert "saved automatically" in dialog.style_label.text
     assert "administrator" not in dialog.style_label.text
-    assert "across all tracks" in dialog.style_label.text
+    assert "only to the selected track" in dialog.style_label.text

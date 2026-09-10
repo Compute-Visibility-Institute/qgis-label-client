@@ -210,6 +210,8 @@ def test_controller_failure_keeps_settings_and_resets_controls(fake_iface, monke
     if axis == "track":
         plugin.set_track("new")
         assert restored == ["old"]
+        plugin.tasks._tasks[-1]._on_success(None)
+        assert restored == ["old", "old"]
     else:
         plugin.apply_as_of()
         assert restored == [date(2026, 1, 1)]

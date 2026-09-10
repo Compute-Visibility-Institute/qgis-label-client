@@ -37,6 +37,7 @@ class LayerState:
     read_only: bool
     abstract: str
     track: object
+    generated_renderer: object
 
     @classmethod
     def capture(cls, layer):
@@ -53,6 +54,7 @@ class LayerState:
             layer.readOnly(),
             layer.abstract(),
             layer.customProperty(layers.TRACK_PROPERTY, None),
+            layer.customProperty(layers.GENERATED_RENDERER_PROPERTY, None),
         )
 
     def restore(self):
@@ -69,6 +71,10 @@ class LayerState:
             layer.removeCustomProperty(layers.TRACK_PROPERTY)
         else:
             layer.setCustomProperty(layers.TRACK_PROPERTY, self.track)
+        if self.generated_renderer is None:
+            layer.removeCustomProperty(layers.GENERATED_RENDERER_PROPERTY)
+        else:
+            layer.setCustomProperty(layers.GENERATED_RENDERER_PROPERTY, self.generated_renderer)
         layer.setReadOnly(self.read_only)
         layer.setAbstract(self.abstract)
         layer.triggerRepaint()
@@ -103,6 +109,8 @@ def transition(targets, settings, changes, registry, track):
         for state in states:
             touched.append(state)
             layers.repoint_for(state.layer, pending, registry, track)
+            if "track" in changes and registry is not None:
+                layers.refresh_generated_style(state.layer, registry)
         settings_started = True
         for key, value in changes.items():
             settings.set(key, value)

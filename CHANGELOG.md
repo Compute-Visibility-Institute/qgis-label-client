@@ -6,6 +6,16 @@ most recent entries into `metadata.txt` at release time.
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-09-10
+
+### Changed
+
+- Load and apply the selected track's independent server styles on Connect and
+  track changes, including projects reopened with a saved track selection.
+- Preserve manually customized layer renderers while refreshing generated styles.
+- Keep the current track and pending edits intact if a track switch cannot finish;
+  ignore registry responses from an earlier connection or selection.
+
 ## [0.1.9] - 2026-09-10
 
 ### Fixed

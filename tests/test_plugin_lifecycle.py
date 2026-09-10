@@ -496,6 +496,10 @@ def test_publish_completion_updates_registry_even_when_result_dialog_not_visible
 
     plugin = LabelClientPlugin(fake_iface)
     plugin.registry = REGISTRY
+    from qgis_label_client.core.tracks import Track
+
+    plugin.tracks = [Track("dev")]
+    plugin.settings.set("track", "dev")
     report = PublishReport(
         style_results=[StyleResult("compound", "initialized", {"fill": "#95ff00"})]
     )

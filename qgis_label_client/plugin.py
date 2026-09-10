@@ -126,6 +126,8 @@ class LabelClientPlugin:
 
         self.dock: LabelClientDock | None = None
         self.registry: ClassRegistry | None = None
+        self._track_change_serial = 0
+        self._registry_pending = False
         self.collections: list[Collection] = []
         self.bulk_capability: bulk.BulkCapability | None = None
         self.bootstrap_style_supported = False
@@ -385,7 +387,7 @@ class LabelClientPlugin:
         self._report(text)
         self._repair_after_401(text)
 
-    def _run_read_task(self, description, work, on_success) -> None:
+    def _run_read_task(self, description, work, on_success, on_failure=None) -> None:
         """Retry a captured GET task once after renewal, without reopening its UI."""
         context = self._session.capture_read(
             self.settings.api_base_url,
@@ -422,6 +424,8 @@ class LabelClientPlugin:
                     self._refresh_credential(resume=lambda: submit(True))
                     return
                 # A repeated 401 is final; it must not start another renewal.
+                if on_failure is not None:
+                    on_failure(message)
                 self._report(message)
 
             self.tasks.run(description, work, succeeded, failed)
@@ -439,6 +443,9 @@ class LabelClientPlugin:
     def _advance_session(self):
         """Invalidate callbacks and the renewal state owned by the previous session."""
         self._session.advance()
+        self._track_change_serial += 1
+        self._registry_pending = False
+        self.registry = None
         self.bulk_capability = None
         self.bootstrap_style_supported = False
         self._publish_backend_url = ""
@@ -594,6 +601,9 @@ class LabelClientPlugin:
 
     def _require_track(self, action: str) -> Track | None:
         """The track, or ``None`` after saying why there is not one. For writes only."""
+        if self._registry_pending:
+            self._fail(f"Cannot {action}: wait for the selected track's styles to load.")
+            return None
         track = self.current_track()
         if track is None:
             stored = self.settings.track
@@ -622,6 +632,9 @@ class LabelClientPlugin:
         """
         if self.dock is None:
             return
+        self._track_change_serial += 1
+        serial = self._track_change_serial
+        self._registry_pending = False
         if name == self.settings.track:
             return
         dirty = layer_tools.dirty_layers()
@@ -641,24 +654,65 @@ class LabelClientPlugin:
             self.dock.set_tracks(self.tracks, self.settings.track)
             self._fail("That history track is unavailable. Connect again to refresh the list.")
             return
-        targets = layer_tools.plugin_layers()
-        repointed = self._transition_layers(targets, {"track": name}, track)
-        if repointed is None:
+        if self.publishing:
             self.dock.set_tracks(self.tracks, self.settings.track)
+            self._message(
+                "Wait for publishing to finish before changing tracks.", Qgis.MessageLevel.Warning
+            )
             return
-        for layer in targets:
-            self._warn_on_track_mismatch(layer, track)
+        url = self.settings.api_base_url
+        authcfg = self.settings.authcfg_for(track.name if track else "")
+        registry_path = str(self.settings.get("class_registry_path"))
+        self._registry_pending = True
+        self.dock.set_tracks(self.tracks, self.settings.track)
+        self.dock.set_status(f"Loading styles for {name or 'the default track'}…")
 
-        self._apply_access()
-        self._refresh_track_banner()
-        # The floor is a property of the track, not of the deployment: a track created last
-        # week cannot answer a question about last year, and the picker should say so
-        # before somebody asks.
-        self._refresh_recorded_bounds()
-        self.dock.set_status(
-            f"History track: {name or '(deployment default)'} - {repointed} layer(s) re-pointed."
-        )
-        log(f"Track switched to {name!r}; {repointed} layer(s) re-pointed.")
+        def work(feedback):
+            return client.fetch_registry(
+                url, registry_path, authcfg, feedback, track=track.name if track else ""
+            )
+
+        def failed(_message):
+            if serial == self._track_change_serial:
+                self._registry_pending = False
+                self.dock.set_tracks(self.tracks, self.settings.track)
+
+        def ready(registry):
+            if serial != self._track_change_serial:
+                return
+            # Editing can start while the registry request is in flight.
+            if layer_tools.dirty_layers():
+                failed("")
+                self._message(
+                    "Save or discard your edits before switching tracks. The current view was kept.",
+                    Qgis.MessageLevel.Warning,
+                )
+                return
+            targets = [
+                layer
+                for layer in layer_tools.plugin_layers()
+                if layer_tools.belongs_to_backend(layer, url)
+            ]
+            repointed = self._transition_layers(targets, {"track": name}, track, registry=registry)
+            self._registry_pending = False
+            if repointed is None:
+                self.dock.set_tracks(self.tracks, self.settings.track)
+                return
+            self.registry = registry
+            self.dock.set_registry(registry)
+            self.dock.set_tracks(self.tracks, self.settings.track)
+            for layer in targets:
+                self._warn_on_track_mismatch(layer, track)
+                self.iface.layerTreeView().refreshLayerSymbology(layer.id())
+            self._refresh_access()
+            self._refresh_track_banner()
+            self._refresh_recorded_bounds()
+            self.dock.set_status(
+                f"History track: {name or '(deployment default)'} - {repointed} layer(s) re-pointed."
+            )
+            log(f"Track switched to {name!r}; {repointed} layer(s) re-pointed.")
+
+        self._run_read_task("Load history track styles", work, ready, failed)
 
     def _refresh_recorded_bounds(self) -> None:
         """Point the historical picker at what the selected track can actually answer."""
@@ -1216,7 +1270,10 @@ class LabelClientPlugin:
         registry_path = str(self.settings.get("class_registry_path"))
         tracks_path = str(self.settings.get("tracks_path"))
         capabilities_path = str(self.settings.get("capabilities_path"))
-        track = self._track_name()
+        selected_track_name = self.settings.track
+        self._track_change_serial += 1
+        serial = self._track_change_serial
+        self._registry_pending = True
         self.bulk_capability = None
         self.bootstrap_style_supported = False
         self._publish_backend_url = ""
@@ -1233,11 +1290,15 @@ class LabelClientPlugin:
             # there are no tracks and every write is refused, which is the honest state
             # rather than a broken one.
             tracks = _fetch_tracks_or_none(url, tracks_path, authcfg, feedback)
+            selected = resolve_track(tracks, selected_track_name)
+            track = selected.name if selected else ""
             capabilities = _fetch_capabilities_or_empty(
                 url, capabilities_path, authcfg, feedback, track=track
             )
             return {
                 "tracks": tracks,
+                "registry_track": track,
+                "connection_serial": serial,
                 "collections": client.fetch_collections(url, authcfg, feedback, track=track),
                 "registry": client.fetch_registry(
                     url, registry_path, authcfg, feedback, track=track
@@ -1249,11 +1310,20 @@ class LabelClientPlugin:
                 "access_context": context,
             }
 
-        self._run_read_task("Connect to labeling API", work, self._on_connected)
+        def failed(_message):
+            if serial == self._track_change_serial:
+                self._registry_pending = False
+                self.registry = None
+                self.dock.set_connected(False)
+
+        self._run_read_task("Connect to labeling API", work, self._on_connected, failed)
 
     def _on_connected(self, result: dict[str, Any]) -> None:
         if self.dock is None:
             return
+        if result.get("connection_serial", self._track_change_serial) != self._track_change_serial:
+            return
+        self._registry_pending = False
         tracks = result["tracks"] or []
         try:
             stored = auth.ensure_track_configs(
@@ -1261,6 +1331,7 @@ class LabelClientPlugin:
             )
         except LabelClientError as exc:
             self.dock.set_connected(False)
+            self.registry = None
             self._fail(str(exc))
             return
         self.settings.set_authcfg_by_track(stored)
@@ -1291,14 +1362,21 @@ class LabelClientPlugin:
         self.dock.set_collections(groups, checked=loaded)
         layertree.group_existing_layers(QgsProject.instance(), groups)
         self.dock.set_registry(self.registry)
+        selected = self.current_track()
+        style_track = result.get("registry_track", selected.name if selected else "")
         for layer in layer_tools.plugin_layers():
+            if not layer_tools.belongs_to_backend(layer, self.settings.api_base_url):
+                continue
             track_authcfg = stored.get(layer_tools.track_of(layer))
             if track_authcfg:
                 try:
                     layer_tools.repair_track_auth(layer, track_authcfg, self.settings.api_base_url)
                 except LabelClientError as exc:
                     self._message(str(exc), Qgis.MessageLevel.Warning)
-            if layer_tools.refresh_generated_captions(layer, self.registry):
+            if layer_tools.track_of(layer) != style_track:
+                continue
+            refreshed = layer_tools.refresh_generated_style(layer, self.registry)
+            if layer_tools.refresh_generated_captions(layer, self.registry) or refreshed:
                 self.iface.layerTreeView().refreshLayerSymbology(layer.id())
         self.dock.set_connected(True)
         self._refresh_track_banner()
@@ -1336,6 +1414,9 @@ class LabelClientPlugin:
         typed at the database and need nothing from this method.
         """
         if self.dock is None or not collection_ids:
+            return
+        if self._registry_pending:
+            self._fail("Wait for the selected track's styles to load before adding layers.")
             return
         if not self.registry:
             self._fail("Connect first: the class registry drives layer configuration.")
@@ -1462,11 +1543,17 @@ class LabelClientPlugin:
         self._refresh_axes()
         log(summary)
 
-    def _transition_layers(self, targets, changes, track):
+    def _transition_layers(self, targets, changes, track, *, registry=None):
         """One foreground activity owns the complete change, including rollback."""
         activity = self.activities.begin()
         try:
-            return transition(targets, self.settings, changes, self.registry, track)
+            return transition(
+                targets,
+                self.settings,
+                changes,
+                registry if registry is not None else self.registry,
+                track,
+            )
         except TransitionError as exc:
             self._fail(str(exc))
             return None
@@ -2072,7 +2159,7 @@ class LabelClientPlugin:
         self.tasks.run(
             f"Publish local layers to {track.name}",
             work,
-            lambda report: self._on_published(selected, routes.untyped, report, track.name),
+            lambda report: self._on_published(selected, routes.untyped, report, track.name, url),
             failed,
             # A cancelled publish is not a discarded read: part of it is already on the
             # server, and the user needs the summary saying which part.
@@ -2112,10 +2199,21 @@ class LabelClientPlugin:
         return answer == QMessageBox.StandardButton.Yes
 
     def _on_published(
-        self, plans, collection_id: str, report: PublishReport, track: str = ""
+        self,
+        plans,
+        collection_id: str,
+        report: PublishReport,
+        track: str = "",
+        backend_url: str = "",
     ) -> None:
         self._end_publish()
-        if self.registry is not None and report.style_results:
+        current_track = self.current_track()
+        same_context = (
+            current_track is not None
+            and current_track.name == (track or report.track)
+            and (not backend_url or backend_url == self.settings.api_base_url)
+        )
+        if self.registry is not None and report.style_results and same_context:
             self.registry = bootstrapstyles.update_registry(self.registry, report.style_results)
         if self.dock is None:
             return

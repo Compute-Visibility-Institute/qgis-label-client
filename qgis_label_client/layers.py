@@ -45,6 +45,7 @@ compatibility metadata; they do not enforce the historical pin on QGIS 3.44. See
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterable
 from dataclasses import replace
 
@@ -63,6 +64,7 @@ from qgis.core import (
     QgsPainting,
     QgsProject,
     QgsProperty,
+    QgsReadWriteContext,
     QgsRendererCategory,
     QgsSimpleMarkerSymbolLayerBase,
     QgsSymbolLayer,
@@ -98,6 +100,7 @@ COLLECTION_PROPERTY = "cvi/collection_id"
 #: would otherwise redirect their edits silently. With this, the panel can compare what
 #: is loaded against what is selected and say so.
 TRACK_PROPERTY = "cvi/track"
+GENERATED_RENDERER_PROPERTY = "cvi/generated_renderer"
 
 #: The transaction-time instant a layer is a view of, or absent for a live layer.
 #:
@@ -811,14 +814,9 @@ def repair_track_auth(layer: QgsVectorLayer, authcfg: str, backend_url: str) -> 
     Rebuilding a provider destroys its edit buffer. Refuse even an unmodified editing
     session so Connect cannot silently stop editing or discard pending changes.
     """
-    if not is_plugin_layer(layer) or layer.providerType() != OAPIF_PROVIDER:
+    if not belongs_to_backend(layer, backend_url):
         return False
     uri = QgsDataSourceUri(layer.source())
-    try:
-        if normalise_base_url(uri.param("url")) != normalise_base_url(backend_url):
-            return False
-    except ConfigurationError:
-        return False
     if uri.authConfigId() == authcfg:
         return False
     if layer.isEditable():
@@ -832,6 +830,17 @@ def repair_track_auth(layer: QgsVectorLayer, authcfg: str, backend_url: str) -> 
     repoint_layer(layer, uri.uri(False))
     layer.setReadOnly(read_only)
     return True
+
+
+def belongs_to_backend(layer: QgsVectorLayer, backend_url: str) -> bool:
+    """Keep credentials and track changes away from another saved connection."""
+    if not is_plugin_layer(layer) or layer.providerType() != OAPIF_PROVIDER:
+        return False
+    uri = QgsDataSourceUri(layer.source())
+    try:
+        return normalise_base_url(uri.param("url")) == normalise_base_url(backend_url)
+    except ConfigurationError:
+        return False
 
 
 def _layer_geometry_family(layer: QgsVectorLayer) -> str:
@@ -1336,7 +1345,34 @@ def _apply_class_renderer(
         catch_all = _symbol_for(registry.unclassified_or_first(), historical, geom_type)
         categories.append(QgsRendererCategory("", catch_all, "Other class (unexpected here)", True))
     layer.setRenderer(QgsCategorizedSymbolRenderer(registry.fields.class_id, categories))
+    layer.setCustomProperty(GENERATED_RENDERER_PROPERTY, renderer_fingerprint(layer))
     layer.triggerRepaint()
+
+
+def renderer_fingerprint(layer: QgsVectorLayer) -> str:
+    """Hash the complete renderer, including analyst changes to symbols or labels."""
+    try:
+        document = QDomDocument()
+        document.appendChild(layer.renderer().save(document, QgsReadWriteContext()))
+        rendered = document.toString()
+        return (
+            hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+            if isinstance(rendered, str)
+            else ""
+        )
+    except (AttributeError, TypeError):
+        return ""
+
+
+def refresh_generated_style(layer: QgsVectorLayer, registry: ClassRegistry) -> bool:
+    """Refresh owned server styling while preserving an analyst's custom renderer."""
+    previous = layer.customProperty(GENERATED_RENDERER_PROPERTY, "")
+    if not previous or previous != renderer_fingerprint(layer):
+        return False
+    names = [field.name() for field in layer.fields()]
+    historical = bool(recorded_at_of(layer)) and registry.fields.superseded in names
+    _apply_class_renderer(layer, registry, historical)
+    return True
 
 
 def _apply_class_value_map(layer: QgsVectorLayer, registry: ClassRegistry) -> None:
