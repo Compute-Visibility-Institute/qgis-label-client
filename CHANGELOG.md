@@ -6,6 +6,16 @@ most recent entries into `metadata.txt` at release time.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-10
+
+### Fixed
+
+- Choose bootstrap destinations from the server's upload capabilities, excluding
+  the read-only class registry and repairing stale destination preferences.
+- Resolve geometry-specific sibling destinations immediately after selection and
+  retain verified bulk capabilities through upload, preventing accidental
+  fallback to individual feature requests.
+
 ## [0.1.3] - 2026-09-10
 
 ### Added

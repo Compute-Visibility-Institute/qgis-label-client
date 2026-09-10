@@ -831,6 +831,46 @@ def test_a_bulk_capable_backend_gets_batches_and_the_probe_happens_once(recorder
     assert report.clean
 
 
+def test_verified_preview_capability_keeps_snapshot_sized_upload_batched(recorder, monkeypatch):
+    """A later unavailable discovery endpoint cannot turn 2,044 rows into 2,044 POSTs."""
+    capability = publish_tools.bulk.parse_capabilities(CAPABILITIES)
+    assert capability is not None
+
+    def no_single_post(*args, **kwargs):
+        pytest.fail("Verified bootstrap must not downgrade to individual POSTs")
+
+    monkeypatch.setattr(client, "create_feature", no_single_post)
+    counts = [57, 775, 272, 804, 28, 108]
+    prepared = [
+        _prepared(_features(count), name=f"Layer {index}", collection_id="label_polygon")
+        for index, count in enumerate(counts)
+    ]
+    report = publish_tools.publish(
+        _bulk_request(*prepared, verified_bulk=capability, chunk_size=200)
+    )
+    assert recorder.probes == 0
+    assert len(recorder.batches) == 14
+    assert report.published == 2044
+    assert report.clean
+
+
+def test_verified_preview_refuses_registry_destination_before_any_writes(recorder):
+    capability = publish_tools.bulk.parse_capabilities(CAPABILITIES)
+    assert capability is not None
+    with pytest.raises(ConfigurationError, match="label_class"):
+        publish_tools.publish(
+            _bulk_request(
+                _prepared(_features(2), name="Good", collection_id="label_polygon"),
+                _prepared(_features(2), name="Wrong", collection_id="label_class"),
+                verified_bulk=capability,
+            )
+        )
+    assert recorder.probes == 0
+    assert not recorder.batches
+    assert not recorder.attempts
+    assert not recorder.extents
+
+
 def test_no_feature_is_ever_offered_twice_across_the_batches(recorder):
     # The duplicate-making move, restated for batches. A feature belongs to exactly one
     # chunk, and a chunk is offered until it is answered -- never split, never re-formed.

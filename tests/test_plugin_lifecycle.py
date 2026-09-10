@@ -312,7 +312,10 @@ def _connected(fake_iface, *collection_ids):
     from qgis_label_client.core.collections import Collection
 
     plugin = _plugin(fake_iface)
-    plugin.collections = [Collection(collection_id=c, title=c) for c in collection_ids]
+    plugin.collections = [
+        Collection(collection_id=c, title=c, transactional=True) for c in collection_ids
+    ]
+    plugin._publish_backend_url = plugin.settings.api_base_url
     return plugin
 
 
@@ -340,18 +343,142 @@ def test_a_setting_stored_before_the_split_needs_no_migration(fake_iface):
 
 
 def test_a_backend_this_cannot_read_falls_back_to_asking(monkeypatch, fake_iface):
-    # Degrading honestly: the plugin asks which collection holds the labels and sends
-    # everything there, which is exactly what it did before the split. Guessing instead
-    # would put the founding dataset in another dataset's collections, permanently.
+    # Choosing a family resolves its geometry routes immediately, and refuses geometry
+    # families that the selected destination does not offer.
     plugin = _connected(fake_iface, "capture_point", "capture_polygon", "annotation_point")
-    monkeypatch.setattr(plugin, "_ask_collection", lambda *args: "annotation_point")
+    monkeypatch.setattr(plugin, "_ask_label_collection", lambda *args: "annotation_point")
     routes = plugin._label_routes()
-    assert routes.collection_for("MultiPolygon") == "annotation_point"
+    assert routes.collection_for("Point") == "annotation_point"
+    assert routes.collection_for("MultiPolygon") == ""
     plugin.unload()
 
 
 def test_a_backend_this_cannot_read_and_nobody_answers_for_routes_nothing(monkeypatch, fake_iface):
     plugin = _connected(fake_iface, "capture_point", "capture_polygon", "annotation_point")
-    monkeypatch.setattr(plugin, "_ask_collection", lambda *args: "")
+    monkeypatch.setattr(plugin, "_ask_label_collection", lambda *args: "")
+    assert not plugin._label_routes()
+    plugin.unload()
+
+
+# A saved class-registry destination caused thousands of single-feature refusals.
+# Keep the real collection topology here: all four typed families plus the registry.
+
+
+def _bulk_capability(*ids):
+    from qgis_label_client.core.bulk import BulkCapability
+
+    return BulkCapability("v1/collections/{collectionId}/items:bulk", tuple(ids), 500, 1000000)
+
+
+def test_bulk_destinations_replace_a_saved_registry_preference(fake_iface, monkeypatch):
+    typed = ["label_point", "label_line", "label_polygon"]
+    views = [
+        f"label_{mode}_{family}"
+        for mode in ("current", "asof", "history")
+        for family in ("point", "line", "polygon")
+    ]
+    plugin = _connected(fake_iface, "label_class", *typed, *views, "labeled_extent")
+    plugin.settings.set("label_collection", "label_class")
+    plugin.bulk_capability = _bulk_capability(*typed)
+    monkeypatch.setattr(plugin, "_ask_label_collection", lambda *_: pytest.fail("not ambiguous"))
+
+    routes = plugin._label_routes()
+
+    assert routes.collection_for("Point") == "label_point"
+    assert routes.collection_for("MultiLineString") == "label_line"
+    assert routes.collection_for("Polygon") == "label_polygon"
+    assert routes.untyped == ""
+    assert plugin.settings.get("label_collection") == "label"
+    plugin.unload()
+
+
+def test_choosing_a_typed_family_routes_all_its_siblings_on_the_first_run(fake_iface, monkeypatch):
+    plugin = _connected(fake_iface, "one_point", "one_polygon", "two_point", "two_polygon")
+    plugin.bulk_capability = _bulk_capability(*(c.collection_id for c in plugin.collections))
+    monkeypatch.setattr(plugin, "_ask_label_collection", lambda *_: "two_point")
+    routes = plugin._label_routes()
+    assert routes.collection_for("Point") == "two_point"
+    assert routes.collection_for("MultiPolygon") == "two_polygon"
+    assert routes.collection_for("LineString") == ""
+    plugin.unload()
+
+
+@pytest.mark.parametrize("transactional", [None, False])
+def test_unverified_collections_cannot_be_publish_destinations(fake_iface, transactional):
+    from qgis_label_client.core.collections import Collection
+
+    plugin = _connected(fake_iface)
+    plugin.collections = [Collection("label_class", "Registry", transactional=transactional)]
+    plugin.settings.set("label_collection", "label_class")
+    assert not plugin._label_routes()
+    assert any("verified upload destinations" in text for _, text, _ in fake_iface.messages)
+    plugin.unload()
+
+
+def test_bulk_collection_must_also_exist_in_the_connected_collection_list(fake_iface):
+    plugin = _connected(fake_iface, "registry")
+    plugin.bulk_capability = _bulk_capability("missing_point")
+    assert not plugin._label_routes()
+    plugin.unload()
+
+
+def test_bulk_metadata_from_a_previous_backend_cannot_route_a_publish(fake_iface):
+    plugin = _connected(fake_iface, "old_point")
+    plugin.bulk_capability = _bulk_capability("old_point")
+    plugin.settings.set("api_base_url", "https://different.example")
+    assert not plugin._label_routes()
+    assert any("Connect to this backend" in text for _, text, _ in fake_iface.messages)
+    plugin.unload()
+
+
+def test_explicit_legacy_write_metadata_still_supports_untyped_publish(fake_iface):
+    plugin = _connected(fake_iface, "annotations-raw")
+    plugin.settings.set("label_collection", "annotations-raw")
+    routes = plugin._label_routes()
+    assert routes.collection_for("Polygon") == "annotations-raw"
+    assert plugin.settings.get("label_collection") == "annotations-raw"
+    plugin.unload()
+
+
+def test_bulk_discovery_failure_does_not_prevent_read_only_connection(monkeypatch):
+    from qgis_label_client import client
+    from qgis_label_client.core.errors import BackendError
+    from qgis_label_client.plugin import _fetch_bulk_or_none
+
+    def unavailable(*args, **kwargs):
+        raise BackendError("unavailable", status=503)
+
+    monkeypatch.setattr(client, "fetch_capabilities", unavailable)
+    assert _fetch_bulk_or_none("https://example", "v1/capabilities", "", None) is None
+
+
+def test_bulk_discovery_keeps_server_limits_and_track(monkeypatch):
+    from qgis_label_client import client
+    from qgis_label_client.plugin import _fetch_bulk_or_none
+
+    def capability(url, path, authcfg, feedback, track):
+        assert track == "dev"
+        return {
+            "bulk_create": {
+                "atomic": True,
+                "collections": ["annotation_point"],
+                "max_features": 200,
+                "max_body_bytes": 50000,
+            }
+        }
+
+    monkeypatch.setattr(client, "fetch_capabilities", capability)
+    result = _fetch_bulk_or_none("https://example", "v1/capabilities", "", None, "dev")
+    assert result.collections == ("annotation_point",)
+    assert result.max_features == 200
+    assert result.max_body_bytes == 50000
+
+
+def test_new_session_discards_previous_publish_destination_authority(fake_iface):
+    plugin = _connected(fake_iface, "annotation_point")
+    plugin.bulk_capability = _bulk_capability("annotation_point")
+    plugin._advance_session()
+    assert plugin.bulk_capability is None
+    assert plugin._publish_backend_url == ""
     assert not plugin._label_routes()
     plugin.unload()

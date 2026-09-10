@@ -43,8 +43,8 @@ from . import auth, client, imagery, network, oauth_flow, qa
 from . import layers as layer_tools
 from . import publish as publish_tools
 from .access import LayerAccess
+from .core import bulk, oauth, recorded, routing
 from .core import collections as collection_groups
-from .core import oauth, recorded, routing
 from .core.activity import ActivityRegistry, ActivityState
 from .core.asof import AsOfMechanism, describe
 from .core.collections import Collection
@@ -102,6 +102,18 @@ def _fetch_tracks_or_none(
         raise
 
 
+def _fetch_bulk_or_none(url, path, authcfg, feedback, track="") -> bulk.BulkCapability | None:
+    """Discover publish destinations without preventing a read-only connection."""
+    if not path:
+        return None
+    try:
+        document = client.fetch_capabilities(url, path, authcfg, feedback, track=track)
+    except LabelClientError as exc:
+        log_warning(f"Could not discover bulk publish destinations: {exc}")
+        return None
+    return bulk.parse_capabilities(document)
+
+
 class LabelClientPlugin:
     """Entry point QGIS instantiates once per load."""
 
@@ -115,6 +127,8 @@ class LabelClientPlugin:
         self.dock: LabelClientDock | None = None
         self.registry: ClassRegistry | None = None
         self.collections: list[Collection] = []
+        self.bulk_capability: bulk.BulkCapability | None = None
+        self._publish_backend_url = ""
         # Every history track the backend offers. Empty until Connect: the plugin has no
         # opinion about what tracks exist, exactly as it has none about what classes do.
         self.tracks: list[Track] = []
@@ -255,6 +269,8 @@ class LabelClientPlugin:
         self.dock = None
         self.registry = None
         self.collections = []
+        self.bulk_capability = None
+        self._publish_backend_url = ""
         self.tracks = []
         self.publishing = False
         self._session.refreshing = False
@@ -421,6 +437,8 @@ class LabelClientPlugin:
     def _advance_session(self):
         """Invalidate callbacks and the renewal state owned by the previous session."""
         self._session.advance()
+        self.bulk_capability = None
+        self._publish_backend_url = ""
 
     def _on_project_read(self, *_args):
         self._refresh_access()
@@ -1194,7 +1212,10 @@ class LabelClientPlugin:
         authcfg = self.settings.authcfg
         registry_path = str(self.settings.get("class_registry_path"))
         tracks_path = str(self.settings.get("tracks_path"))
+        capabilities_path = str(self.settings.get("capabilities_path"))
         track = self._track_name()
+        self.bulk_capability = None
+        self._publish_backend_url = ""
 
         self.dock.set_status("Connecting…")
         context = self._permission_context()
@@ -1213,6 +1234,10 @@ class LabelClientPlugin:
                 "registry": client.fetch_registry(
                     url, registry_path, authcfg, feedback, track=track
                 ),
+                "bulk_capability": _fetch_bulk_or_none(
+                    url, capabilities_path, authcfg, feedback, track=track
+                ),
+                "publish_backend_url": url,
                 "write_access": self._fetch_access(url, authcfg, feedback),
                 "access_context": context,
             }
@@ -1223,6 +1248,8 @@ class LabelClientPlugin:
         if self.dock is None:
             return
         self.collections = result["collections"]
+        self.bulk_capability = result.get("bulk_capability")
+        self._publish_backend_url = result.get("publish_backend_url", "")
         self.registry = result["registry"]
         self.tracks = result["tracks"] or []
         if "write_access" in result:
@@ -1718,38 +1745,64 @@ class LabelClientPlugin:
             self.settings.set(key, chosen)
         return chosen
 
+    def _ask_label_collection(self, eligible: list[Collection]) -> str:
+        """Choose a verified destination family using the server's display names."""
+        groups = collection_groups.group_by_mode(eligible)
+        choices = [f"{group.display_name} ({', '.join(group.collection_ids)})" for group in groups]
+        value, accepted = QInputDialog.getItem(
+            self.iface.mainWindow(),
+            "Label destination",
+            "Which editable collection should receive these labels?",
+            choices,
+            0,
+            False,
+        )
+        if not accepted or value not in choices:
+            return ""
+        return groups[choices.index(value)].collection_ids[0]
+
     def _label_routes(self) -> routing.CollectionRoutes:
-        """Which collection each geometry type publishes into, for this backend.
+        """Resolve geometry routes only among destinations advertised for writes.
 
-        Resolved against the collections ``/collections`` actually listed, never against
-        ids compiled in here -- see :mod:`.core.routing`. ``label_collection`` is the hint
-        about WHICH group of collections holds labels, not the destination: its stem is
-        what matches, so a value remembered from before the geometry split still selects
-        the split collections afterwards, with no migration and no re-prompt.
-
-        Falls back to asking, which is what this plugin has always done when a collection
-        id could not be worked out. That path degrades to exactly the pre-split behaviour
-        -- one collection, everything into it -- and the preview still shows it per layer,
-        so the analyst sees what the fallback decided rather than inheriting it silently.
+        The registry and historical views also appear in /collections. An old saved
+        preference must never turn either into a bootstrap destination. Bulk capabilities
+        identify label destinations directly; older deployments must explicitly advertise
+        collection write support before the plugin offers their collections for publishing.
         """
-        listed = [collection.collection_id for collection in self.collections]
+        if self._publish_backend_url != self.settings.api_base_url:
+            self._fail("Connect to this backend before choosing upload destinations.")
+            return routing.CollectionRoutes()
+        if self.bulk_capability is not None:
+            eligible = [
+                collection
+                for collection in self.collections
+                if self.bulk_capability.serves(collection.collection_id)
+            ]
+        else:
+            eligible = [c for c in self.collections if c.transactional is True]
+        listed = [collection.collection_id for collection in eligible]
+        if not listed:
+            self._fail(
+                "This connection did not advertise any verified upload destinations. "
+                "Connect again; if this persists, ask an administrator to check the "
+                "capabilities endpoint or collection write metadata. Nothing was published."
+            )
+            return routing.CollectionRoutes()
         preferred = str(self.settings.get("label_collection")).strip()
         routes = routing.build_routes(listed, preferred=preferred)
+        if not routes:
+            chosen = self._ask_label_collection(eligible)
+            if not chosen or chosen not in listed:
+                return routing.CollectionRoutes()
+            # Resolve siblings immediately: choosing a point collection must not send
+            # this run's polygons into it and only become correct on the next run.
+            routes = routing.build_routes(listed, preferred=chosen)
         if routes:
-            log(f"Publish routing: {routes.describe()}")
-            return routes
-        if routes.ambiguous:
-            # Said out loud rather than tie-broken. Two unrelated sets of geometry-typed
-            # collections is a question about this deployment, and answering it with a
-            # rule here would put features in another dataset's collections permanently.
-            log_warning(
-                "Could not tell which collections hold labels; more than one geometry-typed "
-                f"set is offered ({', '.join(routes.ambiguous)}). Asking."
+            self.settings.set(
+                "label_collection", routes.stem if routes.by_family else routes.untyped
             )
-        chosen = self._collection_setting(
-            "label_collection", "Label collection", "Which collection holds the labels?"
-        )
-        return routing.single(chosen) if chosen else routing.CollectionRoutes()
+            log(f"Publish routing: {routes.describe()}")
+        return routes
 
     def _on_history(self, label_id: str, entries, track: str = "") -> None:
         if self.dock is None:
@@ -1912,7 +1965,6 @@ class LabelClientPlugin:
         # those rows again to move them.
         routes = self._label_routes()
         if not routes:
-            self._fail("No collection chosen. Nothing was published.")
             return
 
         dialog = PublishDialog(
@@ -1962,12 +2014,12 @@ class LabelClientPlugin:
             extent_collection=extent_collection,
             fields=self.registry.fields,
             track=track.name,
-            # Asked once on the worker, before the first write. A deployment offering the
-            # atomic bulk create turns this from fifteen minutes into a handful of
-            # requests; one that does not answers 404 and the run proceeds one feature at
-            # a time, with nothing said to the analyst about a backend they cannot update.
+            # Reuse the capability that established the preview destinations. Legacy
+            # servers with explicit collection write metadata can still probe for bulk
+            # support on the worker before using their single-feature endpoint.
             capabilities_path=self.settings.get("capabilities_path"),
             chunk_size=self.settings.get("publish_chunk_size"),
+            verified_bulk=self.bulk_capability,
         )
 
         self.publishing = True

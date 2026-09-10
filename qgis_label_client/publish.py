@@ -530,6 +530,9 @@ class PublishRequest:
     #: caller that has not opted into the bulk path gets the slower one that has always
     #: worked, not a probe it did not ask for.
     capabilities_path: str = ""
+    #: Capability used to choose label destinations during Connect. Carry that same
+    #: authority into the worker so another failed probe cannot downgrade the upload.
+    verified_bulk: BulkCapability | None = None
     #: Features per bulk request, before the deployment's own cap is applied. Zero means
     #: "as many as the backend allows"; see the ``publish_chunk_size`` setting for why the
     #: panel asks for fewer than that.
@@ -772,6 +775,8 @@ def _discover_bulk(request: PublishRequest, feedback: QgsFeedback | None) -> _Bu
     a backend without it answers a plain 404 rather than having the request proxied to the
     feature service, where "unknown path" and "endpoint failed" look alike.
     """
+    if request.verified_bulk is not None:
+        return _BulkRun(capability=request.verified_bulk, run_id=request.run_id)
     if not request.capabilities_path:
         return None
     try:
@@ -1247,6 +1252,20 @@ def publish(request: PublishRequest, feedback: QgsFeedback | None = None) -> Pub
             "features would join. Choose a track in the panel before publishing."
         )
 
+    if request.verified_bulk is not None:
+        unsupported = sorted(
+            {
+                request.target_for(prepared)
+                for prepared in request.layers
+                if not request.verified_bulk.serves(request.target_for(prepared))
+            }
+        )
+        if unsupported:
+            raise ConfigurationError(
+                "The selected label destinations are not supported by this server's "
+                "bootstrap uploader: " + ", ".join(unsupported) + ". Reconnect before publishing."
+            )
+
     report = PublishReport(
         track=request.track,
         style_proposals=resolve_styles(
@@ -1257,8 +1276,8 @@ def publish(request: PublishRequest, feedback: QgsFeedback | None = None) -> Pub
     )
     progress = _Progress(total=request.total_features(), feedback=feedback)
     # Once, before the run, and never inferred from a write that happened not to fail.
-    # Every way of failing to get an answer here ends at the one-feature-per-request path,
-    # which is correct against a backend that has not been updated -- see _discover_bulk.
+    # A capability already used by the preview is retained. Older callers without
+    # one can still discover bulk support here -- see _discover_bulk.
     run = _discover_bulk(request, feedback)
     for prepared in request.layers:
         # The extent POST is inside the same guard as the features, because it has the
