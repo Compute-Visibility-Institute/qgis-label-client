@@ -446,6 +446,11 @@ about the analysts' one — the sentence alone cannot tell them apart.
 **Plugins → CVI Label Client → Publish local layers…**, or the button in the panel's
 *Bootstrap* group.
 
+The layer list follows the Layers panel from top to bottom, including nested groups.
+Use **Order → A → Z** for alphabetical sorting, or switch back to **Layers panel**.
+Changing order preserves your selections and settings. **Uncheck all** clears the
+selection so you can choose just the layers you want to publish.
+
 The first deployment starts with an empty backend and a folder of Esri Shapefiles that has
 been version-controlled by being copied and dated. This action reads the vector layers open
 in the project — excluding the ones this plugin loaded, which are already on the server —

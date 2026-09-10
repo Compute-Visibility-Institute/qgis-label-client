@@ -6,6 +6,14 @@ most recent entries into `metadata.txt` at release time.
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-09-10
+
+### Changed
+
+- Bootstrap lists local layers in Layers panel order, including nested groups.
+- Add an optional A to Z order and allow switching back to Layers panel order
+  without losing selections, class mappings, styles or survey settings.
+
 ## [0.1.11] - 2026-09-10
 
 ### Added

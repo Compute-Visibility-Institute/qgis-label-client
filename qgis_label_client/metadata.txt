@@ -4,7 +4,7 @@ qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 supportsQt6=True
 description=Thin client for a bitemporal OGC API - Features labeling backend: Google sign-in, refreshed signed imagery URLs, a registry-driven class vocabulary, and a control for each time axis - as-of on valid time, and a read-only historical view on transaction time.
-version=0.1.11
+version=0.1.12
 author=Compute Visibility Institute
 email=opensource@example.org
 
@@ -48,5 +48,6 @@ deprecated=False
 server=False
 hasProcessingProvider=no
 
-changelog=0.1.11
-    - Add Uncheck all to the bootstrap layer selection dialog.
+changelog=0.1.12
+    - Follow the Layers panel order by default in bootstrap, with optional A to Z sorting.
+    - Preserve selections and class, style and survey settings when changing order.

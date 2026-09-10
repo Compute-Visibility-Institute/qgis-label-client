@@ -102,6 +102,14 @@ COL_NOTES = 9
 
 #: Item data role carrying a layer id on a row.
 LAYER_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+ORDER_ROLE = LAYER_ROLE + 1
+
+
+class _LayerNameItem(QTableWidgetItem):
+    """Move whole table rows using an explicit, stable display order."""
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        return self.data(ORDER_ROLE) < other.data(ORDER_ROLE)
 
 
 class PublishDialog(QDialog):
@@ -126,6 +134,7 @@ class PublishDialog(QDialog):
         self.setMinimumSize(1000, 560)
 
         self._sources = list(sources)
+        self._panel_order = {source.layer_id: index for index, source in enumerate(sources)}
         self._registry = registry
         self._track = track
         self._routes = routes
@@ -150,6 +159,17 @@ class PublishDialog(QDialog):
         self.uncheck_all.setToolTip("Uncheck every layer, then choose the layers to publish.")
         self.uncheck_all.clicked.connect(self._uncheck_all)
         selection_controls.addWidget(self.uncheck_all)
+        order_label = QLabel("Order:", self)
+        self.layer_order = QComboBox(self)
+        self.layer_order.addItem("Layers panel", "panel")
+        self.layer_order.addItem("A → Z", "alphabetical")
+        self.layer_order.setToolTip(
+            "Choose Layers panel order or alphabetical order by layer name."
+        )
+        order_label.setBuddy(self.layer_order)
+        self.layer_order.currentIndexChanged.connect(self._set_layer_order)
+        selection_controls.addWidget(order_label)
+        selection_controls.addWidget(self.layer_order)
         selection_controls.addStretch()
         self.layer_details = QCheckBox("Show layer details", self)
         self.layer_details.setToolTip("Show destination collection, CRS, field mapping and notes.")
@@ -257,8 +277,9 @@ class PublishDialog(QDialog):
         for row, layer_plan in enumerate(plan):
             source = layer_plan.source
 
-            name_item = QTableWidgetItem(source.name)
+            name_item = _LayerNameItem(source.name)
             name_item.setData(LAYER_ROLE, source.layer_id)
+            name_item.setData(ORDER_ROLE, row)
             name_item.setFlags(name_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             name_item.setCheckState(
                 Qt.CheckState.Checked if layer_plan.choice.publish else Qt.CheckState.Unchecked
@@ -383,6 +404,26 @@ class PublishDialog(QDialog):
         return combo
 
     # --- state ----------------------------------------------------------------
+
+    def _set_layer_order(self, _index: int) -> None:
+        if self.layer_order.currentData() == "alphabetical":
+            self._sources.sort(
+                key=lambda source: (source.name.casefold(), self._panel_order[source.layer_id])
+            )
+        else:
+            self._sources.sort(key=lambda source: self._panel_order[source.layer_id])
+        ranks = {source.layer_id: index for index, source in enumerate(self._sources)}
+        was_blocked = self.table.blockSignals(True)
+        try:
+            for row in range(self.table.rowCount()):
+                item = self.table.item(row, COL_LAYER)
+                if item is not None:
+                    item.setData(ORDER_ROLE, ranks[str(item.data(LAYER_ROLE))])
+            # Qt moves the existing items AND cell widgets together, preserving
+            # checkbox, class, style and survey settings without rebuilding rows.
+            self.table.sortItems(COL_LAYER, Qt.SortOrder.AscendingOrder)
+        finally:
+            self.table.blockSignals(was_blocked)
 
     def _uncheck_all(self) -> None:
         # Rebuild the preview once, not once per layer in a large project.

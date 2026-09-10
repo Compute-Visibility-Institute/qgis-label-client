@@ -13,6 +13,7 @@ Two things are load-bearing here and neither is visible from the pure core.
 from __future__ import annotations
 
 import pytest
+from qgis.core import Qgis
 from snapshot_fixtures import REGISTRY, SNAPSHOT_LAYERS
 
 from qgis_label_client import publish as publish_tools
@@ -29,6 +30,86 @@ from qgis_label_client.core.publish import (
 
 COMPOUND = REGISTRY.get("compound")
 STORAGE = "EPSG:4326"
+
+
+class PanelLayer:
+    def __init__(self, layer_id, *, raster=False, valid=True, plugin=False):
+        self.layer_id = layer_id
+        self.raster = raster
+        self.valid = valid
+        self.plugin = plugin
+
+    def id(self):
+        return self.layer_id
+
+    def type(self):
+        return Qgis.LayerType.Raster if self.raster else Qgis.LayerType.Vector
+
+    def isValid(self):  # noqa: N802
+        return self.valid
+
+    def customProperty(self, key, default=None):  # noqa: N802
+        return "label" if self.plugin else default
+
+
+class PanelNode:
+    def __init__(self, layer, *, checked=True):
+        self._layer = layer
+        self.checked = checked
+
+    def layer(self):
+        return self._layer
+
+
+class PanelGroup:
+    def __init__(self, children, *, expanded=True):
+        self.children = children
+        self.expanded = expanded
+
+    def findLayers(self):  # noqa: N802
+        return [
+            node
+            for child in self.children
+            for node in (child.findLayers() if isinstance(child, PanelGroup) else [child])
+        ]
+
+
+class PanelProject:
+    def __init__(self, root):
+        self.root = root
+
+    def layerTreeRoot(self):  # noqa: N802
+        return self.root
+
+    def mapLayers(self):  # noqa: N802
+        raise AssertionError("Layer discovery must use the panel, not the ID registry")
+
+
+def test_local_layers_follow_nested_panel_order_including_hidden_layers():
+    top, nested, bottom = [PanelLayer(name) for name in ("z-top", "m-nested", "a-bottom")]
+    tree = PanelGroup(
+        [
+            PanelNode(top),
+            PanelGroup([PanelGroup([PanelNode(nested, checked=False)])], expanded=False),
+            PanelNode(bottom),
+        ]
+    )
+    assert publish_tools.local_vector_layers(PanelProject(tree)) == [top, nested, bottom]
+
+
+def test_local_layers_filter_unusable_nodes_and_keep_first_duplicate_position():
+    first, second = PanelLayer("first"), PanelLayer("second")
+    tree = PanelGroup(
+        [
+            PanelNode(None),
+            PanelNode(PanelLayer("raster", raster=True)),
+            PanelNode(first),
+            PanelNode(PanelLayer("broken", valid=False)),
+            PanelNode(PanelLayer("backend", plugin=True)),
+            PanelGroup([PanelNode(second), PanelNode(PanelLayer("first"))]),
+        ]
+    )
+    assert publish_tools.local_vector_layers(PanelProject(tree)) == [first, second]
 
 
 class FakeCrs:

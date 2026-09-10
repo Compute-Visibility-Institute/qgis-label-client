@@ -233,20 +233,30 @@ def count_damaged_names(layer: QgsVectorLayer, limit: int = NAME_SCAN_LIMIT) -> 
 
 
 def local_vector_layers(project: QgsProject | None = None) -> list[QgsVectorLayer]:
-    """Vector layers in the project that did not come from the backend.
+    """Local vector layers in Layers-panel order, including nested groups.
 
     Layers this plugin loaded are excluded. Publishing a collection back into itself would
     duplicate every feature in it, and the native OAPIF provider already edits those in
     place through Part 4 -- there is nothing there to bootstrap.
     """
     project = project or QgsProject.instance()
-    return [
-        layer
-        for layer in project.mapLayers().values()
-        if layer.type() == Qgis.LayerType.Vector
-        and not layer_tools.is_plugin_layer(layer)
-        and layer.isValid()
-    ]
+    result = []
+    seen = set()
+    # findLayers traverses the tree top-to-bottom, regardless of visibility or
+    # collapsed groups. mapLayers is keyed by internal IDs, not panel position.
+    for node in project.layerTreeRoot().findLayers():
+        layer = node.layer()
+        if (
+            layer is None
+            or layer.type() != Qgis.LayerType.Vector
+            or layer_tools.is_plugin_layer(layer)
+            or not layer.isValid()
+            or layer.id() in seen
+        ):
+            continue
+        seen.add(layer.id())
+        result.append(layer)
+    return result
 
 
 def describe_layer(layer: QgsVectorLayer, scan_names: bool | None = None) -> SourceLayer:
