@@ -1,13 +1,10 @@
 name: test
 
-# Runs on every push and pull request. Nothing here needs QGIS installed: the pure core
+# Runs only when explicitly requested. Nothing here needs QGIS installed: the pure core
 # imports no QGIS at all, and the UI modules are exercised against the stubs in
 # tests/qgis_stubs. See tests/qgis_stubs/__init__.py for why that boundary is deliberate.
 
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 permissions:

@@ -560,14 +560,19 @@ repeat. Counts accumulate per track, not across them.
 
 ## Development
 
+Ordinary changes are implemented and reported without automatically running tests,
+builds, native QGIS checks or releases. Run validation only when explicitly asked
+to test or publish/deploy. A branch push or pull request does not start the test
+workflow, and an earlier deployment approval does not authorize future releases.
+
 ```bash
-./scripts/dev-link.sh          # symlink this checkout into the QGIS plugins directory
-python -m pip install -r requirements-dev.txt
-pytest                         # no QGIS required
+./scripts/dev-link.sh          # when setting up a local QGIS development profile
+python -m pip install -r requirements-dev.txt # one-time requested setup
+pytest                         # when tests are requested; no QGIS required
 ruff check . && ruff format --check .
 ```
 
-Then install **Plugin Reloader** in QGIS and bind it to a key: two seconds a cycle against
+For requested interactive QGIS work, install **Plugin Reloader** and bind it to a key: two seconds a cycle against
 thirty for a restart. A plugin that fails to import fails **silently** in the plugin
 manager — look in **View → Panels → Log Messages → Plugins**.
 
@@ -655,8 +660,13 @@ There are **no imagery fixtures and there never will be**, and no test touches t
 
 ## Releasing
 
+Release only on an explicit publication/deployment request. Ordinary edits do not
+change version numbers or create tags. For requested checks without a release,
+use `gh workflow run test.yml --ref BRANCH`. Reuse successful checks for unchanged
+code instead of repeating validation through several agents or environments.
+
 ```bash
-# Update metadata.txt, __init__.__version__, and CHANGELOG.md, then commit and test.
+# On an explicit release request, update metadata.txt, __init__.__version__, and CHANGELOG.md.
 git tag -a v0.1.0 -m "v0.1.0 — custom API domain"
 git push origin v0.1.0
 ```

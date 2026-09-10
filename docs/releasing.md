@@ -1,5 +1,16 @@
 # Releasing a version
 
+This procedure runs only when publication/deployment is explicitly requested.
+Ordinary edits require no automatic tests, native QGIS checks, packaging, version
+bump or tag. Earlier blanket deployment approval does not authorize future
+releases. The release workflow still runs its required tests and package checks
+when an authorized release tag is pushed or a release is explicitly dispatched.
+
+For a test request without publication, use the relevant local test command or
+`gh workflow run test.yml --ref BRANCH`. The standalone test workflow is manual;
+ordinary branch pushes and pull requests do not run it. Reuse existing successful
+results for unchanged code and assign validation once across collaborating agents.
+
 Written immediately after cutting `v0.0.1`, which failed twice before it worked. Both
 failures are recorded below, because both are structural and will recur.
 
@@ -64,7 +75,8 @@ that said PKCE made the secret unnecessary was tested against Google and was wro
       tagged and had to be renumbered to `0.0.0` to free it. Two sections claiming one
       version is exactly what breaks upgrade detection.
 
-For a local packaging check, use a disposable clone of the committed release candidate.
+If a local packaging check is requested or needed for the requested release, use
+a disposable clone of the committed release candidate.
 `qgis-plugin-ci package` rewrites metadata and restores Git state; its
 `--allow-uncommitted-changes` path uses internal hard resets. Do not run that path in a
 shared checkout containing work in progress. New package files must be committed or
