@@ -135,21 +135,59 @@ def test_an_untyped_sibling_alongside_a_typed_trio_is_dropped():
     assert "label_current" not in group.collection_ids
 
 
-def test_the_editable_stems_display_name_falls_back_to_the_stem_qualified_by_transactional():
-    # This deployment's typed titles say "areas"/"points"/"lines", vocabulary
-    # routing._FAMILY_TOKENS deliberately does not recognise (it knows "polygon"/"point"/
-    # "line", the id vocabulary). Deriving a group name by editing a typed title would
-    # need an English-synonym table this plugin refuses to hardcode -- the stem is the
-    # fallback instead, because it is always id-derived. A bare "Label" is silent on the
-    # one thing this exact row exists to answer, so every member agreeing `transactional`
-    # qualifies it -- this is the real deployment's own shape: label_polygon/point/line
-    # advertise `editable: true` and have no untyped sibling to borrow a title from.
+@pytest.mark.parametrize("transactional", [True, None])
+def test_group_preserves_the_servers_editable_title_without_inventing_capabilities(transactional):
+    # Production pygeoapi supplies these titles but omits the transactional flag.
+    # Preserve its display vocabulary without turning prose into a capability.
     members = [
-        _collection("label_polygon", "CVI Labels — areas (editable)", transactional=True),
-        _collection("label_point", "CVI Labels — points (editable)", transactional=True),
-        _collection("label_line", "CVI Labels — lines (editable)", transactional=True),
+        _collection("label_polygon", "CVI Labels — areas (editable)", transactional=transactional),
+        _collection("label_point", "CVI Labels — points (editable)", transactional=transactional),
+        _collection("label_line", "CVI Labels — lines (editable)", transactional=transactional),
     ]
-    assert group_by_mode(members)[0].display_name == "Label (editable)"
+    group = group_by_mode(members)[0]
+    assert group.display_name == "CVI Labels (editable)"
+    assert all(member.transactional is transactional for member in group.members)
+
+
+@pytest.mark.parametrize(
+    ("titles", "flags", "expected"),
+    [
+        (("Surveys — polygons", "Surveys — points"), (True, True), "Surveys (editable)"),
+        (
+            ("Surveys — areas (history)", "Surveys — points (history)"),
+            (None, None),
+            "Surveys (history)",
+        ),
+        (
+            ("Surveys — areas (read-only)", "Surveys — points (read-only)"),
+            (False, False),
+            "Surveys (read-only)",
+        ),
+        (
+            ("Surveys — areas (editable)", "Surveys — points (editable)"),
+            (False, False),
+            "Survey (read-only)",
+        ),
+        (("Surveys — areas (editable)", "Surveys — points (editable)"), (True, False), "Survey"),
+        (
+            ("Surveys — areas (read-only)", "Surveys — points (read-only)"),
+            (True, True),
+            "Survey (editable)",
+        ),
+        (("Surveys — draft (editable)", "Surveys — approved (editable)"), (None, None), "Survey"),
+        (("Surveys — points (editable)", "Surveys — areas (editable)"), (None, None), "Survey"),
+        (("Surveys — areas (editable)", "Surveys — points (history)"), (None, None), "Survey"),
+        (("Surveys — areas (editable)", "Other — points (editable)"), (None, None), "Survey"),
+    ],
+)
+def test_common_titles_are_geometry_checked_and_never_override_capabilities(
+    titles, flags, expected
+):
+    members = [
+        _collection("survey_polygon", titles[0], transactional=flags[0]),
+        _collection("survey_point", titles[1], transactional=flags[1]),
+    ]
+    assert group_by_mode(members)[0].display_name == expected
 
 
 def test_the_stem_fallback_stays_bare_when_members_disagree_or_are_all_unknown():

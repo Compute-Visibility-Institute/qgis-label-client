@@ -119,7 +119,13 @@ def _collection_group_tooltip(group: CollectionGroup) -> str:
         f"{member.collection_id}: {member.description}" for member in members if member.description
     )
     states = {member.transactional for member in members}
-    if len(states) == 1:
+    if group.display_name.lower().endswith("(editable)") and states <= {None, True}:
+        # The grouped title preserves what the server calls this collection. It does
+        # not grant the signed-in account permission or change provider capabilities.
+        lines.append(
+            "Draw and edit features here. Saving requires write access to the selected track."
+        )
+    elif len(states) == 1:
         lines.append(_transactional_line(states.pop()))
     else:
         # Not expected in this deployment -- provider-identical siblings under one stem

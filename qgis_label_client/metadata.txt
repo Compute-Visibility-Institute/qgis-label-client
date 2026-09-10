@@ -50,3 +50,4 @@ hasProcessingProvider=no
 
 changelog=0.1.3
     - Show the loaded plugin version in the dock and floating window title.
+    - Identify the editable label group clearly and explain its write-access requirement.

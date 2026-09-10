@@ -98,6 +98,15 @@ def test_group_by_mode_feeds_set_collections_with_no_shape_mismatch():
     ]
     dock.set_collections(group_by_mode(collections))
     assert dock.collection_list.count() == 2  # one collapsed row, one lone row
+    labels = next(
+        dock.collection_list.item(index)
+        for index in range(dock.collection_list.count())
+        if dock.collection_list.item(index).text() == "CVI Labels (editable)"
+    )
+    assert "Draw and edit features here." in labels.toolTip()
+    assert "Saving requires write access to the selected track." in labels.toolTip()
+    assert "Editability not advertised" not in labels.toolTip()
+    assert all(member.transactional is None for member in collections[:3])
 
 
 # --- the pre-check rule: ALL members, never merely one -----------------------

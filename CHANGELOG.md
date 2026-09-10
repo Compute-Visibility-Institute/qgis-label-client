@@ -13,6 +13,9 @@ most recent entries into `metadata.txt` at release time.
 - Show the loaded plugin version in the dock and floating window title, so saved
   connection settings cannot be mistaken for an old installation. Existing saved
   API URLs remain unchanged when upgrading.
+- Preserve the server's editable/read-only wording when grouping geometry-specific
+  layers, so the editable label group appears as "CVI Labels (editable)". Clarify
+  that saving requires write access to the selected track.
 
 ## [0.1.2] - 2026-09-09
 

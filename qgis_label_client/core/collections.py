@@ -10,6 +10,7 @@ optional in the specification, so every one of them is optional here.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -163,6 +164,47 @@ class CollectionGroup:
         return tuple(member.collection_id for member in self.members)
 
 
+# Display vocabulary only. Routing still derives the geometry from the collection id.
+# Requiring the title's geometry word to match that family prevents removing arbitrary
+# differences between sibling titles (e.g. "draft" versus "approved").
+_TITLE_GEOMETRIES = {
+    "areas": routing.POLYGON,
+    "polygons": routing.POLYGON,
+    "points": routing.POINT,
+    "lines": routing.LINE,
+}
+_TYPED_TITLE = re.compile(r"(.+?)\s+—\s+(areas|polygons|points|lines)(\s+\([^()]+\))?", re.I)
+
+
+def _shared_title(members: Sequence[Collection]) -> str | None:
+    """Preserve an advertised title, removing only its geometry-specific segment.
+
+    This is a display operation, never a capability inference: pygeoapi's titles may
+    say "(editable)" even when it supplies no machine-readable transactional flag.
+    Collection.transactional and the native provider/account permission checks remain
+    untouched. Unfamiliar title shapes and contradictory capability metadata fall back
+    to the id-derived name instead of inventing a common meaning.
+    """
+    names: set[str] = set()
+    for member in members:
+        match = _TYPED_TITLE.fullmatch(member.display_name.strip())
+        geometry = routing.typed(member.collection_id)
+        if match is None or geometry is None:
+            return None
+        if _TITLE_GEOMETRIES[match[2].lower()] != geometry[0]:
+            return None
+        names.add(match[1].strip() + (match[3] or ""))
+    if len(names) != 1:
+        return None
+    name = names.pop()
+    flags = {member.transactional for member in members}
+    if "(editable)" in name.lower() and False in flags:
+        return None
+    if "read-only" in name.lower() and True in flags:
+        return None
+    return name
+
+
 def group_by_mode(collections: Sequence[Collection]) -> list[CollectionGroup]:
     """Collapse geometry-typed siblings into one row per mode, for the panel.
 
@@ -208,26 +250,15 @@ def group_by_mode(collections: Sequence[Collection]) -> list[CollectionGroup]:
             # (current, read-only)"), with no geometry qualifier -- no synthesis needed.
             display_name = untyped_members[0].display_name
         else:
-            # No mixed sibling to borrow a title from (the "editable" stem has three typed
-            # members and none untyped). This deployment's own typed titles say
-            # "areas/points/lines", a prose vocabulary routing._FAMILY_TOKENS deliberately
-            # does not know -- inventing an English-synonym table to strip that word back
-            # out of a title would hardcode exactly the kind of deployment vocabulary this
-            # module already refuses to hardcode for ids, twice over instead of once. The
-            # stem is always available and already id-derived, so it is the fallback.
-            #
-            # A bare stem is silent on the one thing this exact row exists to answer --
-            # "read only / editable / etc", in the words that motivated collapsing these
-            # rows in the first place -- so it is qualified from `transactional`, which
-            # every member already carries. Only when every typed sibling AGREES does the
-            # qualifier get added: a split verdict (or every member merely unknown) means
-            # guessing which is right, and naming a state the row is not actually in would
-            # be a worse answer than naming none.
-            base = stem.replace("_", " ").strip().title() or stem
+            # Keep the server's vocabulary where siblings differ only by geometry.
+            # Otherwise use the id-derived stem, qualified only by unanimous explicit
+            # capabilities. A familiar collection id never implies edit permission.
+            shared = _shared_title(typed_members)
+            base = shared or stem.replace("_", " ").strip().title() or stem
             flags = {member.transactional for member in typed_members}
-            if flags == {True}:
+            if flags == {True} and "(editable)" not in base.lower():
                 display_name = f"{base} (editable)"
-            elif flags == {False}:
+            elif flags == {False} and "read-only" not in base.lower():
                 display_name = f"{base} (read-only)"
             else:
                 display_name = base
