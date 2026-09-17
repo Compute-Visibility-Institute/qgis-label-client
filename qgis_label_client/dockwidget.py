@@ -49,7 +49,7 @@ from .core import recorded
 from .core.asof import AsOfMechanism
 from .core.collections import CollectionGroup
 from .core.registry import ClassRegistry
-from .core.tracks import Track
+from .core.tracks import Track, resolve
 from .settings import PLACEHOLDER_API_URL
 
 #: Item data role carrying a collection id on a list row.
@@ -819,6 +819,9 @@ class LabelClientDock(QDockWidget):
     def set_tracks(self, tracks: Sequence[Track], selected: str = "") -> None:
         """Populate the track combo, preserving the selection where it still exists.
 
+        A fresh profile selects the deployment default, matching the controller's
+        resolved track for reads and publishing.
+
         A stored track that the backend no longer offers is **not** silently replaced by
         the default. It is shown as missing, with nothing selected, because answering a
         request for one dataset from another is the contamination failure in reverse: you
@@ -842,7 +845,8 @@ class LabelClientDock(QDockWidget):
                     "\n".join(tooltip),
                     int(Qt.ItemDataRole.ToolTipRole),
                 )
-            index = self.track_combo.findData(selected) if selected else -1
+            resolved = resolve(self._tracks, selected)
+            index = self.track_combo.findData(resolved.name) if resolved else -1
             self.track_combo.setCurrentIndex(index)
         finally:
             self._loading_tracks = False

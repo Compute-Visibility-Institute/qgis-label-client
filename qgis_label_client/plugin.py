@@ -927,11 +927,10 @@ class LabelClientPlugin:
     def _store_credential(self, credential: oauth.Credential) -> None:
         """Write the new ID token into every auth config, reusing every id."""
         try:
-            # One config per KNOWN track, plus one naming none. On the first sign-in of a
-            # fresh profile the track list is empty -- you need a credential to discover
-            # it -- so only the un-tracked entry is written. Connect fans it out after
-            # discovery. Passing the existing map is what makes every id be REUSED, so saved
-            # .qgz projects and already-loaded layers survive the rotation.
+            # One config per discovered or previously saved track, plus one naming none.
+            # A fresh profile starts with only the un-tracked entry; Connect fans it out
+            # after discovery. Returning profiles renew every saved config even before
+            # discovery, reusing ids so saved projects and loaded layers keep working.
             stored = auth.store_id_token_for_tracks(
                 credential.id_token,
                 [track.name for track in self.tracks],

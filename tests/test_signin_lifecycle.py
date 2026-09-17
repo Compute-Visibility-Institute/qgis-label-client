@@ -191,6 +191,29 @@ def test_a_completed_sign_in_stores_the_token_the_track_and_the_expiry(plugin, f
     assert "Signed in as analyst@example.org" in _texts(fake_iface)
 
 
+@pytest.mark.parametrize("completion", ["_store_credential", "_on_refreshed"])
+def test_returning_before_connect_refreshes_the_saved_selected_track(plugin, completion):
+    """Both browser sign-in and renewal must repair a profile reopened days later."""
+    expired = _credential(int(time.time()) - 3 * 24 * HOUR)
+    saved = auth.store_id_token_for_tracks(expired.id_token, [TRACK.name, "other"])
+    plugin.settings.set_authcfg_by_track(saved)
+    plugin.settings.set("track", TRACK.name)
+    plugin.settings.set_oauth_session(expired.email, expired.expires_at)
+    assert plugin.tracks == []  # Track discovery has not run in this QGIS session.
+    credential = _credential(int(time.time()) + HOUR)
+
+    getattr(plugin, completion)(credential)
+
+    assert plugin.settings.authcfg_by_track == saved
+    assert plugin.settings.authcfg == saved[TRACK.name]
+    assert not plugin._credential_needs_refresh()
+    manager = auth_manager()
+    for track, authcfg in saved.items():
+        headers = manager.configs[authcfg].configMap()
+        assert headers[auth.AUTH_HEADER] == f"Bearer {credential.id_token}"
+        assert headers.get("X-Track", "") == track
+
+
 def test_a_sign_in_that_could_not_store_a_renewal_token_says_so_immediately(
     plugin, fake_iface, monkeypatch
 ):

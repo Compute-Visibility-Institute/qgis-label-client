@@ -6,6 +6,16 @@ most recent entries into `metadata.txt` at release time.
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-09-17
+
+### Fixed
+
+- Select the deployment's default history track visibly after Connect for new
+  profiles. Preserve existing choices and leave missing saved tracks unresolved.
+- Refresh every saved track credential during browser sign-in and automatic token
+  renewal, including before track discovery after reopening QGIS. Reuse credential
+  IDs so saved projects and loaded layers do not retain an expired track token.
+
 ## [0.1.13] - 2026-09-17
 
 ### Fixed

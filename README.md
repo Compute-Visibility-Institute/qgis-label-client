@@ -118,6 +118,12 @@ no plugin code is in their path, so a renewed credential cannot un-fail a reques
 already failed: the plugin renews, then says *reload the layer*. This is why the timer is
 the primary mechanism rather than the 401 handler.
 
+After reopening QGIS, **Connect** renews an expired sign-in before connecting when its
+renewal token is still valid. If a new browser sign-in is needed, use **Sign in with
+Google**, then **Connect**; signing out first is unnecessary. Both renewal and browser
+sign-in update every saved track credential, even before tracks have been rediscovered,
+while retaining the credential IDs used by saved projects and loaded layers.
+
 Signing out removes every stored credential **and** revokes the grant at Google, so
 "signed out" is true on both sides rather than only on this machine.
 
@@ -171,8 +177,12 @@ failure in this area produces data that looks completely correct:
 
 Some things follow from that and are worth knowing before they surprise you:
 
-- **Track names are data**, exactly like class names. None appears anywhere in this
-  repository, and the panel's list comes from `GET {api}/v1/tracks` at runtime.
+- **New profiles select the deployment's default track after Connect.** On the hosted
+  platform this is production (`default`). The panel's list and default flag come from
+  `GET {api}/v1/tracks`; development (`dev`) requires an explicit selection.
+- **Existing profiles keep their saved track choice**, including after uninstalling and
+  reinstalling the plugin. If your profile was set to `dev`, choose `default` in
+  **History track** before publishing to production.
 - **Switching tracks is refused while any plugin layer has unsaved edits.** Switching
   re-points every layer, and `setDataSource` on a dirty layer discards the edit buffer with
   no prompt and no undo.
@@ -182,8 +192,9 @@ Some things follow from that and are worth knowing before they surprise you:
 - **An archived track is readable and not writable.** The panel marks it, and publishing
   into one is blocked before the preview opens rather than discovered one refused feature
   at a time.
-- **Reads with no track selected fall back to the deployment default; writes do not.** A
-  browser with no opinion should see something; a write is the contaminating operation.
+- **Publishing requires a resolved track.** A fresh profile resolves to the server's
+  declared default after Connect. If no default is available or a saved track is missing,
+  publishing stays blocked until an available track is selected.
 - **Credentials are stored one per track** (same token, plus the `X-Track` header), and one
   more that names no track. Every hourly renewal rewrites all of them **under their
   existing ids**, so saved projects and already-loaded layers keep working. Signing in happens *before* Connect — you need a credential to

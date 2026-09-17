@@ -280,15 +280,13 @@ def store_id_token_for_tracks(
     creates their own credentials before a native layer can use them.
     """
     existing = dict(existing or {})
-    wanted = [DEFAULT_TRACK_KEY, *(name for name in tracks if name)]
+    # On reopening QGIS, discovery has not run yet but saved layers and the selected
+    # track already reference these configs. Renew all of them before Connect can
+    # send a request with an expired track-specific bearer token.
+    wanted = [DEFAULT_TRACK_KEY, *(name for name in tracks if name), *existing]
     stored: dict[str, str] = {}
     for name in dict.fromkeys(wanted):  # ordered, deduplicated
         stored[name] = store_id_token(token, existing.get(name, ""), name)
-    # Entries for tracks that no longer exist are carried over rather than dropped: a
-    # track missing from `tracks` may simply mean the panel has not connected yet, and
-    # deleting a credential over that guess is not recoverable.
-    for name, authcfg in existing.items():
-        stored.setdefault(name, authcfg)
     return stored
 
 

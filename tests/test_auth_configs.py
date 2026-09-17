@@ -165,6 +165,20 @@ def test_a_first_sign_in_before_connect_writes_only_the_untracked_entry(manager)
     assert list(stored) == [""]
 
 
+def test_renewing_before_track_discovery_rotates_saved_track_credentials(manager):
+    first = auth.store_id_token_for_tracks("expired-token", [TRACK, OTHER_TRACK])
+    manager.cleared.clear()
+
+    renewed = auth.store_id_token_for_tracks("fresh-token", [], first)
+
+    assert renewed == first
+    assert set(manager.cleared) == set(first.values())
+    for track, authcfg in renewed.items():
+        headers = manager.configs[authcfg].configMap()
+        assert headers[auth.AUTH_HEADER] == "Bearer fresh-token"
+        assert headers.get(TRACK_HEADER, "") == track
+
+
 def test_discovery_binds_native_writes_without_a_second_signin(manager):
     initial = auth.store_id_token_for_tracks("fresh-id-token", [])
     stored = auth.ensure_track_configs([TRACK, OTHER_TRACK], initial)
@@ -211,6 +225,10 @@ def test_a_track_missing_from_the_list_keeps_its_credential(manager):
     stored = auth.store_id_token_for_tracks("hour-one", [TRACK, OTHER_TRACK])
     later = auth.store_id_token_for_tracks("hour-two", [TRACK], stored)
     assert later[OTHER_TRACK] == stored[OTHER_TRACK]
+    assert manager.configs[later[OTHER_TRACK]].configMap() == {
+        auth.AUTH_HEADER: "Bearer hour-two",
+        TRACK_HEADER: OTHER_TRACK,
+    }
 
 
 # --- signing out --------------------------------------------------------------
