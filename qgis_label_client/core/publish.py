@@ -413,7 +413,8 @@ def build_draft(
         ),
         # A dropped name is data loss, exactly like a refused attribute, and belongs in
         # the same list rather than in the silence between two dictionary writes.
-        issues=attributes.issues + tuple(
+        issues=attributes.issues
+        + tuple(
             f"{issue}; original source text remains in attrs.source_attributes"
             for issue in names.collisions
         ),
@@ -593,7 +594,9 @@ class LayerPlan:
             and mapping.source != SOURCE_ATTRIBUTES
             for mapping in self.mappings
         ):
-            return (f"{self.source.name}: a canonical mapping claims the source_attributes archive key.",)
+            return (
+                f"{self.source.name}: a canonical mapping claims the source_attributes archive key.",
+            )
         return ()
 
     def mapping_lines(self) -> tuple[str, ...]:
@@ -693,7 +696,8 @@ class LayerPlan:
             floor = "at least " if self.source.scanned < self.source.feature_count else ""
             action = (
                 "omitted from the canonical names"
-                if self.choice.skip_damaged_names else "PUBLISHED AS THEY ARE in the canonical names"
+                if self.choice.skip_damaged_names
+                else "PUBLISHED AS THEY ARE in the canonical names"
             )
             notes.append(
                 f"{floor}{self.source.damaged_names} name(s) look like they have lost "
@@ -708,7 +712,8 @@ class LayerPlan:
         if unmapped:
             notes.append(
                 f"{len(unmapped)} column(s) have no canonical mapping and are retained "
-                "in source_attributes: " + "; ".join(m.source for m in self.mappings if m.target is None)
+                "in source_attributes: "
+                + "; ".join(m.source for m in self.mappings if m.target is None)
             )
         return tuple(notes)
 

@@ -123,7 +123,8 @@ def test_a_drafted_feature_carries_no_identity_at_all():
     assert "id" not in feature
     assert set(feature["properties"]) == {"class_id", "names", "attrs"}
     assert feature["properties"]["attrs"] == {
-        "id": 42, "source_attributes": {"id": 42, "Name_en": "Yunhui Ulanqab"},
+        "id": 42,
+        "source_attributes": {"id": 42, "Name_en": "Yunhui Ulanqab"},
     }
     assert 42 not in feature["properties"].values()
 
@@ -173,14 +174,18 @@ def test_skipping_damaged_names_omits_canonical_names_but_preserves_original_tex
     assert result.draft.names == {"en": "Yunshu"}
     assert result.omitted_names == ("zh",)
     assert result.draft.attrs["source_attributes"] == {
-        "Name:ch": "云枢智能云乌兰察布数据中X8", "Name_en": "Yunshu",
+        "Name:ch": "云枢智能云乌兰察布数据中X8",
+        "Name_en": "Yunshu",
     }
 
 
 def test_original_text_survives_name_collisions_trimming_and_numeric_conversion():
     values = {
-        "Name_en": "  Example Campus  ", "Name": "Different original name",
-        "No. Cooler": "0007", "Company": " Example operator ", "id": None,
+        "Name_en": "  Example Campus  ",
+        "Name": "Different original name",
+        "No. Cooler": "0007",
+        "Company": " Example operator ",
+        "id": None,
     }
     result = build_draft(values, SQUARE, COMPOUND, map_fields(values, COMPOUND))
     assert result.draft.names == {"en": "Example Campus"}
@@ -199,7 +204,8 @@ def test_attribute_problems_travel_with_the_draft_rather_than_stopping_it():
     result = _compound_draft({"Year": 1200, "Name_en": "Yunhui"})
     assert result.draft is not None
     assert result.draft.attrs == {
-        "Year": 1200, "source_attributes": {"Year": 1200, "Name_en": "Yunhui"},
+        "Year": 1200,
+        "source_attributes": {"Year": 1200, "Name_en": "Yunhui"},
     }
     assert result.issues and "minimum" in result.issues[0]
 
@@ -217,7 +223,10 @@ def test_a_point_layer_drafts_against_its_point_class():
     mappings = map_fields(SNAPSHOT_LAYERS["CoolingUnits"], COOLING_UNIT)
     result = build_draft({"Model": "Dry cooler A"}, POINT, COOLING_UNIT, mappings)
     assert result.draft.to_geojson()["geometry"] == POINT
-    assert result.draft.attrs == {"model": "Dry cooler A", "source_attributes": {"Model": "Dry cooler A"}}
+    assert result.draft.attrs == {
+        "model": "Dry cooler A",
+        "source_attributes": {"Model": "Dry cooler A"},
+    }
     assert not result.promoted
 
 
@@ -298,7 +307,8 @@ def test_an_explicit_class_choice_overrides_the_guess():
     # The columns are remapped against the class actually chosen.
     assert all(
         m.role is FieldRole.SOURCE_ATTRIBUTE
-        for m in plan.layers[0].mappings if m.source.startswith("No.")
+        for m in plan.layers[0].mappings
+        if m.source.startswith("No.")
     )
 
 
@@ -455,22 +465,39 @@ def test_the_field_summary_counts_what_lands_where():
 
 
 def test_preview_blocks_a_class_that_cannot_store_original_fields():
-    registry = parse_registry({"classes": [{
-        **SEED_CLASSES[0],
-        "attr_schema": {"type": "object", "additionalProperties": False, "properties": {}},
-    }]})
+    registry = parse_registry(
+        {
+            "classes": [
+                {
+                    **SEED_CLASSES[0],
+                    "attr_schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {},
+                    },
+                }
+            ]
+        }
+    )
     plan = build_plan([_source("Compounds")], registry)
     assert any("source_attributes" in problem for problem in plan.layers[0].problems())
 
 
 def test_preview_explains_archive_only_fields_for_a_closed_class():
-    registry = parse_registry({"classes": [{
-        **SEED_CLASSES[0],
-        "attr_schema": {
-            "type": "object", "additionalProperties": False,
-            "properties": {"source_attributes": {"type": "object"}},
-        },
-    }]})
+    registry = parse_registry(
+        {
+            "classes": [
+                {
+                    **SEED_CLASSES[0],
+                    "attr_schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {"source_attributes": {"type": "object"}},
+                    },
+                }
+            ]
+        }
+    )
     layer = build_plan([_source("Compounds")], registry).layers[0]
     assert layer.problems() == ()
     assert "source archive" in layer.mapping_summary()

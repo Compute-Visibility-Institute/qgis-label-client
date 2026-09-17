@@ -254,7 +254,8 @@ class FieldMapping:
         if self.role is FieldRole.SOURCE_ATTRIBUTE:
             suffix = (
                 "; canonical match is ambiguous between " + ", ".join(self.tied_with)
-                if self.tied_with else ""
+                if self.tied_with
+                else ""
             )
             return f"{self.source} -> original attribute {self.target!r}{suffix}"
         if self.tied_with:
@@ -349,7 +350,9 @@ def map_field(source: str, label_class: LabelClass) -> FieldMapping:
     matched = _attribute_match(source, label_class) or FieldMapping(source=source)
     if matched.role is FieldRole.UNMAPPED and label_class.open_vocabulary:
         return FieldMapping(
-            source=source, role=FieldRole.SOURCE_ATTRIBUTE, target=source,
+            source=source,
+            role=FieldRole.SOURCE_ATTRIBUTE,
+            target=source,
             tied_with=matched.tied_with,
         )
     return matched
@@ -641,7 +644,9 @@ def build_attrs(
                 for source, value in original_values.items()
                 if not isinstance(source, str) or not is_json_native(value)
             ]
-            envelope_problem = "original provider values have no JSON representation: " + ", ".join(unsupported)
+            envelope_problem = "original provider values have no JSON representation: " + ", ".join(
+                unsupported
+            )
         elif not envelope_problem and SOURCE_ATTRIBUTES in declared:
             spec = label_class.attribute(SOURCE_ATTRIBUTES)
             envelope_problem = schema_problem(original_values, spec)
@@ -652,9 +657,14 @@ def build_attrs(
 
     # An exact canonical column wins over aliases; otherwise the source spelling gives
     # a stable ordering. The losing value is retained under its original source key.
-    ordered = sorted(mappings, key=lambda item: (
-        item.target or "", item.source != item.target, item.source,
-    ))
+    ordered = sorted(
+        mappings,
+        key=lambda item: (
+            item.target or "",
+            item.source != item.target,
+            item.source,
+        ),
+    )
     for mapping in ordered:
         if mapping.role is FieldRole.NAME:
             continue
@@ -727,7 +737,9 @@ def build_attrs(
         elif not label_class.open_vocabulary:
             # A closed vocabulary may still explicitly permit the full source archive.
             # Keep the field there, without also adding a forbidden top-level attribute.
-            issues.append(f"{source}: retained in {SOURCE_ATTRIBUTES}; the class restricts extra attributes")
+            issues.append(
+                f"{source}: retained in {SOURCE_ATTRIBUTES}; the class restricts extra attributes"
+            )
             continue
         if problem:
             # The archive already holds this exact value. Keep the canonical attribute

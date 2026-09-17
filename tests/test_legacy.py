@@ -454,14 +454,19 @@ def test_attributes_preserve_empty_source_columns_without_claiming_canonical_val
     result = build_attrs(values, mappings, COMPOUND)
     assert result.attrs == {
         "source_attributes": values,
-        "transformer_count": 4, "id": None, "No. Cooler": None, "Year": "   ", "Area": None,
+        "transformer_count": 4,
+        "id": None,
+        "No. Cooler": None,
+        "Year": "   ",
+        "Area": None,
     }
 
 
 def test_a_recorded_zero_survives():
     mappings = map_fields(["No. Cooler"], COMPOUND)
     assert build_attrs({"No. Cooler": 0}, mappings, COMPOUND).attrs == {
-        "cooling_unit_count": 0, "source_attributes": {"No. Cooler": 0},
+        "cooling_unit_count": 0,
+        "source_attributes": {"No. Cooler": 0},
     }
 
 
@@ -486,15 +491,26 @@ def test_a_value_the_canonical_schema_would_reject_is_reported_and_preserved():
 
 def test_updated_campus_columns_preserve_extra_attributes_nulls_zero_and_units():
     values = {
-        "id": None, "Name_Ch": "示例园区", "Name_En": "Example Campus",
-        "Company": "Example operator", "Location": "Example city",
-        "No. Cooler": None, "Year": None, "Area_sqm": 12345.67, "No. transf": 0,
+        "id": None,
+        "Name_Ch": "示例园区",
+        "Name_En": "Example Campus",
+        "Company": "Example operator",
+        "Location": "Example city",
+        "No. Cooler": None,
+        "Year": None,
+        "Area_sqm": 12345.67,
+        "No. transf": 0,
     }
     result = build_attrs(values, map_fields(values, COMPOUND), COMPOUND)
     assert result.attrs == {
         "source_attributes": values,
-        "id": None, "Company": "Example operator", "Location": "Example city",
-        "No. Cooler": None, "Year": None, "Area_sqm": 12345.67, "transformer_count": 0,
+        "id": None,
+        "Company": "Example operator",
+        "Location": "Example city",
+        "No. Cooler": None,
+        "Year": None,
+        "Area_sqm": 12345.67,
+        "transformer_count": 0,
     }
     assert result.issues == ()
     assert result.blocking_issues == ()
@@ -542,10 +558,14 @@ def test_a_source_column_named_source_attributes_is_nested_without_replacing_the
 
 
 def test_a_closed_schema_can_explicitly_allow_the_original_value_archive():
-    closed = replace(COMPOUND, attr_schema={
-        "type": "object", "additionalProperties": False,
-        "properties": {"source_attributes": {"type": "object"}},
-    })
+    closed = replace(
+        COMPOUND,
+        attr_schema={
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"source_attributes": {"type": "object"}},
+        },
+    )
     values = {"Company": "Example", "id": None}
     result = build_attrs(values, map_fields(values, closed), closed)
     assert result.attrs == {"source_attributes": values}
@@ -553,10 +573,13 @@ def test_a_closed_schema_can_explicitly_allow_the_original_value_archive():
 
 
 def test_the_original_value_archive_never_overwrites_a_declared_nonobject_attribute():
-    incompatible = replace(COMPOUND, attr_schema={
-        **COMPOUND.attr_schema,
-        "properties": {"source_attributes": {"type": "string"}},
-    })
+    incompatible = replace(
+        COMPOUND,
+        attr_schema={
+            **COMPOUND.attr_schema,
+            "properties": {"source_attributes": {"type": "string"}},
+        },
+    )
     values = {"Company": "Example"}
     result = build_attrs(values, map_fields(values, incompatible), incompatible)
     assert result.attrs == {}
@@ -564,10 +587,13 @@ def test_the_original_value_archive_never_overwrites_a_declared_nonobject_attrib
 
 
 def test_a_canonical_alias_cannot_replace_the_original_value_archive():
-    declared = replace(COMPOUND, attr_schema={
-        **COMPOUND.attr_schema,
-        "properties": {"source_attributes": {"type": "object"}},
-    })
+    declared = replace(
+        COMPOUND,
+        attr_schema={
+            **COMPOUND.attr_schema,
+            "properties": {"source_attributes": {"type": "object"}},
+        },
+    )
     values = {"Source Attributes": {"original": "value"}}
     result = build_attrs(values, map_fields(values, declared), declared)
     assert result.attrs["source_attributes"] == values
@@ -578,7 +604,8 @@ def test_name_columns_reach_only_the_original_values_archive_inside_attrs():
     mappings = map_fields(SNAPSHOT_LAYERS["Substation"], SUBSTATION)
     result = build_attrs({"Name": "变电站", "No. Transf": 2}, mappings, SUBSTATION)
     assert result.attrs == {
-        "transformer_count": 2, "source_attributes": {"Name": "变电站", "No. Transf": 2},
+        "transformer_count": 2,
+        "source_attributes": {"Name": "变电站", "No. Transf": 2},
     }
 
 
