@@ -14,11 +14,13 @@ Three properties are worth more than the rest, and each has a failure mode that 
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 from snapshot_fixtures import REGISTRY, SEED_CLASSES, SNAPSHOT_LAYERS, TRACK
 
 from qgis_label_client.core.fields import CoreFields
-from qgis_label_client.core.legacy import map_fields
+from qgis_label_client.core.legacy import FieldRole, map_fields
 from qgis_label_client.core.publish import (
     LayerChoice,
     LayerOutcome,
@@ -119,7 +121,10 @@ def test_a_drafted_feature_carries_no_identity_at_all():
     result = _compound_draft({"id": 42, "Name_en": "Yunhui Ulanqab"})
     feature = result.draft.to_geojson()
     assert "id" not in feature
-    assert set(feature["properties"]) == {"class_id", "names"}
+    assert set(feature["properties"]) == {"class_id", "names", "attrs"}
+    assert feature["properties"]["attrs"] == {
+        "id": 42, "source_attributes": {"id": 42, "Name_en": "Yunhui Ulanqab"},
+    }
     assert 42 not in feature["properties"].values()
 
 
@@ -127,7 +132,10 @@ def test_names_and_attributes_land_in_their_json_containers():
     result = _compound_draft({"Name:ch": "云汇数据中心", "Name_en": "Yunhui", "No. transf": "6"})
     feature = result.draft.to_geojson()
     assert feature["properties"]["names"] == {"zh": "云汇数据中心", "en": "Yunhui"}
-    assert feature["properties"]["attrs"] == {"transformer_count": 6}
+    assert feature["properties"]["attrs"] == {
+        "transformer_count": 6,
+        "source_attributes": {"Name:ch": "云汇数据中心", "Name_en": "Yunhui", "No. transf": "6"},
+    }
     assert feature["properties"]["class_id"] == "compound"
     assert feature["geometry"]["type"] == "MultiPolygon"
 
@@ -135,7 +143,7 @@ def test_names_and_attributes_land_in_their_json_containers():
 def test_empty_containers_are_omitted_rather_than_sent_as_empty_objects():
     # Both columns default to '{}' server-side; an omitted key cannot be mistaken for a
     # client asserting emptiness.
-    feature = _compound_draft({"id": None}).draft.to_geojson()
+    feature = _compound_draft({}).draft.to_geojson()
     assert feature["properties"] == {"class_id": "compound"}
 
 
@@ -157,13 +165,28 @@ def test_a_damaged_name_is_reported_even_when_it_is_published():
     assert result.draft.names["zh"].endswith("X8")
 
 
-def test_skipping_damaged_names_removes_them_from_the_draft():
+def test_skipping_damaged_names_omits_canonical_names_but_preserves_original_text():
     result = _compound_draft(
         {"Name:ch": "云枢智能云乌兰察布数据中X8", "Name_en": "Yunshu"},
         skip_damaged_names=True,
     )
     assert result.draft.names == {"en": "Yunshu"}
     assert result.omitted_names == ("zh",)
+    assert result.draft.attrs["source_attributes"] == {
+        "Name:ch": "云枢智能云乌兰察布数据中X8", "Name_en": "Yunshu",
+    }
+
+
+def test_original_text_survives_name_collisions_trimming_and_numeric_conversion():
+    values = {
+        "Name_en": "  Example Campus  ", "Name": "Different original name",
+        "No. Cooler": "0007", "Company": " Example operator ", "id": None,
+    }
+    result = build_draft(values, SQUARE, COMPOUND, map_fields(values, COMPOUND))
+    assert result.draft.names == {"en": "Example Campus"}
+    assert result.draft.attrs["cooling_unit_count"] == 7
+    assert result.draft.attrs["source_attributes"] == values
+    assert any("dropped" in issue for issue in result.issues)
 
 
 def test_a_feature_whose_geometry_cannot_be_reshaped_is_not_drafted():
@@ -175,15 +198,26 @@ def test_a_feature_whose_geometry_cannot_be_reshaped_is_not_drafted():
 def test_attribute_problems_travel_with_the_draft_rather_than_stopping_it():
     result = _compound_draft({"Year": 1200, "Name_en": "Yunhui"})
     assert result.draft is not None
-    assert result.draft.attrs == {}
+    assert result.draft.attrs == {
+        "Year": 1200, "source_attributes": {"Year": 1200, "Name_en": "Yunhui"},
+    }
     assert result.issues and "minimum" in result.issues[0]
+
+
+def test_a_closed_schema_does_not_upload_a_row_with_missing_source_attributes():
+    closed = replace(COMPOUND, attr_schema={**COMPOUND.attr_schema, "additionalProperties": False})
+    values = {"extra_column": "A source fact", "Name_en": "Example"}
+    result = build_draft(values, SQUARE, closed, map_fields(values, closed))
+    assert result.draft is None
+    assert result.invalid_attributes
+    assert any("source_attributes" in issue for issue in result.issues)
 
 
 def test_a_point_layer_drafts_against_its_point_class():
     mappings = map_fields(SNAPSHOT_LAYERS["CoolingUnits"], COOLING_UNIT)
     result = build_draft({"Model": "Dry cooler A"}, POINT, COOLING_UNIT, mappings)
     assert result.draft.to_geojson()["geometry"] == POINT
-    assert result.draft.attrs == {"model": "Dry cooler A"}
+    assert result.draft.attrs == {"model": "Dry cooler A", "source_attributes": {"Model": "Dry cooler A"}}
     assert not result.promoted
 
 
@@ -262,7 +296,10 @@ def test_an_explicit_class_choice_overrides_the_guess():
     )
     assert plan.layers[0].class_id == "administrative"
     # The columns are remapped against the class actually chosen.
-    assert all(m.target is None for m in plan.layers[0].mappings if m.source.startswith("No."))
+    assert all(
+        m.role is FieldRole.SOURCE_ATTRIBUTE
+        for m in plan.layers[0].mappings if m.source.startswith("No.")
+    )
 
 
 def test_selecting_a_layer_with_no_class_is_a_blocking_problem():
@@ -413,8 +450,32 @@ def test_a_mapping_line_carries_the_declared_range_and_length():
 
 def test_the_field_summary_counts_what_lands_where():
     summary = build_plan([_source("Compounds")], REGISTRY).layers[0].mapping_summary()
-    assert "1 unmapped" in summary
+    assert "1 -> source attribute" in summary
     assert "2 -> name" in summary
+
+
+def test_preview_blocks_a_class_that_cannot_store_original_fields():
+    registry = parse_registry({"classes": [{
+        **SEED_CLASSES[0],
+        "attr_schema": {"type": "object", "additionalProperties": False, "properties": {}},
+    }]})
+    plan = build_plan([_source("Compounds")], registry)
+    assert any("source_attributes" in problem for problem in plan.layers[0].problems())
+
+
+def test_preview_explains_archive_only_fields_for_a_closed_class():
+    registry = parse_registry({"classes": [{
+        **SEED_CLASSES[0],
+        "attr_schema": {
+            "type": "object", "additionalProperties": False,
+            "properties": {"source_attributes": {"type": "object"}},
+        },
+    }]})
+    layer = build_plan([_source("Compounds")], registry).layers[0]
+    assert layer.problems() == ()
+    assert "source archive" in layer.mapping_summary()
+    assert any("original source_attributes field" in line for line in layer.mapping_lines())
+    assert not any("map to nothing" in note for note in layer.notes())
 
 
 def test_there_is_no_field_summary_until_a_class_is_chosen():

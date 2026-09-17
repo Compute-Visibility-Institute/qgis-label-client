@@ -133,9 +133,9 @@ def python_value(value: Any) -> Any:
     """Normalise one QGIS attribute value to something the pure core can reason about.
 
     An empty DBF cell arrives as a NULL QVariant, which is not ``None`` and, depending on
-    the binding, not reliably falsy either. Publishing one would write a JSON ``null`` into
-    ``attrs`` -- a claim that somebody looked and found nothing, in a dataset where the
-    truth is that nobody filled the column in at all.
+    the binding, not reliably falsy either. Convert it to Python ``None`` so the source
+    archive preserves the empty cell as JSON ``null`` without attempting to serialize
+    a Qt wrapper. Typed canonical attributes still omit empty source cells.
     """
     if value is None:
         return None
@@ -145,7 +145,7 @@ def python_value(value: Any) -> Any:
 
 
 def feature_values(feature: QgsFeature, field_names: Sequence[str]) -> dict[str, Any]:
-    """A feature's attributes as a plain mapping, NULLs normalised away."""
+    """A feature's attributes as a plain mapping, QGIS NULLs converted to None."""
     return {name: python_value(feature.attribute(name)) for name in field_names}
 
 
@@ -1146,7 +1146,10 @@ def _draft_feature(
     for message in result.issues:
         outcome.note(message, subject)
     if result.draft is None:
-        outcome.skipped_unshapeable += 1
+        if result.invalid_attributes:
+            outcome.failed += 1
+        else:
+            outcome.skipped_unshapeable += 1
         return None
 
     outcome.promoted += int(result.promoted)

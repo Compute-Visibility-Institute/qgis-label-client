@@ -6,6 +6,20 @@ most recent entries into `metadata.txt` at release time.
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-09-17
+
+### Fixed
+
+- Preserve every original provider field and value in `attrs.source_attributes`
+  during bootstrap upload, including Chinese and English text, Company, Location,
+  nulls, zero, and text before canonical name cleanup or numeric conversion.
+- Retain unmatched columns under their original names for open attribute schemas.
+  Keep colliding or incompatible canonical values in the source archive instead of
+  discarding them, and report the mapping decision.
+- Refuse rows whose source values cannot be represented in JSON or whose class
+  schema cannot accept the source archive, rather than upload an incomplete copy.
+  Value-map and relation widgets retain stored codes, not their display labels.
+
 ## [0.1.12] - 2026-09-10
 
 ### Changed

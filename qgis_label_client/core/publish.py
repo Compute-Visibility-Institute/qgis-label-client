@@ -52,6 +52,7 @@ from typing import Any
 from .bootstrapstyles import StyleResult
 from .fields import DEFAULT_FIELDS, CoreFields
 from .legacy import (
+    SOURCE_ATTRIBUTES,
     ClassGuess,
     FieldMapping,
     FieldRole,
@@ -60,6 +61,7 @@ from .legacy import (
     map_fields,
     name_columns,
     name_entries,
+    source_archive_problem,
 )
 from .names import NameSet, build_names
 from .registry import ClassRegistry, LabelClass
@@ -361,6 +363,8 @@ class DraftResult:
 
     draft: FeatureDraft | None = None
     issues: tuple[str, ...] = ()
+    #: Source attributes cannot be represented without losing data.
+    invalid_attributes: bool = False
     #: Set when the geometry had to be promoted to the class's multi-part type.
     promoted: bool = False
     #: Set when a third ordinate was dropped so PostGIS would accept the geometry.
@@ -397,6 +401,8 @@ def build_draft(
 
     names: NameSet = build_names(name_entries(values, mappings), skip_damaged=skip_damaged_names)
     attributes = build_attrs(values, mappings, label_class)
+    if attributes.blocking_issues:
+        return DraftResult(issues=attributes.issues + names.collisions, invalid_attributes=True)
 
     return DraftResult(
         draft=FeatureDraft(
@@ -407,7 +413,10 @@ def build_draft(
         ),
         # A dropped name is data loss, exactly like a refused attribute, and belongs in
         # the same list rather than in the silence between two dictionary writes.
-        issues=attributes.issues + names.collisions,
+        issues=attributes.issues + tuple(
+            f"{issue}; original source text remains in attrs.source_attributes"
+            for issue in names.collisions
+        ),
         promoted=was_promoted(geometry, conformed),
         flattened=flattened,
         damaged_names=names.damaged,
@@ -574,6 +583,17 @@ class LayerPlan:
         # report that reads like a server fault.
         if self.routing_problem:
             return (self.routing_problem,)
+        if self.source.field_names:
+            archive_problem = source_archive_problem(self.label_class)
+            if archive_problem:
+                return (f"{self.source.name}: {archive_problem}.",)
+        if any(
+            mapping.role is FieldRole.ATTRIBUTE
+            and mapping.target == SOURCE_ATTRIBUTES
+            and mapping.source != SOURCE_ATTRIBUTES
+            for mapping in self.mappings
+        ):
+            return (f"{self.source.name}: a canonical mapping claims the source_attributes archive key.",)
         return ()
 
     def mapping_lines(self) -> tuple[str, ...]:
@@ -604,6 +624,10 @@ class LayerPlan:
         lines: list[str] = []
         for mapping in self.mappings:
             line = mapping.describe()
+            if mapping.role is FieldRole.UNMAPPED:
+                line = f"{mapping.source} -> original source_attributes field"
+            elif mapping.source == SOURCE_ATTRIBUTES:
+                line = f"{mapping.source} -> field nested inside the source_attributes archive"
             if (
                 self.label_class is not None
                 and mapping.role is FieldRole.ATTRIBUTE
@@ -623,7 +647,7 @@ class LayerPlan:
             return ""
         counts: dict[str, int] = {}
         for mapping in self.mappings:
-            key = "unmapped" if mapping.target is None else f"-> {mapping.role.value}"
+            key = "-> source archive" if mapping.target is None else f"-> {mapping.role.value}"
             counts[key] = counts.get(key, 0) + 1
         if not counts:
             return "no columns"
@@ -632,6 +656,11 @@ class LayerPlan:
     def notes(self) -> tuple[str, ...]:
         """Things worth saying before publishing. Advisory, never blocking."""
         notes: list[str] = []
+        if self.source.field_names:
+            notes.append(
+                "Original provider fields, including unchanged text and null values, "
+                "are retained in attrs.source_attributes alongside the mapped fields."
+            )
         if self.source.previous is not None:
             notes.append(self.source.previous.describe())
         if not self.source.count_known:
@@ -662,21 +691,24 @@ class LayerPlan:
             )
         if self.source.damaged_names:
             floor = "at least " if self.source.scanned < self.source.feature_count else ""
-            action = "omitted" if self.choice.skip_damaged_names else "PUBLISHED AS THEY ARE"
+            action = (
+                "omitted from the canonical names"
+                if self.choice.skip_damaged_names else "PUBLISHED AS THEY ARE in the canonical names"
+            )
             notes.append(
                 f"{floor}{self.source.damaged_names} name(s) look like they have lost "
                 f"their final character to the UTF-7 truncation; they will be {action}. "
                 "That is an upper bound, not a measurement: a two-character site "
                 "designator after a Chinese character cannot be told apart from a cut "
-                "escape run, so omitting these may destroy an intact name."
+                "escape run. Original text is retained in attrs.source_attributes either way."
             )
         if self.guess.tied_with:
             notes.append(self.guess.describe())
         unmapped = [m.describe() for m in self.mappings if m.target is None]
         if unmapped:
             notes.append(
-                f"{len(unmapped)} column(s) map to nothing in this class's schema: "
-                + "; ".join(unmapped)
+                f"{len(unmapped)} column(s) have no canonical mapping and are retained "
+                "in source_attributes: " + "; ".join(m.source for m in self.mappings if m.target is None)
             )
         return tuple(notes)
 

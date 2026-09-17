@@ -526,18 +526,37 @@ Two more things the dialog says out loud, because both are silent failures other
 
 What happens per feature:
 
+- every provider field is copied into `attrs.source_attributes` under its original name,
+  before any name cleanup or numeric conversion. This includes original text, whitespace,
+  nulls, zero, colliding name columns, and names omitted from the canonical name display.
+  A source column named `source_attributes` is nested inside this archive;
 - legacy columns are matched onto the class's own `attr_schema`, so `No. Cooler` and
   `No. Coolim` converge on one attribute and `No. transf`/`No. Transf` on another, without
   this plugin containing any of those names;
 - `Name:ch` / `Name_en` / `Name` become `names` as `{"zh": …, "en": …}`, with an unmarked
   column filed by content;
-- empty values are omitted rather than written as nulls — only four columns in the source
-  have any data at all, and `{"…": null}` would claim somebody looked and found nothing;
+- classes that allow additional attributes preserve unmatched columns under their exact
+  source names, including nulls, empty text, and zero. For example, `Company`, `Location`,
+  `Area_sqm`, and the source `id` remain inside `attrs`; `Area_sqm` keeps its stated units;
+- when a canonical conversion fails or two columns conflict, the original column is
+  retained separately and the report explains why. If an extra top-level copy would
+  conflict with a canonical attribute, the original value stays in the archive. A row
+  is refused if the archive is incompatible with the class schema or a canonical mapping
+  claims its reserved key. A closed class schema must allow a `source_attributes` object;
+  other source fields remain in that archive when the class prohibits extra top-level
+  attributes. Empty name cells are still omitted from `names`;
 - single-part geometries are promoted to the multi-part type the class declares, anything
   outside EPSG:4326 is reprojected, and invalid geometries are skipped and reported rather
   than sent for the server to reject;
-- **no identity is invented.** The source `id` column is 0% populated and `label_id` is
-  `uuid DEFAULT gen_random_uuid()`. Identity is the server's.
+- **no identity is invented.** Source `id` is provenance inside `attrs`, while `label_id`
+  is `uuid DEFAULT gen_random_uuid()`. Identity is the server's.
+
+The archive stores the values QGIS reads from the provider. Ordinary text fields retain
+their text exactly. Editor widgets such as Value Map or Value Relation may display a
+label instead of the stored code; the archive currently preserves that code, not the
+widget's display label. Values without a JSON representation are reported and the row
+is refused. Source field aliases, widget configuration, and provider field definitions
+are not part of the uploaded attributes.
 
 The run happens in a `QgsTask` with progress and cancellation. **One feature per request,
 and nothing is ever sent twice.** A save is not atomic — one HTTP request is one edit, and

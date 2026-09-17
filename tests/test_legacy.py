@@ -11,6 +11,8 @@ so every tie must produce *no* answer rather than an arbitrary one.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 from snapshot_fixtures import EXPECTED_CLASSES, REGISTRY, SEED_CLASSES, SNAPSHOT_LAYERS
 
@@ -163,13 +165,13 @@ def test_a_column_already_using_the_canonical_spelling_is_matched_exactly():
 def test_a_description_does_not_land_on_a_count():
     # "Cooler" carries no quantity marker, so it is not the same fact as "No. Cooler".
     # Without that check an abbreviation would silently become a denormalised count.
-    assert map_field("Cooler", COMPOUND).role is FieldRole.UNMAPPED
+    assert map_field("Cooler", COMPOUND).role is FieldRole.SOURCE_ATTRIBUTE
 
 
 def test_an_abbreviation_may_say_less_than_the_canonical_name_but_never_more():
     assert map_field("No. Cooling Units", COMPOUND).target == "cooling_unit_count"
     # Extra content the class never declared means this is a different fact.
-    assert map_field("No. Cooler Roof", COMPOUND).role is FieldRole.UNMAPPED
+    assert map_field("No. Cooler Roof", COMPOUND).role is FieldRole.SOURCE_ATTRIBUTE
 
 
 def test_an_ambiguous_column_is_reported_rather_than_guessed():
@@ -192,7 +194,7 @@ def test_an_ambiguous_column_is_reported_rather_than_guessed():
         }
     )
     mapping = map_field("No. Cooler", registry.get("invented"))
-    assert mapping.role is FieldRole.UNMAPPED
+    assert mapping.role is FieldRole.SOURCE_ATTRIBUTE
     assert mapping.tied_with == ("cooling_tower_count", "cooling_unit_count")
     assert "ambiguous" in mapping.describe()
 
@@ -237,9 +239,8 @@ def test_the_registry_wins_when_it_declares_a_name_attribute():
     assert mapping.role is FieldRole.ATTRIBUTE and mapping.target == "name"
 
 
-def test_the_empty_id_column_maps_to_nothing():
-    # 0% populated across all 1,246 features, and identity is the server's to assign.
-    assert map_field("id", COMPOUND).role is FieldRole.UNMAPPED
+def test_source_id_is_an_attribute_not_server_identity():
+    assert map_field("id", COMPOUND).role is FieldRole.SOURCE_ATTRIBUTE
 
 
 def test_name_columns_are_found_without_a_class():
@@ -256,7 +257,7 @@ def test_the_whole_compounds_layer_maps_as_expected():
     assert mappings["No. transf"].target == "transformer_count"
     assert mappings["Year"].target == "commissioned_year"
     assert mappings["Area"].target == "area_m2"
-    assert mappings["id"].role is FieldRole.UNMAPPED
+    assert mappings["id"].role is FieldRole.SOURCE_ATTRIBUTE
 
 
 # --- values ----------------------------------------------------------------
@@ -340,10 +341,10 @@ def test_a_value_with_no_json_form_never_reaches_attrs():
     values = {"Surveyed": _Unserialisable(), "Tally": 6}
     result = build_attrs(values, map_fields(list(values), label_class), label_class)
 
-    # The good column still publishes; only the unserialisable one is dropped, with a
-    # reason that names the attribute.
-    assert result.attrs == {"tally": 6}
-    assert any("JSON" in issue and "surveyed" in issue for issue in result.issues)
+    # Refuse before drafting if the original-value archive would lose a source value.
+    assert result.attrs == {}
+    assert any("JSON" in issue and "Surveyed" in issue for issue in result.issues)
+    assert result.blocking_issues
 
 
 #: A class declaring the three types a DBF column arrives in the wrong shape for. Built
@@ -439,9 +440,7 @@ def test_the_schema_keywords_the_server_enforces_are_checked_first():
     assert schema_problem("operational", COMPOUND.attribute("status")) is None
 
 
-def test_attributes_omit_every_empty_value():
-    # Only four columns in the whole snapshot have any data. Writing nulls for the rest
-    # would claim we looked and found nothing.
+def test_attributes_preserve_empty_source_columns_without_claiming_canonical_values():
     mappings = map_fields(SNAPSHOT_LAYERS["Compounds"], COMPOUND)
     values = {
         "id": None,
@@ -453,19 +452,24 @@ def test_attributes_omit_every_empty_value():
         "No. transf": 4,
     }
     result = build_attrs(values, mappings, COMPOUND)
-    assert result.attrs == {"transformer_count": 4}
+    assert result.attrs == {
+        "source_attributes": values,
+        "transformer_count": 4, "id": None, "No. Cooler": None, "Year": "   ", "Area": None,
+    }
 
 
 def test_a_recorded_zero_survives():
     mappings = map_fields(["No. Cooler"], COMPOUND)
-    assert build_attrs({"No. Cooler": 0}, mappings, COMPOUND).attrs == {"cooling_unit_count": 0}
+    assert build_attrs({"No. Cooler": 0}, mappings, COMPOUND).attrs == {
+        "cooling_unit_count": 0, "source_attributes": {"No. Cooler": 0},
+    }
 
 
-def test_an_unmapped_column_with_a_value_is_reported_not_silently_dropped():
+def test_an_unmapped_column_keeps_its_original_key_and_value():
     mappings = map_fields(["Mystery"], COMPOUND)
     result = build_attrs({"Mystery": "something"}, mappings, COMPOUND)
-    assert result.attrs == {}
-    assert result.issues and "Mystery" in result.issues[0]
+    assert result.attrs == {"Mystery": "something", "source_attributes": {"Mystery": "something"}}
+    assert result.issues == ()
 
 
 def test_an_unmapped_column_that_is_empty_produces_no_noise():
@@ -473,17 +477,109 @@ def test_an_unmapped_column_that_is_empty_produces_no_noise():
     assert build_attrs({"Mystery": None}, mappings, COMPOUND).issues == ()
 
 
-def test_a_value_the_server_would_reject_is_reported_and_dropped():
+def test_a_value_the_canonical_schema_would_reject_is_reported_and_preserved():
     mappings = map_fields(["Year"], COMPOUND)
     result = build_attrs({"Year": 1200}, mappings, COMPOUND)
-    assert result.attrs == {}
+    assert result.attrs == {"Year": 1200, "source_attributes": {"Year": 1200}}
     assert "minimum" in result.issues[0]
 
 
-def test_name_columns_never_reach_attrs():
+def test_updated_campus_columns_preserve_extra_attributes_nulls_zero_and_units():
+    values = {
+        "id": None, "Name_Ch": "示例园区", "Name_En": "Example Campus",
+        "Company": "Example operator", "Location": "Example city",
+        "No. Cooler": None, "Year": None, "Area_sqm": 12345.67, "No. transf": 0,
+    }
+    result = build_attrs(values, map_fields(values, COMPOUND), COMPOUND)
+    assert result.attrs == {
+        "source_attributes": values,
+        "id": None, "Company": "Example operator", "Location": "Example city",
+        "No. Cooler": None, "Year": None, "Area_sqm": 12345.67, "transformer_count": 0,
+    }
+    assert result.issues == ()
+    assert result.blocking_issues == ()
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_colliding_alias_keeps_both_values_regardless_of_source_field_order(reverse):
+    values = {"No. Cooler": 3, "cooling_unit_count": 9}
+    sources = list(reversed(values)) if reverse else list(values)
+    result = build_attrs(values, map_fields(sources, COMPOUND), COMPOUND)
+    assert result.attrs == {"cooling_unit_count": 9, "No. Cooler": 3, "source_attributes": values}
+    assert any("conflicts" in issue for issue in result.issues)
+    assert result.blocking_issues == ()
+
+
+def test_conflicting_source_key_stays_in_the_archive_without_overwriting_canonical_data():
+    values = {"No. Cooler": 3, "cooling_unit_count": "unreadable"}
+    result = build_attrs(values, map_fields(values, COMPOUND), COMPOUND)
+    assert result.attrs == {"cooling_unit_count": 3, "source_attributes": values}
+    assert any("source key conflicts" in issue for issue in result.issues)
+    assert result.blocking_issues == ()
+
+
+def test_closed_schema_blocks_unmapped_source_values_including_null():
+    closed = replace(COMPOUND, attr_schema={**COMPOUND.attr_schema, "additionalProperties": False})
+    values = {"Company": "Example operator", "id": None}
+    result = build_attrs(values, map_fields(values, closed), closed)
+    assert result.blocking_issues
+    assert "source_attributes" in result.blocking_issues[0]
+    assert result.attrs == {}
+
+
+def test_unserializable_source_value_blocks_instead_of_escaping_json_encoding():
+    values = {"survey_date": object()}
+    result = build_attrs(values, map_fields(values, COMPOUND), COMPOUND)
+    assert result.blocking_issues
+
+
+def test_a_source_column_named_source_attributes_is_nested_without_replacing_the_archive():
+    values = {"source_attributes": "Original table text", "Company": "  Example  "}
+    result = build_attrs(values, map_fields(values, COMPOUND), COMPOUND)
+    assert result.attrs["source_attributes"] == values
+    assert result.attrs["Company"] == "  Example  "
+    assert result.blocking_issues == ()
+
+
+def test_a_closed_schema_can_explicitly_allow_the_original_value_archive():
+    closed = replace(COMPOUND, attr_schema={
+        "type": "object", "additionalProperties": False,
+        "properties": {"source_attributes": {"type": "object"}},
+    })
+    values = {"Company": "Example", "id": None}
+    result = build_attrs(values, map_fields(values, closed), closed)
+    assert result.attrs == {"source_attributes": values}
+    assert result.blocking_issues == ()
+
+
+def test_the_original_value_archive_never_overwrites_a_declared_nonobject_attribute():
+    incompatible = replace(COMPOUND, attr_schema={
+        **COMPOUND.attr_schema,
+        "properties": {"source_attributes": {"type": "string"}},
+    })
+    values = {"Company": "Example"}
+    result = build_attrs(values, map_fields(values, incompatible), incompatible)
+    assert result.attrs == {}
+    assert result.blocking_issues
+
+
+def test_a_canonical_alias_cannot_replace_the_original_value_archive():
+    declared = replace(COMPOUND, attr_schema={
+        **COMPOUND.attr_schema,
+        "properties": {"source_attributes": {"type": "object"}},
+    })
+    values = {"Source Attributes": {"original": "value"}}
+    result = build_attrs(values, map_fields(values, declared), declared)
+    assert result.attrs["source_attributes"] == values
+    assert result.blocking_issues
+
+
+def test_name_columns_reach_only_the_original_values_archive_inside_attrs():
     mappings = map_fields(SNAPSHOT_LAYERS["Substation"], SUBSTATION)
     result = build_attrs({"Name": "变电站", "No. Transf": 2}, mappings, SUBSTATION)
-    assert result.attrs == {"transformer_count": 2}
+    assert result.attrs == {
+        "transformer_count": 2, "source_attributes": {"Name": "变电站", "No. Transf": 2},
+    }
 
 
 def test_the_cooling_unit_model_column_maps_even_though_it_is_always_empty():

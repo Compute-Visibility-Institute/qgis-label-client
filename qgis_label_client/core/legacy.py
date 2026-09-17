@@ -59,6 +59,9 @@ from .registry import AttributeSpec, ClassRegistry, LabelClass
 #: why four: it is the longest prefix shared by every abbreviation in the source data.
 STEM_LENGTH = 4
 
+# Upload provenance lives alongside canonical attributes, never in the feature's ID.
+SOURCE_ATTRIBUTES = "source_attributes"
+
 #: Tokens that mark a name as counting something rather than describing it. Generic
 #: English and notation, not domain vocabulary -- nothing here names a class or an
 #: attribute, which is the property the hygiene test protects.
@@ -228,7 +231,9 @@ class FieldRole(str, Enum):
     NAME = "name"
     #: Into ``label.attrs``, under the attribute key in :attr:`FieldMapping.target`.
     ATTRIBUTE = "attribute"
-    #: Nothing in the class registry resembles it. Reported, never published.
+    #: Kept under its original column name when the registry allows extra attributes.
+    SOURCE_ATTRIBUTE = "source attribute"
+    #: No canonical match, and the class refuses additional source attributes.
     UNMAPPED = "unmapped"
 
 
@@ -238,7 +243,7 @@ class FieldMapping:
 
     source: str
     role: FieldRole = FieldRole.UNMAPPED
-    #: Attribute key for :attr:`FieldRole.ATTRIBUTE`, language key for
+    #: Attribute key for :attr:`FieldRole.ATTRIBUTE` or SOURCE_ATTRIBUTE, language key for
     #: :attr:`FieldRole.NAME`, ``None`` when unmapped.
     target: str | None = None
     #: Declared attributes that matched equally well. Non-empty means the mapping was
@@ -246,6 +251,12 @@ class FieldMapping:
     tied_with: tuple[str, ...] = ()
 
     def describe(self) -> str:
+        if self.role is FieldRole.SOURCE_ATTRIBUTE:
+            suffix = (
+                "; canonical match is ambiguous between " + ", ".join(self.tied_with)
+                if self.tied_with else ""
+            )
+            return f"{self.source} -> original attribute {self.target!r}{suffix}"
         if self.tied_with:
             return f"{self.source}: ambiguous between " + ", ".join(self.tied_with)
         if self.role is FieldRole.UNMAPPED:
@@ -335,7 +346,13 @@ def map_field(source: str, label_class: LabelClass) -> FieldMapping:
         as_name = _name_match(source)
         if as_name is not None:
             return as_name
-    return _attribute_match(source, label_class) or FieldMapping(source=source)
+    matched = _attribute_match(source, label_class) or FieldMapping(source=source)
+    if matched.role is FieldRole.UNMAPPED and label_class.open_vocabulary:
+        return FieldMapping(
+            source=source, role=FieldRole.SOURCE_ATTRIBUTE, target=source,
+            tied_with=matched.tied_with,
+        )
+    return matched
 
 
 def map_fields(sources: Iterable[str], label_class: LabelClass) -> tuple[FieldMapping, ...]:
@@ -581,6 +598,18 @@ class AttributeResult:
 
     attrs: Mapping[str, Any]
     issues: tuple[str, ...] = ()
+    #: A row must not be sent when some source values cannot be retained safely.
+    blocking_issues: tuple[str, ...] = ()
+
+
+def source_archive_problem(label_class: LabelClass) -> str | None:
+    """Whether the class can hold upload provenance, before reading any features."""
+    if SOURCE_ATTRIBUTES in label_class.attribute_names():
+        if label_class.attribute(SOURCE_ATTRIBUTES).type not in (None, "object"):
+            return "the class reserves source_attributes for a non-object value"
+    elif not label_class.open_vocabulary:
+        return "the class must permit a source_attributes object for upload provenance"
+    return None
 
 
 def build_attrs(
@@ -588,40 +617,126 @@ def build_attrs(
     mappings: Iterable[FieldMapping],
     label_class: LabelClass,
 ) -> AttributeResult:
-    """Build ``label.attrs`` for one feature.
+    """Build canonical attributes and retain the source fields they cannot represent.
 
-    Blank values are omitted before anything else happens, which is also why an unmapped
-    column that is empty in every row -- ``id``, and most of this dataset -- never produces
-    a warning. There is nothing to warn about.
+    Every original provider value is archived before name cleanup or type conversion.
+    Extra columns also keep their exact keys and values, including explicit nulls. An invalid
+    canonical conversion or conflicting alias also falls back to the original column.
+    Closed schemas and unrepresentable values block the row rather than publishing an
+    incomplete copy. Canonical keys are assigned first, so source fallback never depends
+    on the order of the provider's columns and never overwrites a canonical attribute.
     """
     attrs: dict[str, Any] = {}
     issues: list[str] = []
+    blocked: list[str] = []
+    originals: list[tuple[str, Any]] = []
+    owners: dict[str, str] = {}
+    declared = set(label_class.attribute_names())
+    if values:
+        original_values = dict(values)
+        envelope_problem = source_archive_problem(label_class)
+        if not is_json_native(original_values):
+            unsupported = [
+                f"{source} ({type(value).__name__})"
+                for source, value in original_values.items()
+                if not isinstance(source, str) or not is_json_native(value)
+            ]
+            envelope_problem = "original provider values have no JSON representation: " + ", ".join(unsupported)
+        elif not envelope_problem and SOURCE_ATTRIBUTES in declared:
+            spec = label_class.attribute(SOURCE_ATTRIBUTES)
+            envelope_problem = schema_problem(original_values, spec)
+        if envelope_problem:
+            message = f"{SOURCE_ATTRIBUTES}: {envelope_problem}; this row was not published"
+            return AttributeResult(attrs={}, issues=(message,), blocking_issues=(message,))
+        attrs[SOURCE_ATTRIBUTES] = original_values
 
-    for mapping in mappings:
+    # An exact canonical column wins over aliases; otherwise the source spelling gives
+    # a stable ordering. The losing value is retained under its original source key.
+    ordered = sorted(mappings, key=lambda item: (
+        item.target or "", item.source != item.target, item.source,
+    ))
+    for mapping in ordered:
         if mapping.role is FieldRole.NAME:
             continue
-        raw = values.get(mapping.source)
-        if is_blank(raw):
+        if mapping.source not in values:
+            continue
+        raw = values[mapping.source]
+        if mapping.source == SOURCE_ATTRIBUTES:
+            # A provider column with this name is itself a value inside the archive.
+            # It must not replace the archive or be recursively unpacked.
+            continue
+        if mapping.role is FieldRole.ATTRIBUTE and mapping.target == SOURCE_ATTRIBUTES:
+            message = (
+                f"{mapping.source}: its canonical target conflicts with the reserved "
+                f"{SOURCE_ATTRIBUTES} archive; this row was not published"
+            )
+            issues.append(message)
+            blocked.append(message)
             continue
         if mapping.role is not FieldRole.ATTRIBUTE or not mapping.target:
-            issues.append(f"{mapping.describe()}; its value {raw!r} was not published")
+            originals.append((mapping.source, raw))
+            continue
+        if is_blank(raw):
+            # Null/empty aliases are source facts too. They cannot be put into a typed
+            # canonical integer/string field, but an open schema can retain the column.
+            originals.append((mapping.source, raw))
             continue
 
         spec = label_class.attribute(mapping.target)
         coerced, problem = coerce(raw, spec)
         if problem:
             issues.append(f"{mapping.target}: {problem}")
+            originals.append((mapping.source, raw))
             continue
         problem = schema_problem(coerced, spec)
         if problem:
             issues.append(f"{mapping.target}: {problem}")
+            originals.append((mapping.source, raw))
             continue
         if is_blank(coerced):
-            # Coercion can empty a value: a string field holding only spaces becomes "".
+            originals.append((mapping.source, raw))
+            continue
+        if mapping.target in attrs:
+            if attrs[mapping.target] != coerced or type(attrs[mapping.target]) is not type(coerced):
+                issues.append(
+                    f"{mapping.source} conflicts with {owners[mapping.target]} for "
+                    f"{mapping.target}; retaining the source column separately"
+                )
+                originals.append((mapping.source, raw))
             continue
         attrs[mapping.target] = coerced
+        owners[mapping.target] = mapping.source
 
-    return AttributeResult(attrs=attrs, issues=tuple(issues))
+    for source, raw in originals:
+        problem = None
+        if not is_json_native(raw):
+            problem = f"{type(raw).__name__} values have no JSON form"
+        elif source in attrs:
+            if attrs[source] == raw and type(attrs[source]) is type(raw):
+                continue
+            problem = "its source key conflicts with a canonical attribute"
+        elif source in declared:
+            # Keeping an invalid value under a declared name would only move the refusal
+            # to the server. An undeclared source spelling is the safe fallback.
+            spec = label_class.attribute(source)
+            converted, conversion_problem = coerce(raw, spec)
+            if conversion_problem or schema_problem(converted, spec):
+                problem = "its original value does not satisfy the declared attribute schema"
+            elif type(converted) is not type(raw) or converted != raw:
+                problem = "its declared source key requires a value conversion"
+        elif not label_class.open_vocabulary:
+            # A closed vocabulary may still explicitly permit the full source archive.
+            # Keep the field there, without also adding a forbidden top-level attribute.
+            issues.append(f"{source}: retained in {SOURCE_ATTRIBUTES}; the class restricts extra attributes")
+            continue
+        if problem:
+            # The archive already holds this exact value. Keep the canonical attribute
+            # intact and report why this duplicate cannot also appear at the top level.
+            issues.append(f"{source}: {problem}; original value retained in {SOURCE_ATTRIBUTES}")
+            continue
+        attrs[source] = raw
+
+    return AttributeResult(attrs=attrs, issues=tuple(issues), blocking_issues=tuple(blocked))
 
 
 def name_entries(
