@@ -1,8 +1,8 @@
 # CVI Label Client
 
-## Development preview: class layers and attribute columns
+## Class layers and attribute columns
 
-The development build asks the server for its class-layer capability on **Connect**.
+The plugin asks the server for its class-layer capability on **Connect**.
 When supported, **Add editable layers** adds separate platform class layers. A class that
 accepts several geometry families has separate point, line and polygon child layers;
 multipart features stay in their corresponding family. Source attributes appear as
@@ -14,8 +14,11 @@ reconnecting to load a changed field schema; existing dirty layers are never rep
 Local uploads continue through the established bulk API, preserving all source data.
 Servers without the new capability keep the existing geometry-layer interface. An
 authentication, network or malformed-capability error is reported rather than silently
-downgrading. The production plugin update feed is unchanged: test preview ZIPs in a
-separate QGIS profile connected to the development API.
+downgrading. Version 0.2.0 is distributed through the usual stable plugin repository.
+The new backend capability is enabled on development servers first; the same plugin
+keeps the legacy interface on production servers until they advertise support.
+Use a separate QGIS profile when testing the development server so your production
+project and saved connection stay separate.
 
 The **History track** selector is collapsed at the bottom of the panel. The current
 track remains visible beneath the connection controls.
@@ -24,7 +27,7 @@ A QGIS 3.44 plugin for a bitemporal geospatial labeling backend that speaks
 **OGC API - Features** (Parts 1, 2 and 4).
 
 It is deliberately thin. QGIS's native OAPIF provider already reads *and* writes vector
-features with no plugin code at all, so this plugin covers only the six things QGIS
+features with no plugin code at all, so this plugin covers the things QGIS
 cannot do on its own.
 
 ---
@@ -34,7 +37,6 @@ cannot do on its own.
 | | Why QGIS cannot do it |
 |---|---|
 | **Authentication** — signs in with Google, stores the resulting token in `QgsAuthManager`, puts its seven-character id in every layer URI, and **renews it before it expires** | QGIS can hold a credential, but something has to obtain it, reference it and replace it. QGIS 3.44 can carry an ID token itself, but only by evicting the `X-Track` header from the credential and only until the first refresh, after which it sends an expired one forever |
-| **Imagery credentials** — fetches fresh signed object-storage URLs and re-points raster layer sources | **The clearest reason this plugin exists.** Signed URLs expire, and there is no way to write "a URL, but fetch it fresh" into a project file. A `.qgz` saved on Monday has dead raster layers on Tuesday |
 | **Collections and class vocabulary** — read from the backend at connect time | Categories, styles, attribute schemas and form order live in the server's class registry. Anything compiled into the plugin would drift from the web UI the first time someone adds a class |
 | **As-of date** — pins layers to one instant of *valid* time | The Temporal Controller cannot drive `datetime`: its filter is a function node the Part 1 compiler refuses, so it filters client-side and downloads the whole collection. Sending the instant server-side is a plugin job |
 | **Historical view** — adds a read-only layer showing what the team *believed* at a chosen instant | Transaction time has no OGC parameter at all. It travels as a per-layer request header, which is also the only transport that reaches the `OPTIONS` probe QGIS uses to decide whether a layer is editable |
@@ -60,8 +62,7 @@ https://github.com/Compute-Visibility-Institute/qgis-label-client/releases/lates
 No username, no password, no VPN, and **no QGIS master password prompt during install**.
 The plugin then behaves like an official one: searchable, installable, with upgrade badges.
 
-> The plugin is marked **experimental** while it stabilises. Tick
-> *Show also experimental plugins* in the same Settings tab, or it will not appear.
+Version 0.2.0 uses the stable feed. **Show also experimental plugins** is not required.
 
 ### From a zip
 
@@ -237,7 +238,8 @@ Reviewed local source layers show **[Unpushed]** after edits and use the same wa
 toggle. Save local source files and the QGIS project before closing; export memory
 layers to a file. The upload journal does not preserve their unsaved feature payloads.
 
-These changes are unreleased and have not yet undergone native-QGIS validation.
+These workflows are included in version 0.2.0. Save remote edits and your QGIS
+project before upgrading; recovery journals do not replace saving local source files.
 
 ### Why the plugin runs the OAuth flow itself
 

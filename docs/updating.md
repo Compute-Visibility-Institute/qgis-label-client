@@ -18,8 +18,7 @@ the labels again.
 ## 2. Upgrade through the plugin manager
 
 1. Open **Plugins → Manage and Install Plugins → Settings**.
-2. Enable **Show also experimental plugins** while CVI Label Client is published as
-   experimental.
+2. Version 0.2.0 uses the stable feed; **Show also experimental plugins** is not required.
 3. Ensure the CVI repository is enabled. If it is missing, click **Add** and use:
 
    ```text
@@ -27,8 +26,7 @@ the labels again.
    ```
 
 4. Click **Reload all repositories** to fetch the current release list.
-5. Open **Upgradeable**, select **CVI Label Client**, and click **Upgrade Plugin**
-   or **Upgrade Experimental Plugin**, whichever QGIS offers.
+5. Open **Upgradeable**, select **CVI Label Client**, and click **Upgrade Plugin**.
 6. Check the installed version in the plugin's details against the latest release:
 
    https://github.com/Compute-Visibility-Institute/qgis-label-client/releases/latest
@@ -81,10 +79,17 @@ backup project first; moving to another server may require reloading the remote
 collections and restoring their styles and time filters. See
 [upgrading an existing profile after a deployment move](../README.md#upgrading-an-existing-profile-after-the-deployment-moves).
 
-## Release status
+## Version 0.2.0 and backend compatibility
 
-This guide describes the update procedure, not a new plugin release. As of
-**22 September 2026**, the new startup connection prompt, durable unpushed-edit
-recovery and push-all-local workflow are under development and are **not included
-in a published release yet**. Do not rely on those features to protect unsaved
-work until a release explicitly includes them.
+Version 0.2.0 includes the startup connection prompt, unpushed-edit recovery and
+**Push all local** workflow, and is delivered through the normal stable repository.
+Continue saving edits and local source files before upgrading.
+
+On Connect, the plugin asks whether the server supports separate class layers and
+editable source-attribute columns. That backend capability is enabled on development
+servers first. Production servers without it retain the existing geometry-layer
+interface with the same plugin version. Authentication or connection failures are
+reported rather than treated as a reason to switch interfaces.
+
+For development-server testing, use a separate QGIS profile and the API URL from its
+setup page. Installing an update does not change your saved server or track.

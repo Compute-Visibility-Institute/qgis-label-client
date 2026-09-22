@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and `qgis-plugin-ci` copies the
 most recent entries into `metadata.txt` at release time.
 
+## [0.2.0] - 2026-09-22
+
+### Changed
+
+- Publish the tested development preview through the normal plugin repository as
+  a non-experimental release. Reload the usual repository and upgrade to 0.2.0;
+  no separate repository or experimental-plugin setting is required.
+- Use class layers and editable original-attribute columns when the server
+  advertises support. Keep legacy collections on production and older APIs.
+- Include the preview's simplified layer controls, reconnect/pending-edit
+  recovery, and Push all local workflows described below.
+
 ## [0.2.0-dev.1] - 2026-09-22
 
 Development preview; distributed separately from the production update feed.
