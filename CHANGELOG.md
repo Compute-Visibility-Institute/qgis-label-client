@@ -4,7 +4,41 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and `qgis-plugin-ci` copies the
 most recent entries into `metadata.txt` at release time.
 
-## [Unreleased]
+## [0.2.0-dev.1] - 2026-09-22
+
+Development preview; distributed separately from the production update feed.
+
+### Changed
+
+- Negotiate the development class-layer API and expose separate editable layers
+  by platform class and geometry, with original scalar attributes as editable
+  columns. Keep legacy API support for production and older servers.
+- Replace the collection checklist with **Add read only layers** and **Add
+  editable layers**. Keep historical views in their own controls and remove
+  imagery and surveyed-extents options from the layer picker.
+- Add **Push all local** and run it after connection for reviewed local point, line
+  and polygon layers. Skip existing server features, keep a durable before-upload
+  journal, and hold changed or uncertain rows for review. Mark reviewed local-source
+  edits Unpushed and respect the edit-warning popup toggle.
+- Mark native local changes as Unpushed and persist private recovery journals with
+  typed attributes and geometry. On connection, upload never-submitted work after
+  account/track/access and server-version checks; hold uncertain saves and conflicts
+  for review. Add an Unpushed edits menu and a separate edit-warning popup toggle.
+- Move the history-track selector to the bottom of the panel and collapse it on first
+  use. Keep the current-track banner visible below Connection. New profiles continue
+  to select the server's default track (production on the production server), and
+  existing profiles keep their saved selection.
+- Show a startup connection popup with Sign out, Sign in with Google, and Connect.
+  Add menu controls to reopen it and turn startup prompting on or off. On connection,
+  refresh clean loaded live layers while preserving their filters and leaving active
+  edit buffers and queued local changes untouched.
+
+### Fixed
+
+- Preserve native editing sessions and unsaved edits across sign-out and sign-in to
+  the same account and backend. Delete credentials on logout, retain only their
+  nonsecret references, and recreate those references on login without rebuilding
+  providers. Recheck access and leave old layers unauthenticated for another account.
 
 ## [0.1.14] - 2026-09-17
 

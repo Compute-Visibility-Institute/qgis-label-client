@@ -249,6 +249,27 @@ def test_signing_out_removes_the_refresh_token_as_well_as_the_configs(manager):
     assert removed == len(stored)
     assert manager.configs == {}
     assert auth.REFRESH_TOKEN_SETTING not in manager.settings
+    assert set(stored.values()) <= set(manager.cleared)
+
+
+def test_restoring_removed_references_reconnects_every_track_without_new_ids(manager):
+    previous = auth.store_id_token_for_tracks("old-token", [TRACK, OTHER_TRACK])
+    auth.remove_all(previous)
+    restored = auth.store_id_token_for_tracks("new-token", [], previous, restore_missing=True)
+    assert restored == previous
+    for track, authcfg in restored.items():
+        headers = manager.configs[authcfg].configMap()
+        assert headers[auth.AUTH_HEADER] == "Bearer new-token"
+        assert headers.get(TRACK_HEADER, "") == track
+
+
+def test_restore_never_overwrites_an_occupied_id_or_leaves_partial_credentials(manager):
+    previous = auth.store_id_token_for_tracks("old-token", [TRACK])
+    auth.remove(previous[""])
+    with pytest.raises(ConfigurationError, match="already in use"):
+        auth.store_id_token_for_tracks("new-token", [], previous, restore_missing=True)
+    assert set(manager.configs) == {previous[TRACK]}
+    assert manager.configs[previous[TRACK]].configMap()[auth.AUTH_HEADER] == "Bearer old-token"
 
 
 # --- refusals -----------------------------------------------------------------

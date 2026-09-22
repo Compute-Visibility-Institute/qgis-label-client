@@ -25,7 +25,6 @@ import os
 import time
 from collections.abc import Callable, Sequence
 from contextlib import suppress
-from datetime import datetime, timezone
 from typing import Any
 
 from qgis.core import Qgis, QgsApplication, QgsFeedback, QgsProject
@@ -39,11 +38,11 @@ from qgis.PyQt.QtWidgets import (
     QMessageBox,
 )
 
-from . import auth, client, imagery, layertree, network, oauth_flow, qa
+from . import auth, client, layertree, network, oauth_flow, qa
 from . import layers as layer_tools
 from . import publish as publish_tools
 from .access import LayerAccess
-from .core import bootstrapstyles, bulk, oauth, recorded, routing
+from .core import bootstrapstyles, bulk, classlayers, oauth, recorded, routing
 from .core import collections as collection_groups
 from .core.activity import ActivityRegistry, ActivityState
 from .core.asof import AsOfMechanism, describe
@@ -60,6 +59,7 @@ from .historydialog import HistoryDialog
 from .log import log, log_error, log_warning
 from .publishdialog import PublishDialog, PublishReportDialog
 from .settings import PluginSettings
+from .startup import StartupConnection
 from .tasks import TaskRunner
 from .transitions import TransitionError, transition
 from .validtime import register_functions, unregister_functions
@@ -123,12 +123,16 @@ class LabelClientPlugin:
         self.activities = ActivityRegistry(self._sync_activity)
         self.tasks = TaskRunner(self.activities)
         self.teardown = Teardown()
+        self.startup = StartupConnection(self)
+        self.pending = None
+        self.push_local = None
 
         self.dock: LabelClientDock | None = None
         self.registry: ClassRegistry | None = None
         self._track_change_serial = 0
         self._registry_pending = False
         self.collections: list[Collection] = []
+        self.collection_roles: dict[str, str] = {}
         self.bulk_capability: bulk.BulkCapability | None = None
         self.bootstrap_style_supported = False
         self._publish_backend_url = ""
@@ -190,18 +194,6 @@ class LabelClientPlugin:
             "menu: panel", lambda: self.iface.removePluginMenu(MENU_NAME, self.panel_action)
         )
 
-        self.refresh_action = QAction(
-            QgsApplication.getThemeIcon("/mActionRefresh.svg"),
-            "Refresh imagery",
-            self.iface.mainWindow(),
-        )
-        self.refresh_action.triggered.connect(self.refresh_imagery)
-        self.iface.addPluginToMenu(MENU_NAME, self.refresh_action)
-        self.teardown.add(
-            "menu: refresh imagery",
-            lambda: self.iface.removePluginMenu(MENU_NAME, self.refresh_action),
-        )
-
         self.recorded_action = QAction(
             QgsApplication.getThemeIcon("/mActionHistory.svg"),
             "Historical view (transaction time)…",
@@ -246,10 +238,24 @@ class LabelClientPlugin:
         # the analyst touches anything.
         self._arm_refresh_timer()
         self._refresh_access()
+        self.startup.install(MENU_NAME)
+        from .pending import PendingEdits
+
+        self.pending = PendingEdits(self)
+        self.pending.install(MENU_NAME)
+        from .pushlocal import PushAllLocal
+
+        self.push_local = PushAllLocal(self)
+        self.push_local.install(MENU_NAME)
         log("Plugin loaded.")
 
     def unload(self) -> None:
         """Detach everything. QGIS cleans up nothing."""
+        self.startup.close()
+        if self.push_local is not None:
+            self.push_local.close()
+        if self.pending is not None:
+            self.pending.close()
         # Tasks first: a request that completes after the dock is gone would call into a
         # destroyed widget, which is a crash rather than a warning.
         self.tasks.shutdown()
@@ -272,6 +278,7 @@ class LabelClientPlugin:
         self.dock = None
         self.registry = None
         self.collections = []
+        self.collection_roles = {}
         self.bulk_capability = None
         self.bootstrap_style_supported = False
         self._publish_backend_url = ""
@@ -312,7 +319,6 @@ class LabelClientPlugin:
         self.dock.signOutRequested.connect(self.sign_out)
         self.dock.copyAddressRequested.connect(self.copy_address)
         self.dock.loadLayersRequested.connect(self.load_collections)
-        self.dock.refreshImageryRequested.connect(self.refresh_imagery)
         self.dock.asOfApplied.connect(self.apply_as_of)
         self.dock.recordedViewRequested.connect(self.open_recorded_view)
         self.dock.historyRequested.connect(self.show_history)
@@ -442,6 +448,8 @@ class LabelClientPlugin:
 
     def _advance_session(self):
         """Invalidate callbacks and the renewal state owned by the previous session."""
+        if self.push_local is not None:
+            self.push_local.cancel()
         self._session.advance()
         self._track_change_serial += 1
         self._registry_pending = False
@@ -551,6 +559,7 @@ class LabelClientPlugin:
         self._refresh_credential(quiet=True)
 
     def _refresh_auth_label(self) -> None:
+        self.startup.update_status()
         if self.dock is None:
             return
         stored = self.settings.authcfg_by_track
@@ -926,6 +935,23 @@ class LabelClientPlugin:
 
     def _store_credential(self, credential: oauth.Credential) -> None:
         """Write the new ID token into every auth config, reusing every id."""
+        existing = self.settings.authcfg_by_track
+        if (
+            existing
+            and self.settings.oauth_email
+            and self.settings.oauth_email.casefold() != credential.email.casefold()
+            and any(layer.isEditable() for layer in layer_tools.plugin_layers())
+        ):
+            self._fail(
+                "Sign-in was not changed: finish editing before switching Google "
+                "accounts, or sign out first. Open edits must not silently be saved "
+                "under a different account."
+            )
+            return
+        restoring = False
+        if not existing:
+            existing = self.settings.signed_out_authcfgs(credential.email)
+            restoring = bool(existing)
         try:
             # One config per discovered or previously saved track, plus one naming none.
             # A fresh profile starts with only the un-tracked entry; Connect fans it out
@@ -934,7 +960,8 @@ class LabelClientPlugin:
             stored = auth.store_id_token_for_tracks(
                 credential.id_token,
                 [track.name for track in self.tracks],
-                self.settings.authcfg_by_track,
+                existing,
+                restore_missing=restoring,
             )
             renewable = auth.store_refresh_token(credential.refresh_token)
         except LabelClientError as exc:
@@ -942,6 +969,7 @@ class LabelClientPlugin:
             return
 
         self.settings.set_authcfg_by_track(stored)
+        self.settings.set("signed_out_connection", "")
         self.settings.set_oauth_session(credential.email, credential.expires_at)
         self._advance_session()
         self._refresh_auth_label()
@@ -952,6 +980,13 @@ class LabelClientPlugin:
         note = f" Covers {covered} track(s)." if covered else ""
         who = credential.email or "your Google account"
         self._message(f"Signed in as {who}.{note}", Qgis.MessageLevel.Success)
+        if restoring:
+            self._message(
+                "Reconnected your existing layers. Editing sessions and unsaved edits "
+                "were preserved. If a save failed while signed out, use Save Layer Edits "
+                "to retry; saving still requires your current server permissions.",
+                Qgis.MessageLevel.Info,
+            )
         if not renewable:
             # Said out loud rather than discovered in an hour. Without a stored refresh
             # token the session simply dies mid-afternoon, and every layer starts 401ing
@@ -1193,6 +1228,7 @@ class LabelClientPlugin:
         """
         self._abandon_sign_in()
         stored = self.settings.authcfg_by_track
+        self.settings.remember_signed_out_connection()
         refresh_token = ""
         try:
             if auth.master_password_ready(prompt=False):
@@ -1298,11 +1334,15 @@ class LabelClientPlugin:
                 "tracks": tracks,
                 "registry_track": track,
                 "connection_serial": serial,
-                "collections": client.fetch_collections(url, authcfg, feedback, track=track),
+                "collections": (
+                    client.fetch_collections(url, authcfg, feedback, track=track)
+                    + client.fetch_class_layers(url, authcfg, feedback, track=track)
+                ),
                 "registry": client.fetch_registry(
                     url, registry_path, authcfg, feedback, track=track
                 ),
                 "bulk_capability": bulk.parse_capabilities(capabilities),
+                "collection_roles": capabilities.get("collection_roles", {}),
                 "bootstrap_style_supported": bootstrapstyles.supported(capabilities),
                 "publish_backend_url": url,
                 "write_access": self._fetch_access(url, authcfg, feedback),
@@ -1336,6 +1376,7 @@ class LabelClientPlugin:
         self.settings.set_authcfg_by_track(stored)
         self._refresh_auth_label()
         self.collections = result["collections"]
+        self.collection_roles = result.get("collection_roles", {})
         self.bulk_capability = result.get("bulk_capability")
         self.bootstrap_style_supported = result.get("bootstrap_style_supported", False)
         self._publish_backend_url = result.get("publish_backend_url", "")
@@ -1355,14 +1396,33 @@ class LabelClientPlugin:
         # feature exists to prevent.
         self.dock.set_tracks(self.tracks, self.settings.track)
         loaded = {layer_tools.collection_of(layer) for layer in layer_tools.plugin_layers()}
-        # The same mode metadata drives both the panel checkbox and native layer-tree
-        # group. Individual layers retain their geometry-specific providers and titles.
-        groups = collection_groups.group_by_mode(self.collections)
+        # Each mode button loads every member; native tree groups still preserve the
+        # server's class and geometry metadata.
+        groups = collection_groups.group_by_mode(
+            classlayers.visible_collections(
+                self.collections, self.bulk_capability, self.collection_roles
+            )
+        )
         self.dock.set_collections(groups, checked=loaded)
-        layertree.group_existing_layers(QgsProject.instance(), groups)
+        readonly_groups = collection_groups.group_by_mode(
+            classlayers.current_collections(
+                self.collections, self.bulk_capability, self.collection_roles
+            )
+        )
+        self.dock.set_readonly_collections(readonly_groups)
+        references = collection_groups.group_by_mode(
+            classlayers.reference_collections(
+                self.collections, self.bulk_capability, self.collection_roles
+            )
+        )
+        self.dock.set_reference_collections(references, checked=loaded)
+        layertree.group_existing_layers(QgsProject.instance(), groups + readonly_groups)
         self.dock.set_registry(self.registry)
         selected = self.current_track()
         style_track = result.get("registry_track", selected.name if selected else "")
+        class_metadata = {
+            c.collection_id: c.class_layer for c in self.collections if c.class_layer is not None
+        }
         for layer in layer_tools.plugin_layers():
             if not layer_tools.belongs_to_backend(layer, self.settings.api_base_url):
                 continue
@@ -1374,6 +1434,20 @@ class LabelClientPlugin:
                     self._message(str(exc), Qgis.MessageLevel.Warning)
             if layer_tools.track_of(layer) != style_track:
                 continue
+            metadata = class_metadata.get(layer_tools.collection_of(layer))
+            if metadata and metadata != layer_tools.class_layer_metadata(layer):
+                if (
+                    layer.isEditable()
+                    or layer.isModified()
+                    or layer.customProperty("cvi/pending_state", "")
+                ):
+                    self._message(
+                        f"Save or recover edits in {layer.name()} and Connect again to load new attributes.",
+                        Qgis.MessageLevel.Warning,
+                    )
+                else:
+                    layer_tools.repoint_for(layer, self.settings, self.registry, selected)
+                    layer_tools.configure_class_columns(layer, dict(metadata))
             refreshed = layer_tools.refresh_generated_style(layer, self.registry)
             if layer_tools.refresh_generated_captions(layer, self.registry) or refreshed:
                 self.iface.layerTreeView().refreshLayerSymbology(layer.id())
@@ -1392,6 +1466,16 @@ class LabelClientPlugin:
             f"{len(self.registry)} classes from {self.registry.source_url}, "
             f"{len(self.tracks)} tracks"
         )
+        if self.pending is not None:
+            self.pending.on_connected(
+                lambda: (
+                    self.push_local.on_connected(self.startup.refresh_layers)
+                    if self.push_local is not None
+                    else self.startup.refresh_layers()
+                )
+            )
+        else:
+            self.startup.refresh_layers()
 
     # -------------------------------------------------------------------- layers
 
@@ -1427,7 +1511,23 @@ class LabelClientPlugin:
             return
 
         titles = {c.collection_id: c.display_name for c in self.collections}
-        groups = collection_groups.group_by_mode(self.collections)
+        groups = collection_groups.group_by_mode(
+            classlayers.visible_collections(
+                self.collections, self.bulk_capability, self.collection_roles
+            )
+            + classlayers.current_collections(
+                self.collections, self.bulk_capability, self.collection_roles
+            )
+        )
+        class_metadata = {
+            c.collection_id: c.class_layer for c in self.collections if c.class_layer is not None
+        }
+        readonly_ids = {
+            c.collection_id
+            for c in classlayers.current_collections(
+                self.collections, self.bulk_capability, self.collection_roles
+            )
+        }
         project = QgsProject.instance()
         # Historical layers deliberately do not count as "already loaded". The whole use
         # case is the live layer and one or more past-belief layers open together, and a
@@ -1459,7 +1559,12 @@ class LabelClientPlugin:
                     continue
                 if self._refuse_unpinned_historical(layer, collection_id):
                     continue
+                if collection_id in class_metadata:
+                    layer_tools.configure_class_columns(layer, dict(class_metadata[collection_id]))
                 layer_tools.apply_registry(layer, self.registry)
+                if collection_id in readonly_ids:
+                    layer.setCustomProperty("cvi/read_only_view", True)
+                    layer.setReadOnly(True)
                 layertree.add_collection_layer(project, layer, groups)
                 added += 1
                 self._warn_on_track_mismatch(layer, track)
@@ -1699,66 +1804,6 @@ class LabelClientPlugin:
         self._refresh_axes(moment)
         log(f"Historical layer added at {moment} on track {track_name or '(default)'}.")
 
-    # ------------------------------------------------------------------- imagery
-
-    def refresh_imagery(self) -> None:
-        """Mint fresh signed URLs and swap them into the raster layers."""
-        url = self._persist_url()
-        if not url:
-            self._fail("Enter the API URL first.")
-            return
-        if self._defer_until_fresh(self.refresh_imagery):
-            return
-        authcfg = self.settings.authcfg
-        path = str(self.settings.get("signed_urls_path"))
-        # Imagery is shared between tracks by design -- one GeoTIFF serves both, because a
-        # capture is a fact about the world and a track is a body of belief about it. The
-        # track is sent for the edge's audit line, not to scope anything.
-        track = self._track_name()
-        if self.dock is not None:
-            self.dock.set_imagery_status("Requesting signed URLs…")
-
-        def work(feedback: QgsFeedback):
-            return client.fetch_signed_assets(url, path, authcfg, feedback, track=track)
-
-        self._run_read_task("Refresh imagery URLs", work, self._on_signed_urls)
-
-    def _on_signed_urls(self, result) -> None:
-        assets, expires_at = result
-        _, unmatched, applied = imagery.refresh_sources(assets)
-        if self.dock is None:
-            return
-        expiry = f" Valid until {expires_at.isoformat()}." if expires_at else ""
-        note = (
-            f" {len(unmatched)} raster layer(s) matched nothing - see the log." if unmatched else ""
-        )
-        self.dock.set_imagery_status(
-            f"{applied} layer(s) re-pointed from {len(assets)} signed URL(s).{expiry}{note}"
-        )
-        self._warn_if_expiring(expires_at)
-
-    def _warn_if_expiring(self, expires_at) -> None:
-        """Say so when the freshly minted URLs are already close to death.
-
-        Worth saying out loud rather than only printing the timestamp: an expired signed
-        URL does not blank the map. GDAL keeps serving what it has cached, so the raster
-        looks right for a while and then starts failing mid-pan, which reads as a QGIS
-        problem rather than as "refresh the imagery".
-        """
-        if expires_at is None:
-            return
-        minutes = int(self.settings.get("expiry_warning_minutes"))
-        if minutes <= 0:
-            return
-        remaining = (expires_at - datetime.now(timezone.utc)).total_seconds() / 60
-        if remaining <= minutes:
-            self._message(
-                f"These signed imagery URLs expire in {int(remaining)} minute(s). "
-                "Refresh again before they do; an expired URL fails silently from "
-                "GDAL's cache rather than blanking the layer.",
-                Qgis.MessageLevel.Warning,
-            )
-
     # ------------------------------------------------------------------------ QA
 
     def show_history(self) -> None:
@@ -1831,16 +1876,32 @@ class LabelClientPlugin:
 
     def _ask_history_collection(self) -> str:
         return self._ask_collection(
-            "History collection", "Which collection serves the label audit trail?"
+            "History collection", "Which collection serves the label audit trail?", role="audit"
         )
 
-    def _ask_collection(self, title: str, question: str) -> str:
+    def _ask_collection(self, title: str, question: str, role: str = "") -> str:
         """Ask which collection serves a purpose, rather than assuming a name.
 
         Collection ids are a deployment's choice. Guessing one and failing produces a
         404 that reads like an outage; asking once and remembering costs a dialog.
         """
-        choices = [c.collection_id for c in self.collections] or [""]
+        eligible = [
+            collection
+            for collection in self.collections
+            if not role
+            or classlayers.collection_role(collection, self.bulk_capability, self.collection_roles)
+            == role
+        ]
+        # Unknown legacy servers still permit an explicit choice. Metadata is never
+        # offered as a label/history layer, and no permission is inferred here.
+        if not eligible:
+            eligible = [
+                c
+                for c in self.collections
+                if classlayers.collection_role(c, self.bulk_capability, self.collection_roles)
+                != "metadata"
+            ]
+        choices = [c.collection_id for c in eligible] or [""]
         value, accepted = QInputDialog.getItem(
             self.iface.mainWindow(), title, question, choices, 0, False
         )
@@ -1851,7 +1912,8 @@ class LabelClientPlugin:
         stored = str(self.settings.get(key)).strip()
         if stored:
             return stored
-        chosen = self._ask_collection(title, question).strip()
+        role = {"recorded_collection": "historical", "extent_collection": "extent"}.get(key, "")
+        chosen = self._ask_collection(title, question, role=role).strip()
         if chosen:
             self.settings.set(key, chosen)
         return chosen
@@ -1890,7 +1952,9 @@ class LabelClientPlugin:
                 if self.bulk_capability.serves(collection.collection_id)
             ]
         else:
-            eligible = [c for c in self.collections if c.transactional is True]
+            eligible = [
+                c for c in self.collections if c.transactional is True and c.class_layer is None
+            ]
         listed = [collection.collection_id for collection in eligible]
         if not listed:
             self._fail(

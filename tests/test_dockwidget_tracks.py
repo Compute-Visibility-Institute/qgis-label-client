@@ -8,6 +8,33 @@ from qgis_label_client.core.tracks import Track
 from qgis_label_client.dockwidget import LabelClientDock
 
 
+def test_history_track_is_the_last_panel_section(monkeypatch):
+    sections = []
+    for name in (
+        "connection",
+        "collections",
+        "bootstrap",
+        "asof",
+        "recorded",
+        "qa",
+        "vocabulary",
+        "reference",
+        "track",
+    ):
+        method_name = f"_build_{name}_group"
+        original = getattr(LabelClientDock, method_name)
+
+        def build(self, parent, original=original, name=name):
+            sections.append(name)
+            return original(self, parent)
+
+        monkeypatch.setattr(LabelClientDock, method_name, build)
+    dock = LabelClientDock(None)
+    assert sections[-1] == "track"
+    assert sections.index("reference") < sections.index("track")
+    assert "refresh_imagery_button" not in vars(dock)
+
+
 @pytest.mark.parametrize(
     ("saved", "default_status", "declares_default", "expected_index"),
     [

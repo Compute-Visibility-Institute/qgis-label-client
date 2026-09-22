@@ -27,13 +27,14 @@ turns every rename into a release. So the routes are resolved against the ids
 deployment offering something this cannot place is refused with a sentence rather than
 routed on a guess.
 
-CLASS STAYS AN ATTRIBUTE, NEVER A LAYER
+BOOTSTRAP UPLOADS KEEP THE LEGACY GEOMETRY ROUTES
 
 There are three geometry families and there will be three no matter how many classes the
 registry grows. Adding a class remains one row in ``label_class``: no migration, no new
-collection, no plugin release. Nothing here keys on a class id and nothing here may start
-to -- the split is by geometry, of which there is a closed set, not by class, of which
-there is not.
+collection, no plugin release. The additive class-layer API is for native editing and
+is discovered separately. Local bootstrap uploads retain these geometry routes and
+their existing nested attribute payloads; routing one to a flat class-layer endpoint
+would silently change the payload contract.
 
 WHY A WRONG ROUTE IS WORSE THAN NO ROUTE
 

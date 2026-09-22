@@ -15,6 +15,7 @@ in ``QGIS3.ini``, and never in a support bundle.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
@@ -59,6 +60,12 @@ DEFAULTS: dict[str, Any] = {
     #
     # Still not a token: every value is a seven-character reference into qgis-auth.db.
     "authcfg_by_track": "",
+    # Nonsecret references retained after logout, scoped to the previous account and
+    # backend. Credentials themselves are removed from qgis-auth.db. Keeping the IDs
+    # allows the same account to reconnect native layers without replacing providers.
+    "signed_out_connection": "",
+    "show_startup_connection": True,
+    "show_unpushed_warnings": True,
     # Who is signed in, for the panel label. An email address, not a credential: it is
     # already visible in the QGIS window and on every server log line, and holding it here
     # is what lets the panel say "Signed in as ..." without decrypting anything -- which
@@ -286,6 +293,44 @@ class PluginSettings:
         """
         mapping = self.authcfg_by_track
         return mapping.get(track) or mapping.get("", "")
+
+    def remember_signed_out_connection(self) -> None:
+        """Keep references only; an empty repeated logout must not erase them."""
+        mapping = self.authcfg_by_track
+        if mapping and self.oauth_email:
+            self.set(
+                "signed_out_connection",
+                json.dumps(
+                    {
+                        "email": self.oauth_email.casefold(),
+                        "backend": self.api_base_url,
+                        "authcfgs": mapping,
+                    },
+                    sort_keys=True,
+                ),
+            )
+
+    def signed_out_authcfgs(self, email: str) -> dict[str, str]:
+        """Restore references only for the same signed-in account and backend."""
+        try:
+            saved = json.loads(self.get("signed_out_connection"))
+        except (ValueError, TypeError):
+            return {}
+        if not isinstance(saved, dict) or not email:
+            return {}
+        if saved.get("email") != email.casefold() or saved.get("backend") != self.api_base_url:
+            return {}
+        mapping = saved.get("authcfgs")
+        if not isinstance(mapping, dict) or not all(
+            isinstance(track, str)
+            and isinstance(authcfg, str)
+            and re.fullmatch(r"[A-Za-z0-9]{7}", authcfg)
+            for track, authcfg in mapping.items()
+        ):
+            return {}
+        if len(set(mapping.values())) != len(mapping):
+            return {}  # Legacy shared IDs cannot safely name multiple tracks.
+        return mapping
 
     @property
     def authcfg(self) -> str:

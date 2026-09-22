@@ -164,7 +164,7 @@ def _transactional_word(transactional: bool | None) -> str:
 
 
 class LabelClientDock(QDockWidget):
-    """Connection, collections, imagery, both time axes and QA, in one persistent panel.
+    """Connection, class layers, both time axes and QA, in one persistent panel.
 
     THE TWO TIME CONTROLS ARE TWO BOXES, and that is a design decision rather than a
     layout one. "As-of date (valid time)" asks what was true on the ground; "Historical
@@ -180,7 +180,6 @@ class LabelClientDock(QDockWidget):
     #: an administrator, and retyping an address by eye is how a grant lands on nobody.
     copyAddressRequested = pyqtSignal()
     loadLayersRequested = pyqtSignal(list)
-    refreshImageryRequested = pyqtSignal()
     asOfApplied = pyqtSignal()
     #: The transaction-time axis. Carries the rendered wire instant rather than a QDateTime
     #: so that the conversion happens exactly once, in core.recorded.instant, and the panel
@@ -206,6 +205,8 @@ class LabelClientDock(QDockWidget):
         self._connected = False
         self._busy = False
         self._write_access: bool | None = None
+        self._editable_collection_ids: list[str] = []
+        self._readonly_collection_ids: list[str] = []
         self.setAllowedAreas(
             Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
         )
@@ -226,12 +227,14 @@ class LabelClientDock(QDockWidget):
         layout.setContentsMargins(8, 8, 8, 8)
 
         layout.addWidget(self._build_connection_group(container))
-        # Above Collections, because it scopes everything below it. A collection list read
-        # without knowing which dataset it belongs to is a list of names.
-        layout.addWidget(self._build_track_group(container))
+        # Keep the current dataset visible beside the connection, while the rarely used
+        # selector lives at the bottom of the panel.
+        self.track_banner = QLabel("Not connected.", container)
+        self.track_banner.setWordWrap(True)
+        self.track_banner.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(self.track_banner)
         layout.addWidget(self._build_collections_group(container))
         layout.addWidget(self._build_bootstrap_group(container))
-        layout.addWidget(self._build_imagery_group(container))
         layout.addWidget(self._build_asof_group(container))
         # Immediately below, and never inside it. Two time axes, two boxes -- see
         # _build_recorded_group.
@@ -248,6 +251,8 @@ class LabelClientDock(QDockWidget):
 
         layout.addWidget(self._build_qa_group(container))
         layout.addWidget(self._build_vocabulary_group(container))
+        layout.addWidget(self._build_reference_group(container))
+        layout.addWidget(self._build_track_group(container))
 
         layout.addStretch(1)
         for label in container.findChildren(QLabel):
@@ -348,19 +353,13 @@ class LabelClientDock(QDockWidget):
         return group
 
     def _build_track_group(self, parent: QWidget) -> QWidget:
-        """The dataset selector, and the banner that keeps saying which one it is.
-
-        NOT COLLAPSIBLE-BY-DEFAULT, and the banner is outside the combo rather than being
-        the combo's own text. Both for the same reason: the track is the piece of state
-        that is most expensive to be wrong about and least visible while you are drawing.
-        An annotator spends an afternoon in the map canvas, not in this panel, and the
-        thing they need on screen is not a control -- it is an answer.
-        """
-        group = _collapsible("History track", parent)
+        """The optional dataset selector; the current track is shown by Connection."""
+        group = _collapsible("History track", parent, collapsed=True)
         layout = QVBoxLayout(group)
 
         hint = QLabel(
-            "Choose the dataset you want to work in.",
+            "Change the dataset you work in. New profiles use this server's default track; "
+            "the production server defaults to production.",
             group,
         )
         hint.setWordWrap(True)
@@ -370,10 +369,6 @@ class LabelClientDock(QDockWidget):
         self.track_combo.currentIndexChanged.connect(self._emit_track_changed)
         layout.addWidget(self.track_combo)
 
-        self.track_banner = QLabel("Not connected.", group)
-        self.track_banner.setWordWrap(True)
-        self.track_banner.setTextFormat(Qt.TextFormat.RichText)
-        layout.addWidget(self.track_banner)
         return group
 
     def _emit_track_changed(self) -> None:
@@ -382,26 +377,48 @@ class LabelClientDock(QDockWidget):
         self.trackChanged.emit(self.selected_track())
 
     def _build_collections_group(self, parent: QWidget) -> QWidget:
-        group = _collapsible("Collections", parent)
+        group = _collapsible("Label layers", parent)
         layout = QVBoxLayout(group)
 
         hint = QLabel(
-            "Choose which layers to add to your project.",
+            "Add current labels for viewing or editing. Historical views are added below.",
             group,
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        self.collection_list = QListWidget(group)
-        self.collection_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self.collection_list.setMinimumHeight(110)
-        self.collection_list.setMaximumHeight(190)
-        layout.addWidget(self.collection_list)
+        self.load_readonly_button = QPushButton("Add read only layers", group)
+        self.load_readonly_button.setToolTip("Add the server's current read-only label layers.")
+        self.load_readonly_button.clicked.connect(
+            lambda: self.loadLayersRequested.emit(list(self._readonly_collection_ids))
+        )
+        layout.addWidget(self.load_readonly_button)
 
-        self.load_button = QPushButton("Add selected layers", group)
+        self.load_button = QPushButton("Add editable layers", group)
         self.load_button.setIcon(QgsApplication.getThemeIcon("/mActionAddOgrLayer.svg"))
+        self.load_button.setToolTip("Add separate class layers when supported by the server.")
         self.load_button.clicked.connect(self._emit_load_layers)
         layout.addWidget(self.load_button)
+        return group
+
+    def _build_reference_group(self, parent: QWidget) -> QWidget:
+        group = _collapsible("Advanced reference layers", parent, collapsed=True)
+        self.reference_group = group
+        group.setVisible(False)
+        layout = QVBoxLayout(group)
+        hint = QLabel("Other optional reference layers advertised by this server.", group)
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.reference_list = QListWidget(group)
+        self.reference_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.reference_list.setMinimumHeight(80)
+        self.reference_list.setMaximumHeight(150)
+        layout.addWidget(self.reference_list)
+        self.load_reference_button = QPushButton("Add selected reference layers", group)
+        self.load_reference_button.clicked.connect(
+            lambda: self.loadLayersRequested.emit(self.checked_collections(self.reference_list))
+        )
+        layout.addWidget(self.load_reference_button)
         return group
 
     def _build_bootstrap_group(self, parent: QWidget) -> QWidget:
@@ -426,27 +443,6 @@ class LabelClientDock(QDockWidget):
         self.publish_status = QLabel("", group)
         self.publish_status.setWordWrap(True)
         layout.addWidget(self.publish_status)
-        return group
-
-    def _build_imagery_group(self, parent: QWidget) -> QWidget:
-        group = _collapsible("Imagery", parent)
-        layout = QVBoxLayout(group)
-
-        hint = QLabel(
-            "Refresh imagery access when images stop drawing.",
-            group,
-        )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
-        self.imagery_status = QLabel("Imagery has not been refreshed yet.", group)
-        self.imagery_status.setWordWrap(True)
-        layout.addWidget(self.imagery_status)
-
-        self.refresh_imagery_button = QPushButton("Refresh imagery", group)
-        self.refresh_imagery_button.setIcon(QgsApplication.getThemeIcon("/mActionRefresh.svg"))
-        self.refresh_imagery_button.clicked.connect(self.refreshImageryRequested)
-        layout.addWidget(self.refresh_imagery_button)
         return group
 
     def _build_asof_group(self, parent: QWidget) -> QWidget:
@@ -555,6 +551,14 @@ class LabelClientDock(QDockWidget):
         note.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(note)
 
+        self.history_button = QPushButton("Selected label history…", group)
+        self.history_button.setIcon(QgsApplication.getThemeIcon("/mActionHistory.svg"))
+        self.history_button.setToolTip(
+            "Every recorded belief about the selected label, keyed on its immutable label_id."
+        )
+        self.history_button.clicked.connect(self.historyRequested)
+        layout.addWidget(self.history_button)
+
         self.recorded_floor_label = QLabel("", group)
         self.recorded_floor_label.setWordWrap(True)
         layout.addWidget(self.recorded_floor_label)
@@ -578,14 +582,6 @@ class LabelClientDock(QDockWidget):
     def _build_qa_group(self, parent: QWidget) -> QWidget:
         group = _collapsible("QA", parent, collapsed=True)
         layout = QVBoxLayout(group)
-
-        self.history_button = QPushButton("Selected label history…", group)
-        self.history_button.setIcon(QgsApplication.getThemeIcon("/mActionHistory.svg"))
-        self.history_button.setToolTip(
-            "Every recorded belief about the selected label, keyed on its immutable label_id."
-        )
-        self.history_button.clicked.connect(self.historyRequested)
-        layout.addWidget(self.history_button)
 
         self.coverage_button = QPushButton("Check survey coverage", group)
         self.coverage_button.setToolTip(
@@ -630,13 +626,16 @@ class LabelClientDock(QDockWidget):
     def _sync_actions(self) -> None:
         available = self._connected and not self._busy
         for widget in (
-            self.load_button,
-            self.refresh_imagery_button,
+            self.load_reference_button,
             self.apply_asof_button,
             self.history_button,
             self.coverage_button,
         ):
             widget.setEnabled(available)
+        self.load_readonly_button.setEnabled(available and bool(self._readonly_collection_ids))
+        self.load_button.setEnabled(
+            available and bool(self._editable_collection_ids) and self._write_access is not False
+        )
         self.connect_button.setEnabled(not self._busy)
         self.track_combo.setEnabled(available)
         self.publish_button.setEnabled(available and self._write_access is not False)
@@ -666,10 +665,6 @@ class LabelClientDock(QDockWidget):
 
     def set_auth_status(self, message: str) -> None:
         self.auth_label.setText(message)
-
-    def set_imagery_status(self, message: str) -> None:
-        self.imagery_status.setText(message)
-        self.set_status(message)
 
     def set_qa_result(self, message: str) -> None:
         self.qa_result.setText(message)
@@ -772,19 +767,29 @@ class LabelClientDock(QDockWidget):
     def set_collections(
         self, groups: Sequence[CollectionGroup], checked: Iterable[str] = ()
     ) -> None:
-        """Populate the collection list, preserving which rows were checked.
+        """The editable action loads every advertised class/geometry layer.
 
-        One row per :class:`CollectionGroup`, never per collection: a group of geometry-
-        typed siblings (``label_current_point``/``_line``/``_polygon``) is one checkbox
-        for one mode, which is the whole point of grouping upstream in
-        :func:`.core.collections.group_by_mode` rather than here. A group of size one
-        (every collection this deployment has not split by geometry) renders identically
-        to a plain collection before this method learned about groups.
+        Existing layers are skipped by the controller; there is no second selection
+        state to keep in sync with the QGIS layer tree.
         """
+        self._editable_collection_ids = [cid for group in groups for cid in group.collection_ids]
+        self._sync_actions()
+
+    def set_readonly_collections(self, groups: Sequence[CollectionGroup]) -> None:
+        self._readonly_collection_ids = [cid for group in groups for cid in group.collection_ids]
+        self._sync_actions()
+
+    def set_reference_collections(
+        self, groups: Sequence[CollectionGroup], checked: Iterable[str] = ()
+    ) -> None:
+        self._set_collection_items(self.reference_list, groups, checked)
+        self.reference_group.setVisible(bool(groups))
+
+    def _set_collection_items(self, target, groups, checked) -> None:
         preselected = set(checked)
-        self.collection_list.clear()
+        target.clear()
         for group in groups:
-            item = QListWidgetItem(group.display_name, self.collection_list)
+            item = QListWidgetItem(group.display_name, target)
             # A comma-joined STRING, not the tuple itself. Every other item-data role in
             # this codebase (LAYER_ROLE in publishdialog.py, the combo boxes' userData)
             # already stores a plain string -- one of them re-wraps with str() on read as
@@ -808,10 +813,12 @@ class LabelClientDock(QDockWidget):
             )
             item.setToolTip(_collection_group_tooltip(group))
 
-    def checked_collections(self) -> list[str]:
+    def checked_collections(self, target=None) -> list[str]:
+        if target is None:
+            return list(self._editable_collection_ids)
         ids: list[str] = []
-        for row in range(self.collection_list.count()):
-            item = self.collection_list.item(row)
+        for row in range(target.count()):
+            item = target.item(row)
             if item.checkState() == Qt.CheckState.Checked:
                 ids.extend(str(item.data(COLLECTION_ROLE)).split(","))
         return ids

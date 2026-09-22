@@ -57,6 +57,31 @@ def test_values_round_trip():
     assert settings.api_base_url == "https://host/oapif"
 
 
+def test_signed_out_references_survive_reload_without_restoring_a_session():
+    settings = PluginSettings()
+    references = {"": "cvi0001", "alpha": "cvi0002"}
+    settings.set_authcfg_by_track(references)
+    settings.set_oauth_session("Analyst@example.org", 12345)
+    settings.remember_signed_out_connection()
+    settings.set_authcfg_by_track({})
+    settings.clear_oauth_session()
+    reopened = PluginSettings()
+    reopened.remember_signed_out_connection()  # Repeated logout is harmless.
+    assert reopened.authcfg == ""
+    assert reopened.oauth_expires_at == 0
+    assert reopened.signed_out_authcfgs("analyst@example.org") == references
+    assert reopened.signed_out_authcfgs("someone-else@example.org") == {}
+    reopened.set("api_base_url", "https://other.example.org")
+    assert reopened.signed_out_authcfgs("analyst@example.org") == {}
+
+
+@pytest.mark.parametrize("saved", ["", "broken", "[]", '{"authcfgs": null}'])
+def test_malformed_signed_out_references_are_ignored(saved):
+    settings = PluginSettings()
+    settings.set("signed_out_connection", saved)
+    assert settings.signed_out_authcfgs("analyst@example.org") == {}
+
+
 @pytest.mark.parametrize(
     "stored,expected", [("true", True), ("false", False), ("1", True), (0, False)]
 )

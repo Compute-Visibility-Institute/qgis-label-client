@@ -117,6 +117,7 @@ def test_reconnect_resolves_saved_track_after_discovery(plugin, monkeypatch):
     )
     monkeypatch.setattr(client, "fetch_capabilities", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(client, "fetch_collections", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(client, "fetch_class_layers", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         client,
         "fetch_registry",

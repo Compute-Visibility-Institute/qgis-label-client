@@ -991,6 +991,8 @@ class LayerOutcome:
     expected: int = 0
     read: int = 0
     published: int = 0
+    already_present: int = 0
+    held_for_review: int = 0
     failed: int = 0
     skipped_no_geometry: int = 0
     skipped_invalid_geometry: int = 0
@@ -1054,6 +1056,10 @@ class LayerOutcome:
     def line(self) -> str:
         into = f" in {self.collection_id}" if self.collection_id else ""
         bits = [f"{self.layer_name} -> {self.class_id}{into}: {self.published} published"]
+        if self.already_present:
+            bits.append(f"{self.already_present} already stored")
+        if self.held_for_review:
+            bits.append(f"{self.held_for_review} held for review; not resent")
         if self.failed:
             bits.append(f"{self.failed} rejected by the server")
         if self.skipped:
@@ -1152,6 +1158,7 @@ class PublishReport:
     def clean(self) -> bool:
         return (
             not self.failed
+            and not any(outcome.held_for_review for outcome in self.outcomes)
             and not self.skipped
             and not self.not_created
             and not self.unverified
@@ -1188,6 +1195,12 @@ class PublishReport:
                 "second copy of these, because the server assigns identity."
             )
         bits = [f"{self.published} feature(s) published{self._where}"]
+        present = sum(outcome.already_present for outcome in self.outcomes)
+        held = sum(outcome.held_for_review for outcome in self.outcomes)
+        if present:
+            bits.append(f"{present} already stored")
+        if held:
+            bits.append(f"{held} held for review; not resent")
         if self.failed:
             bits.append(f"{self.failed} rejected by the server")
         if self.not_created:

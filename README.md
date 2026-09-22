@@ -1,5 +1,25 @@
 # CVI Label Client
 
+## Development preview: class layers and attribute columns
+
+The development build asks the server for its class-layer capability on **Connect**.
+When supported, **Add editable layers** adds separate platform class layers. A class that
+accepts several geometry families has separate point, line and polygon child layers;
+multipart features stay in their corresponding family. Source attributes appear as
+ordinary editable columns using the original field names as aliases. New features
+receive the layer's class automatically.
+
+New classes and fields are discovered on Connect. Save or recover pending edits before
+reconnecting to load a changed field schema; existing dirty layers are never replaced.
+Local uploads continue through the established bulk API, preserving all source data.
+Servers without the new capability keep the existing geometry-layer interface. An
+authentication, network or malformed-capability error is reported rather than silently
+downgrading. The production plugin update feed is unchanged: test preview ZIPs in a
+separate QGIS profile connected to the development API.
+
+The **History track** selector is collapsed at the bottom of the panel. The current
+track remains visible beneath the connection controls.
+
 A QGIS 3.44 plugin for a bitemporal geospatial labeling backend that speaks
 **OGC API - Features** (Parts 1, 2 and 4).
 
@@ -65,10 +85,14 @@ Open the **CVI Label Client** panel from the toolbar, then:
    and not a side effect of loading a layer — and why it is worth letting your operating
    system's keychain remember it, since the token renewal needs that database unlocked.
 3. **Connect** — lists the collections, the history tracks and the class registry.
-4. **History track** — pick which dataset you are working in. See below; this is the one
-   setting whose being wrong produces data that looks entirely correct.
-5. Tick the collections you want and **Load checked collections**.
-6. **Refresh imagery URLs** at the start of each session.
+4. Check the current track shown below **Connection**. New profiles on the production
+   server select production (`default`). To change it, expand **History track** at the
+   bottom of the panel.
+5. Under **Label layers**, choose **Add read only layers** to view current labels or
+   **Add editable layers** to work on them. The editable action adds separate platform
+   class layers when supported by the server. Historical views belong to the history
+   controls. Survey extents are not offered in the add-layer UI. Imagery is managed
+   outside this plugin.
 
 Nothing is stored anywhere except `QgsSettings` (URLs, page size, as-of state, the
 selected track, the signed-in address and the token's expiry instant — none of them a
@@ -91,7 +115,7 @@ After the operator confirms the new deployment is ready:
    layers from this project, keeping your local source layers. **Connect** alone does
    not change existing layer sources, and already-loaded collections are skipped.
 4. Load the same checked collections, restore any historical views with their original
-   instants, and reapply your saved custom styling. Refresh imagery URLs.
+   instants, and reapply your saved custom styling.
 5. Check the layer sources show the new API, the intended track and time views are
    selected, and your access permissions match expectations. Save the migrated project
    separately before continuing work.
@@ -124,8 +148,96 @@ Google**, then **Connect**; signing out first is unnecessary. Both renewal and b
 sign-in update every saved track credential, even before tracks have been rediscovered,
 while retaining the credential IDs used by saved projects and loaded layers.
 
-Signing out removes every stored credential **and** revokes the grant at Google, so
-"signed out" is true on both sides rather than only on this machine.
+Signing out removes every stored credential and requests revocation at Google. Open
+editing sessions and unsaved changes stay in QGIS, but cannot be saved while signed
+out. Signing back into the **same account and backend** restores the existing layers'
+credential references without rebuilding their providers or replacing edit buffers.
+The plugin retains only the previous email, backend URL and nonsecret credential IDs
+for this purpose, including across a plugin reload; the tokens themselves are deleted.
+Permissions are checked again, and the server still rejects saves if write access was
+removed. Failed saves are not replayed automatically: use **Save Layer Edits** after
+signing in. A different account does not reconnect the old editing session.
+
+### Upgrading and reconnecting existing layers
+
+See [the update guide](docs/updating.md) for installation and reload steps.
+Upgrading the plugin does not require deleting or re-importing its editable layers.
+They are native QGIS layers and survive plugin unload, together with their saved
+connection references. Save the QGIS project before an upgrade; if restarting QGIS,
+save or export unsaved feature edits first because project files do not store them.
+
+At startup, the **CVI — sign in and connect** popup provides **Sign out**, **Sign in
+with Google**, and **Connect**. An existing valid sign-in can go straight to Connect.
+The popup is optional: toggle **Plugins → CVI Label Client → Show connection prompt
+on startup**. Open it manually using **Sign in and connect…** in the same menu.
+
+**Connect** refreshes the available collections, tracks, permissions, class/style
+metadata, and clean loaded live layers. Native providers fetch current data again
+using their existing track, canvas restriction and time filters; this does not download
+the whole database or change historical views. Clean editing sessions refresh their
+provider data without stopping editing. Pending local changes are kept intact until
+those changes are handled. Connect can
+repair an outdated credential reference on a non-editing layer; it refuses to rebuild
+a provider while editing so unsaved changes are not discarded.
+
+### Unpushed edits and recovery
+
+Editable CVI layers are marked **[Unpushed: count]** while their changes exist only
+locally. Each edit saves a private recovery journal in the QGIS profile's
+`cvi-unpushed` directory. The journal keeps attributes (including Chinese text and
+typed dates), geometry, and its original account, server, track and collection;
+it contains no login tokens. Save the QGIS project too so its layers can be reopened.
+
+**Connect** uploads never-submitted pending edits for the same signed-in account
+after checking write access and the original server versions, then refreshes clean
+layers. Edits whose server versions changed stay **Unpushed: needs review**. These
+are checks before a normal native QGIS save, not a new atomic server locking protocol.
+A failed or interrupted save also needs review: native feature creation has no
+idempotency key, so replaying an uncertain save could create duplicate features.
+
+Use **Plugins → CVI Label Client → Unpushed edits…** to see saved recovery copies,
+restore them locally for review, or explicitly discard them. Cancelling edits in
+QGIS stops their automatic upload but retains a recovery copy for deliberate review.
+An already-open edited buffer is never replaced by recovery. New edits made before
+old recovery is restored are kept separately and require review. Missing original
+layers must be reopened before recovery can be applied; the journal itself remains
+available if the project is unavailable.
+
+**Warn about unpushed edits** toggles the edit-warning popups independently of the
+startup connection prompt. Turning popups off does not turn off journaling or the
+layer markers. Recovery write errors always remain visible in the QGIS message bar;
+keep QGIS open and export the edited layer if its local recovery copy cannot be saved.
+Field/schema edits require explicit saving or export rather than automatic recovery.
+
+### Push all local features
+
+**Plugins → CVI Label Client → Push all local** saves eligible native pending edits,
+then checks local point, line and polygon layers (including multipart geometries).
+Connect also performs this check. New or invalid class mappings open the existing
+upload review; previously reviewed mappings and exclusions are remembered for that
+account, server and track. Remote database/WFS layers and unsupported geometries are
+not imported automatically.
+
+Before creating features, the plugin reads the destination collections and compares
+server label IDs, geometry and attributes. It normalizes coordinate precision to nine
+decimal places and ignores polygon ring start/winding and multipart order; line
+direction remains significant. Existing matches are skipped. Matching geometry with
+different attributes, changed previously uploaded source rows, and uncertain earlier
+uploads are held for review instead of creating another copy. This action only creates
+missing features: edit the server layers to change or delete existing server labels.
+
+The private `cvi-unpushed/local-uploads.sqlite` journal records content hashes, source
+feature references and request outcomes before uploads, without tokens or feature
+payloads. Interrupted writes are not automatically replayed. Source references use the
+local provider/source and feature ID; replacing files, changing IDs or independently
+redrawing a feature can make its prior identity impossible to infer. Separate machines
+do not share this journal, and simultaneous imports need coordination.
+
+Reviewed local source layers show **[Unpushed]** after edits and use the same warning
+toggle. Save local source files and the QGIS project before closing; export memory
+layers to a file. The upload journal does not preserve their unsaved feature payloads.
+
+These changes are unreleased and have not yet undergone native-QGIS validation.
 
 ### Why the plugin runs the OAuth flow itself
 
@@ -178,8 +290,10 @@ failure in this area produces data that looks completely correct:
 Some things follow from that and are worth knowing before they surprise you:
 
 - **New profiles select the deployment's default track after Connect.** On the hosted
-  platform this is production (`default`). The panel's list and default flag come from
-  `GET {api}/v1/tracks`; development (`dev`) requires an explicit selection.
+  production server this is production (`default`). The panel's list and default flag
+  come from `GET {api}/v1/tracks`; a server restricted to development selects `dev`
+  instead. The selector is at the bottom of the panel, initially collapsed, while the
+  current track remains visible below Connection.
 - **Existing profiles keep their saved track choice**, including after uninstalling and
   reinstalling the plugin. If your profile was set to `dev`, choose `default` in
   **History track** before publishing to production.
@@ -215,7 +329,6 @@ are configurable paths so a deployment can mount them anywhere.
 | `GET {api}/collections/{id}/items` | OAPIF Parts 1 and 4 | Everything QGIS's provider does, plus history queries |
 | `GET {api}/v1/classes` | no | The class registry |
 | `GET {api}/v1/tracks` | no | The history-track list |
-| `GET {api}/v1/imagery/signed-urls` | no | Minting short-lived signed URLs |
 
 A backend with no `/v1/tracks` (404) is treated as a deployment with no history tracks:
 the panel shows an empty list, reads work, and every write is refused. A response that is
@@ -266,36 +379,11 @@ into `attrs` by name still fails the build. It is a deny list, so it cannot know
 term added after it was written — but the regression it catches is the one that actually
 happens.
 
-### Signed imagery URLs
+### Imagery
 
-```jsonc
-{
-  "expires_at": "2026-08-23T18:00:00Z",
-  "assets": [
-    {
-      "capture_id": "…",
-      "stac_id": "…",             // the scene stem
-      "asset": "visual",          // derivative role: visual, nir, analysis, … ("key" also accepted)
-      "url": "https://storage.googleapis.com/…?X-Goog-Signature=…",   // "href" also accepted
-      "gs_uri": "gs://…/scene_visual.tif",
-      "expires_at": "…"           // optional per-asset override
-    }
-  ]
-}
-```
-
-The plugin matches assets to raster layers in two ways:
-
-1. **Explicitly**, when a layer carries the custom property
-   `cvi/asset_key = "{stac_id}:{asset}"`. Set this in your project file. It is the reliable
-   route.
-2. **By object path**, comparing bucket-and-object of the layer's current source against
-   each asset's, ignoring the query string. This rescues a project saved with an expired
-   URL.
-
-Layers that match nothing are reported in the Log Messages panel rather than skipped
-quietly — a raster left on an expired URL keeps drawing from GDAL's cache for a while and
-looks fine right up until it doesn't.
+The plugin does not add or refresh imagery layers. Existing raster layers in saved
+QGIS projects are left untouched. Use the web imagery catalogue or manage local
+rasters directly in QGIS.
 
 ---
 

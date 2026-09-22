@@ -24,7 +24,7 @@ class LayerAccess:
                 and isinstance(state.get("abstract"), str)
             ):
                 state = None
-            if layers.recorded_at_of(layer):
+            if layers.recorded_at_of(layer) or layer.customProperty("cvi/read_only_view", False):
                 if state is not None:
                     layer.removeCustomProperty(ACCESS_PROPERTY)
                 continue

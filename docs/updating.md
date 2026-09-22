@@ -1,6 +1,8 @@
 # Updating CVI Label Client in QGIS
 
-**Save your edits and project, upgrade the plugin, restart QGIS, then reconnect.**
+**Save your edits and project, upgrade the plugin, then reconnect.**
+No QGIS restart is needed for a normal plugin upgrade: the Plugin Manager unloads
+the old plugin and loads the updated version in the same QGIS session.
 An ordinary plugin update does not require deleting your editable layers or importing
 the labels again.
 
@@ -8,8 +10,9 @@ the labels again.
 
 1. Use **Save Layer Edits** for each edited remote layer and check that saving succeeds.
 2. Save your QGIS project (`.qgz` or `.qgs`).
-3. If saving edits fails, keep QGIS open and export the edited layer to a local
-   GeoPackage before restarting. Saving the project alone does not preserve a native
+3. Wait for any running upload or publish operation to finish before upgrading.
+4. If saving edits fails, keep QGIS open and export the edited layer to a local
+   GeoPackage before upgrading. Saving the project alone does not preserve a native
    layer's unsaved edit buffer.
 
 ## 2. Upgrade through the plugin manager
@@ -44,16 +47,14 @@ Download the packaged **`qgis_label_client.<version>.zip`** from the release's
 Use the plugin ZIP, not GitHub's **Source code (zip)** download: the release package
 contains the configuration needed for Google sign-in.
 
-## 3. Restart and reconnect
+## 3. Reconnect
 
-1. Close QGIS and open it again. A restart is recommended after an upgrade so the
-   session uses the newly installed Python code.
-2. Reopen your saved project and open the **CVI Label Client** panel.
-3. Click **Connect**. If your session needs a new Google sign-in, choose
+1. Close the Plugin Manager and open the **CVI Label Client** panel. Keep your
+   project and existing layers open.
+2. Click **Connect**. If your session needs a new Google sign-in, choose
    **Sign in with Google**, select your work account, and then **Connect**.
-4. Confirm the intended server and history track before editing. Production data
+3. Confirm the intended server and history track before editing. Production data
    uses the `default` track; `dev` is for testing. An update preserves saved choices.
-5. Click **Refresh imagery URLs** if purchased imagery needs fresh access links.
 
 You can follow the same reconnect steps whenever you reopen QGIS later, even when
 you have not updated the plugin.

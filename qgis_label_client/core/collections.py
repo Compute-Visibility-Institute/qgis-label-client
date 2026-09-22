@@ -43,6 +43,8 @@ class Collection:
     #: collection. Part 4 has no required flag for this, so absence means "unknown",
     #: never "read-only" -- the panel says so rather than disabling editing.
     transactional: bool | None = None
+    #: Additive development API metadata. Absent for every legacy collection.
+    class_layer: Mapping[str, Any] | None = None
 
     @property
     def display_name(self) -> str:
@@ -232,6 +234,19 @@ def group_by_mode(collections: Sequence[Collection]) -> list[CollectionGroup]:
 
     groups: list[CollectionGroup] = []
     for stem, members in by_stem.items():
+        class_members = [member for member in members if member.class_layer is not None]
+        if class_members and len(class_members) == len(members):
+            groups.append(
+                CollectionGroup(
+                    stem=stem,
+                    display_name=str(
+                        class_members[0].class_layer.get("class_name")
+                        or class_members[0].display_name
+                    ),
+                    members=tuple(class_members),
+                )
+            )
+            continue
         typed_members = [c for c in members if routing.typed(c.collection_id) is not None]
         untyped_members = [c for c in members if routing.typed(c.collection_id) is None]
 

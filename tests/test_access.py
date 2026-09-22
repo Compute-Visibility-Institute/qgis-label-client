@@ -4,9 +4,10 @@ import time
 
 import pytest
 
-from qgis_label_client import client, layers
+from qgis_label_client import auth, client, layers
 from qgis_label_client.access import ACCESS_PROPERTY, READ_ONLY_REASON, LayerAccess
 from qgis_label_client.core.errors import BackendError
+from qgis_label_client.core.oauth import Credential
 from qgis_label_client.plugin import LabelClientPlugin
 
 
@@ -88,6 +89,75 @@ def test_native_edit_buffers_are_preserved_for_newly_detected_reader():
     layer = Layer(editing=True)
     assert LayerAccess().apply([layer], False) == ["labels"]
     assert layer.edits == ["unsaved geometry"] and layer.editing
+
+
+@pytest.mark.parametrize("access_after_relogin", [True, False])
+def test_logout_relogin_preserves_open_edits_and_rechecks_server_access(
+    fake_iface, monkeypatch, access_after_relogin
+):
+    plugin = LabelClientPlugin(fake_iface)
+    plugin.initGui()
+    layer = Layer(editing=True)
+    monkeypatch.setattr(layers, "plugin_layers", lambda: [layer])
+    credential = Credential("before", "refresh", "analyst@example.org", int(time.time()) + 3600)
+    plugin._store_credential(credential)
+    references = plugin.settings.authcfg_by_track
+    plugin.sign_out()
+    assert plugin.settings.authcfg_by_track == {}
+    assert all(auth.summarise(reference) is None for reference in references.values())
+    assert layer.isEditable() and layer.edits == ["unsaved geometry"]
+
+    plugin._store_credential(
+        Credential("after", "refresh-new", credential.email, credential.expires_at)
+    )
+    assert plugin.settings.authcfg_by_track == references
+    check = [task for task in plugin.tasks._tasks if task.description() == "Check account access"][
+        -1
+    ]
+    check._on_success(access_after_relogin)
+    assert plugin._current_write_access() is access_after_relogin
+    assert layer.isEditable() and layer.edits == ["unsaved geometry"]
+    plugin.unload()
+
+
+def test_different_account_does_not_reauthenticate_old_native_layers(fake_iface, monkeypatch):
+    plugin = LabelClientPlugin(fake_iface)
+    plugin.initGui()
+    layer = Layer(editing=True)
+    monkeypatch.setattr(layers, "plugin_layers", lambda: [layer])
+    plugin._store_credential(
+        Credential("before", "refresh", "first@example.org", int(time.time()) + 3600)
+    )
+    previous = set(plugin.settings.authcfg_by_track.values())
+    plugin.sign_out()
+    plugin._store_credential(
+        Credential("after", "refresh-new", "second@example.org", int(time.time()) + 3600)
+    )
+    assert previous.isdisjoint(plugin.settings.authcfg_by_track.values())
+    assert all(auth.summarise(reference) is None for reference in previous)
+    assert layer.isEditable() and layer.edits == ["unsaved geometry"]
+    plugin.unload()
+
+
+def test_switching_account_without_logout_refuses_to_reuse_an_open_edit_session(
+    fake_iface, monkeypatch
+):
+    plugin = LabelClientPlugin(fake_iface)
+    plugin.initGui()
+    layer = Layer(editing=True)
+    monkeypatch.setattr(layers, "plugin_layers", lambda: [layer])
+    plugin._store_credential(
+        Credential("before", "refresh", "first@example.org", int(time.time()) + 3600)
+    )
+    previous = plugin.settings.authcfg_by_track
+    plugin._store_credential(
+        Credential("after", "refresh-new", "second@example.org", int(time.time()) + 3600)
+    )
+    assert plugin.settings.oauth_email == "first@example.org"
+    assert plugin.settings.authcfg_by_track == previous
+    assert any("Sign-in was not changed" in text for _, text, _ in fake_iface.messages)
+    assert layer.isEditable() and layer.edits == ["unsaved geometry"]
+    plugin.unload()
 
 
 def test_repointed_readonly_layer_is_restricted_again():

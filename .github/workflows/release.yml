@@ -129,9 +129,16 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "release $TAG already exists; leaving it alone"
           else
+            release_flags=(--latest=false)
+            if [[ "$TAG" == *-* ]]; then
+              release_flags+=(--prerelease)
+            else
+              release_flags=(--latest)
+            fi
             gh release create "$TAG" \
               --title "$TAG" \
               --notes "Plugin ZIP and plugins.xml are attached below by qgis-plugin-ci." \
+              "${release_flags[@]}" \
               --verify-tag
           fi
 

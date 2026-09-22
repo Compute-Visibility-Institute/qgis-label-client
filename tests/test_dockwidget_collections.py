@@ -1,14 +1,4 @@
-"""The "load label collections" panel: one checkbox per mode, not per geometry.
-
-core/collections.py's group_by_mode decides WHICH collections collapse into one row --
-tested without QGIS in test_collections_and_history.py. What is tested here is the half
-that function cannot reach on its own: that LabelClientDock actually renders one
-QListWidgetItem per CollectionGroup, pre-checks it only when EVERY member is already on
-the map (never when merely one of several is -- a checkbox that overstates what is loaded
-is worse than one that understates it, see set_collections' own comment), and that
-checked_collections() hands the controller a flat list of ids regardless of how many rows
-were collapsed to produce it.
-"""
+"""Optional reference-layer checklist grouping and tooltip behavior."""
 
 from __future__ import annotations
 
@@ -45,14 +35,28 @@ def test_a_single_member_group_renders_and_round_trips_like_a_plain_collection_d
         display_name="CVI Surveyed extents",
         members=(_collection("labeled_extent", "CVI Surveyed extents"),),
     )
-    dock.set_collections([group])
-    item = dock.collection_list.item(0)
+    dock.set_reference_collections([group])
+    item = dock.reference_list.item(0)
     # A comma-joined string, not the tuple itself -- see set_collections' own comment on
     # why this matches every other item-data role in this codebase.
     assert item.data(COLLECTION_ROLE) == "labeled_extent"
 
     item.setCheckState(Qt.CheckState.Checked)
-    assert dock.checked_collections() == ["labeled_extent"]
+    assert dock.checked_collections(dock.reference_list) == ["labeled_extent"]
+
+
+def test_reference_selection_is_separate_from_current_label_selection():
+    dock = _dock()
+    reference = CollectionGroup(
+        stem="labeled_extent",
+        display_name="Survey extents",
+        members=(_collection("labeled_extent"),),
+    )
+    dock.set_collections([])
+    dock.set_reference_collections([reference])
+    dock.reference_list.item(0).setCheckState(Qt.CheckState.Checked)
+    assert dock.checked_collections() == []
+    assert dock.checked_collections(dock.reference_list) == ["labeled_extent"]
 
 
 def test_checking_a_collapsed_row_yields_every_members_id():
@@ -66,10 +70,10 @@ def test_checking_a_collapsed_row_yields_every_members_id():
             _collection("label_current_line"),
         ),
     )
-    dock.set_collections([group])
-    assert dock.collection_list.count() == 1
-    dock.collection_list.item(0).setCheckState(Qt.CheckState.Checked)
-    assert sorted(dock.checked_collections()) == [
+    dock.set_reference_collections([group])
+    assert dock.reference_list.count() == 1
+    dock.reference_list.item(0).setCheckState(Qt.CheckState.Checked)
+    assert sorted(dock.checked_collections(dock.reference_list)) == [
         "label_current_line",
         "label_current_point",
         "label_current_polygon",
@@ -83,11 +87,11 @@ def test_an_unchecked_collapsed_row_contributes_nothing():
         display_name="mode",
         members=(_collection("label_current_polygon"), _collection("label_current_point")),
     )
-    dock.set_collections([group])
-    assert dock.checked_collections() == []
+    dock.set_reference_collections([group])
+    assert dock.checked_collections(dock.reference_list) == []
 
 
-def test_group_by_mode_feeds_set_collections_with_no_shape_mismatch():
+def test_group_by_mode_feeds_reference_collections_with_no_shape_mismatch():
     # The integration this whole change is for: what plugin.py actually hands the panel.
     dock = _dock()
     collections = [
@@ -96,12 +100,12 @@ def test_group_by_mode_feeds_set_collections_with_no_shape_mismatch():
         _collection("label_line", "CVI Labels — lines (editable)"),
         _collection("labeled_extent", "CVI Surveyed extents"),
     ]
-    dock.set_collections(group_by_mode(collections))
-    assert dock.collection_list.count() == 2  # one collapsed row, one lone row
+    dock.set_reference_collections(group_by_mode(collections))
+    assert dock.reference_list.count() == 2  # one collapsed row, one lone row
     labels = next(
-        dock.collection_list.item(index)
-        for index in range(dock.collection_list.count())
-        if dock.collection_list.item(index).text() == "CVI Labels (editable)"
+        dock.reference_list.item(index)
+        for index in range(dock.reference_list.count())
+        if dock.reference_list.item(index).text() == "CVI Labels (editable)"
     )
     assert "Draw and edit features here." in labels.toolTip()
     assert "Saving requires write access to the selected track." in labels.toolTip()
@@ -126,7 +130,7 @@ def _trio() -> CollectionGroup:
 
 def test_the_row_is_checked_when_every_sibling_is_already_loaded():
     dock = _dock()
-    dock.set_collections(
+    dock.set_reference_collections(
         [_trio()],
         checked={
             "label_current_polygon",
@@ -134,7 +138,7 @@ def test_the_row_is_checked_when_every_sibling_is_already_loaded():
             "label_current_line",
         },
     )
-    assert dock.collection_list.item(0).checkState() == Qt.CheckState.Checked
+    assert dock.reference_list.item(0).checkState() == Qt.CheckState.Checked
 
 
 def test_the_row_stays_unchecked_when_only_one_of_three_siblings_is_loaded():
@@ -142,14 +146,14 @@ def test_the_row_stays_unchecked_when_only_one_of_three_siblings_is_loaded():
     # checkbox would assert the whole mode is on the map while most of its geometry is not
     # drawn anywhere -- populated and wrong, not merely incomplete.
     dock = _dock()
-    dock.set_collections([_trio()], checked={"label_current_polygon"})
-    assert dock.collection_list.item(0).checkState() == Qt.CheckState.Unchecked
+    dock.set_reference_collections([_trio()], checked={"label_current_polygon"})
+    assert dock.reference_list.item(0).checkState() == Qt.CheckState.Unchecked
 
 
 def test_the_row_is_unchecked_when_none_of_the_siblings_are_loaded():
     dock = _dock()
-    dock.set_collections([_trio()], checked=set())
-    assert dock.collection_list.item(0).checkState() == Qt.CheckState.Unchecked
+    dock.set_reference_collections([_trio()], checked=set())
+    assert dock.reference_list.item(0).checkState() == Qt.CheckState.Unchecked
 
 
 # --- tooltip content ----------------------------------------------------------

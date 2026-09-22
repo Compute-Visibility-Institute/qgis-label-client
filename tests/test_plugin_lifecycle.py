@@ -26,9 +26,8 @@ def test_one_cycle_attaches_and_detaches_everything(fake_iface):
     plugin.initGui()
     assert len(fake_iface.toolbar_icons) == 1
     assert len(fake_iface.docks) == 1
-    # Four menu entries: the panel toggle, the imagery refresh, the transaction-time
-    # historical view and the bootstrap publish.
-    assert [menu for menu, _ in fake_iface.plugin_menu] == [MENU_NAME] * 4
+    # Layer tools, connection controls, recovery controls and push-all-local.
+    assert [menu for menu, _ in fake_iface.plugin_menu] == [MENU_NAME] * 8
 
     plugin.unload()
     assert fake_iface.toolbar_icons == []
@@ -56,16 +55,25 @@ def test_unload_is_idempotent(fake_iface):
 def test_every_attachment_registers_a_teardown(fake_iface):
     plugin = LabelClientPlugin(fake_iface)
     plugin.initGui()
-    # expression function, dock, toolbar icon, four menu entries.
+    # Every menu entry and project attachment has a matching teardown.
     assert plugin.teardown.labels == [
         "valid-time expression",
         "dock widget",
         "toolbar icon",
         "menu: panel",
-        "menu: refresh imagery",
         "menu: historical view",
         "menu: publish local layers",
         "project access state",
+        "menu: connection prompt",
+        "menu: startup prompt toggle",
+        "menu: Warn about unpushed edits",
+        "menu: Unpushed edits…",
+        "pending layer additions",
+        "pending layer removals",
+        "pending project read",
+        "menu: push all local",
+        "local source additions",
+        "local source project read",
     ]
     plugin.unload()
     assert len(plugin.teardown) == 0

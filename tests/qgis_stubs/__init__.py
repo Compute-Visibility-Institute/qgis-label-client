@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import itertools
 import sys
+import tempfile
 import types
 from typing import Any, ClassVar
 
@@ -408,6 +409,14 @@ _AUTH_MANAGER = _AuthManager()
 
 
 class QgsApplication(Stub):
+    _profile: ClassVar[Any] = None
+
+    @staticmethod
+    def qgisSettingsDirPath() -> str:  # noqa: N802 - QGIS naming
+        if QgsApplication._profile is None:
+            QgsApplication._profile = tempfile.TemporaryDirectory(prefix="cvi-qgis-test-profile-")
+        return QgsApplication._profile.name
+
     @staticmethod
     def taskManager() -> _TaskManager:  # noqa: N802 - Qt naming
         return _TASK_MANAGER
@@ -415,6 +424,62 @@ class QgsApplication(Stub):
     @staticmethod
     def authManager() -> _AuthManager:  # noqa: N802 - Qt naming
         return _AUTH_MANAGER
+
+
+class QgsVariantUtils:
+    @staticmethod
+    def isNull(value) -> bool:  # noqa: N802 - QGIS naming
+        return value is None
+
+
+class QgsProject(Stub):
+    _instance: ClassVar[Any] = None
+
+    def __init__(self):
+        super().__init__()
+        self.layersAdded = Signal("layersAdded")
+        self.layersWillBeRemoved = Signal("layersWillBeRemoved")
+        self.readProject = Signal("readProject")
+        self._layers = {}
+        self._filename = ""
+
+    @classmethod
+    def instance(cls):
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def mapLayers(self):  # noqa: N802 - QGIS naming
+        return dict(self._layers)
+
+    def fileName(self):  # noqa: N802 - QGIS naming
+        return self._filename
+
+    def setFileName(self, filename):  # noqa: N802 - QGIS naming
+        self._filename = filename
+
+
+class QAction(Stub):
+    """Menu labels and toggle signals, used by lifecycle and preference tests."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self._text = next((value for value in args if isinstance(value, str)), "")
+        self._checked = False
+        self.triggered = Signal("triggered")
+        self.toggled = Signal("toggled")
+
+    def text(self):
+        return self._text
+
+    def setChecked(self, checked):  # noqa: N802 - Qt naming
+        changed = self._checked != bool(checked)
+        self._checked = bool(checked)
+        if changed:
+            self.toggled.emit(self._checked)
+
+    def isChecked(self):  # noqa: N802 - Qt naming
+        return self._checked
 
 
 class QListWidgetItem(Stub):
@@ -511,6 +576,8 @@ _CORE_EXPLICIT = {
     "QgsFeedback": QgsFeedback,
     "QgsTask": QgsTask,
     "QgsApplication": QgsApplication,
+    "QgsProject": QgsProject,
+    "QgsVariantUtils": QgsVariantUtils,
 }
 
 _QTCORE_EXPLICIT = {
@@ -519,6 +586,7 @@ _QTCORE_EXPLICIT = {
 }
 
 _QTWIDGETS_EXPLICIT = {
+    "QAction": QAction,
     "QListWidget": QListWidget,
     "QListWidgetItem": QListWidgetItem,
 }
@@ -576,3 +644,7 @@ def reset() -> None:
     QgsMessageLog.records.clear()
     _TASK_MANAGER.tasks.clear()
     _AUTH_MANAGER.reset()
+    QgsProject._instance = None
+    if QgsApplication._profile is not None:
+        QgsApplication._profile.cleanup()
+        QgsApplication._profile = None

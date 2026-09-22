@@ -117,7 +117,9 @@ def master_password_ready(prompt: bool = True) -> bool:
     return bool(manager.setMasterPassword(True))
 
 
-def store_id_token(token: str, existing_authcfg: str = "", track: str = "") -> str:
+def store_id_token(
+    token: str, existing_authcfg: str = "", track: str = "", *, restore_missing: bool = False
+) -> str:
     """Store or replace the API bearer token for one track; return its ``authcfg`` id.
 
     The token is passed in, used once and not returned, logged or stored anywhere else.
@@ -137,10 +139,21 @@ def store_id_token(token: str, existing_authcfg: str = "", track: str = "") -> s
         raise ConfigurationError("The QGIS authentication database was not unlocked.")
 
     config = QgsAuthMethodConfig()
+    loaded = False
     if existing_authcfg:
         loaded, config = manager.loadAuthenticationConfig(existing_authcfg, config, True)
+        if restore_missing and loaded:
+            raise ConfigurationError(
+                "A signed-out layer's credential ID is already in use. "
+                "Sign-in was stopped to avoid replacing another connection."
+            )
         if not loaded:
             config = QgsAuthMethodConfig()
+            if restore_missing:
+                # Only the same account/backend's saved sign-out references opt in.
+                # Recreating the ID reconnects native providers without setDataSource,
+                # which would destroy their active edit buffers.
+                config.setId(existing_authcfg)
 
     config.setName(config_name(track))
     config.setMethod(AUTH_METHOD)
@@ -153,7 +166,7 @@ def store_id_token(token: str, existing_authcfg: str = "", track: str = "") -> s
         headers[TRACK_HEADER] = track
     config.setConfigMap(headers)
 
-    if existing_authcfg and config.id():
+    if loaded:
         stored, config = manager.storeAuthenticationConfig(config, True)
     else:
         stored, config = manager.storeAuthenticationConfig(config, False)
@@ -263,6 +276,8 @@ def store_id_token_for_tracks(
     token: str,
     tracks: Sequence[str] = (),
     existing: Mapping[str, str] | None = None,
+    *,
+    restore_missing: bool = False,
 ) -> dict[str, str]:
     """Store the token once per track, plus once un-tracked; return ``{track: authcfg}``.
 
@@ -285,8 +300,17 @@ def store_id_token_for_tracks(
     # send a request with an expired track-specific bearer token.
     wanted = [DEFAULT_TRACK_KEY, *(name for name in tracks if name), *existing]
     stored: dict[str, str] = {}
-    for name in dict.fromkeys(wanted):  # ordered, deduplicated
-        stored[name] = store_id_token(token, existing.get(name, ""), name)
+    try:
+        for name in dict.fromkeys(wanted):  # ordered, deduplicated
+            stored[name] = store_id_token(
+                token, existing.get(name, ""), name, restore_missing=restore_missing
+            )
+    except ConfigurationError:
+        if restore_missing:
+            # A failed restoration must not leave some old layers signed back in.
+            for authcfg in stored.values():
+                remove(authcfg)
+        raise
     return stored
 
 
@@ -360,7 +384,9 @@ def remove(authcfg: str) -> bool:
     """Delete a stored credential. Signing out should actually remove the token."""
     if not authcfg:
         return False
-    return bool(auth_manager().removeAuthenticationConfig(authcfg))
+    removed = bool(auth_manager().removeAuthenticationConfig(authcfg))
+    clear_cached_config(authcfg)
+    return removed
 
 
 def remove_all(authcfgs: Mapping[str, str] | None) -> int:

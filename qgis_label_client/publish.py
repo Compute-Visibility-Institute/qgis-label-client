@@ -552,6 +552,8 @@ class PublishRequest:
     #: object, because the reason has to be unique per chunk *across the run* for the
     #: recovery read in :mod:`.core.bulk` to mean anything.
     run_id: str = field(default_factory=bulk.new_run_id)
+    # Optional incremental-upload guard. Ordinary bootstrap publishing is unchanged.
+    feature_guard: Any = None
 
     def total_features(self) -> int:
         return sum(prepared.plan.source.feature_count for prepared in self.layers)
@@ -618,6 +620,8 @@ def _send_one(
     """
     attempts = max(1, request.max_throttle_retries + 1)
     for attempt in range(attempts):
+        if request.feature_guard is not None:
+            request.feature_guard.check_active()
         if feedback is not None and feedback.isCanceled():
             return 0, None
         try:
@@ -688,7 +692,13 @@ def _send(
         # Already stopping. Sending would be one more write the user asked not to make.
         outcome.not_sent += 1
         return
+    if request.feature_guard is not None:
+        request.feature_guard.started(collection_id, [feature], request.run_id)
     published, error = _send_one(request, collection_id, feature, feedback)
+    if request.feature_guard is not None:
+        request.feature_guard.finished(
+            collection_id, [feature], "confirmed" if published else "uncertain"
+        )
     if published:
         outcome.published += 1
     elif error is None:
@@ -831,6 +841,8 @@ def _post_chunk(
     """
     attempts = max(1, request.max_throttle_retries + 1)
     for attempt in range(attempts):
+        if request.feature_guard is not None:
+            request.feature_guard.check_active()
         if feedback is not None and feedback.isCanceled():
             return bulk.ChunkVerdict(state=bulk.NOT_SENT)
         try:
@@ -923,7 +935,18 @@ def _send_chunk(
         return
 
     reason = run.next_reason()
+    if request.feature_guard is not None:
+        request.feature_guard.started(collection_id, chunk.features, reason)
     verdict = _post_chunk(request, collection_id, chunk, reason, run, feedback)
+    if request.feature_guard is not None:
+        state = (
+            "confirmed"
+            if verdict.state == bulk.CREATED
+            else "uncertain"
+            if verdict.state == bulk.UNKNOWN
+            else "not-created"
+        )
+        request.feature_guard.finished(collection_id, chunk.features, state)
 
     if verdict.state == bulk.CREATED:
         outcome.published += verdict.created
@@ -1211,6 +1234,18 @@ def _publish_layer(
         if draft is None:
             progress.step()
             continue
+        if request.feature_guard is not None:
+            state, reason = request.feature_guard.skip(
+                collection_id, draft, values, (prepared.plan.source.layer_id, str(feature.id()))
+            )
+            if state:
+                if state == "present":
+                    outcome.already_present += 1
+                else:
+                    outcome.held_for_review += 1
+                outcome.note(reason, subject)
+                progress.step()
+                continue
 
         if chunk is None:
             _send(request, collection_id, draft, subject, outcome, feedback)
@@ -1232,6 +1267,8 @@ def _publish_layer(
 def _request_style(request, proposal, feedback):
     attempts = max(1, request.max_throttle_retries + 1)
     for attempt in range(attempts):
+        if request.feature_guard is not None:
+            request.feature_guard.check_active()
         try:
             return client.initialize_bootstrap_style(
                 request.base_url,

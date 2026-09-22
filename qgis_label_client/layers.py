@@ -46,6 +46,7 @@ compatibility metadata; they do not enforce the historical pin on QGIS 3.44. See
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Iterable
 from dataclasses import replace
 
@@ -54,6 +55,7 @@ from qgis.core import (
     QgsCategorizedSymbolRenderer,
     QgsDataProvider,
     QgsDataSourceUri,
+    QgsDefaultValue,
     QgsEditorWidgetSetup,
     QgsFeatureRenderer,
     QgsFeatureRequest,
@@ -76,7 +78,7 @@ from qgis.core import (
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtXml import QDomDocument
 
-from .core import asof, recorded, routing, stylecapture, styling
+from .core import asof, classlayers, recorded, routing, stylecapture, styling
 from .core import tracks as track_tools
 from .core.asof import AsOfMechanism
 from .core.errors import BackendError, ConfigurationError, MixedGeometryError
@@ -115,7 +117,12 @@ RECORDED_AT_PROPERTY = "cvi/recorded_at"
 OAPIF_PROVIDER = "OAPIF"
 
 
-def landing_url(settings: PluginSettings, track: Track | None = None, recorded_at: str = "") -> str:
+def landing_url(
+    settings: PluginSettings,
+    track: Track | None = None,
+    recorded_at: str = "",
+    collection_id: str = "",
+) -> str:
     """The URL handed to the provider as ``url``, carrying everything a parameter can.
 
     THIS QUERY STRING IS NOT DECORATION. It is the only channel a plugin has into the
@@ -137,7 +144,7 @@ def landing_url(settings: PluginSettings, track: Track | None = None, recorded_a
         carries the selected track on reads. Native writes drop this query and rely on
         the track-specific ``X-Track`` authentication header instead (:mod:`.auth`).
     """
-    base = normalise_base_url(settings.api_base_url)
+    base = classlayers.collection_root(settings.api_base_url, collection_id)
     params: dict[str, object] = {}
     as_of = settings.as_of
     if as_of is not None and settings.as_of_mechanism is AsOfMechanism.DATETIME:
@@ -242,7 +249,7 @@ def build_layer_uri(
         headers[TRACK_HEADER] = track.name
     headers.update(recorded.headers(recorded_at))
     return build_oapif_uri(
-        landing_url=landing_url(settings, track, recorded_at),
+        landing_url=landing_url(settings, track, recorded_at, collection_id),
         collection_id=collection_id,
         authcfg=settings.authcfg_for(track.name if track else "") or None,
         page_size=int(settings.get("page_size")),
@@ -476,6 +483,8 @@ def repoint_for(
         # question. A track switch that dropped the parameter would otherwise leave a layer
         # still named for a past instant and quietly showing the present.
         verify_recorded_echo(layer, recorded_at, registry)
+    elif layer.customProperty("cvi/read_only_view", False):
+        layer.setReadOnly(True)
 
 
 def is_plugin_layer(layer: QgsMapLayer) -> bool:
@@ -838,7 +847,8 @@ def belongs_to_backend(layer: QgsVectorLayer, backend_url: str) -> bool:
         return False
     uri = QgsDataSourceUri(layer.source())
     try:
-        return normalise_base_url(uri.param("url")) == normalise_base_url(backend_url)
+        expected = classlayers.collection_root(backend_url, collection_of(layer))
+        return normalise_base_url(uri.param("url")) == expected
     except ConfigurationError:
         return False
 
@@ -1289,6 +1299,63 @@ def apply_registry(
 
     _lock_server_assigned(layer, registry)
     _apply_map_tip(layer, registry, names, historical)
+    metadata = class_layer_metadata(layer)
+    if metadata:
+        configure_class_columns(layer, metadata)
+
+
+def class_layer_metadata(layer: QgsVectorLayer) -> dict:
+    """Persist discovered identity/field aliases in the project, not in layer names."""
+    try:
+        metadata = json.loads(str(layer.customProperty(classlayers.METADATA_PROPERTY, "{}")))
+    except (TypeError, ValueError):
+        return {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def refresh_class_layer_after_commit(layer: QgsVectorLayer) -> bool:
+    """Fetch new versioned feature IDs after a fully acknowledged native save.
+
+    The native OAPIF provider caches item URLs. Class-layer URLs include a revision,
+    so keeping them after Save would make a later delete use the previous revision.
+    Called on the next event-loop turn, after QGIS has cleared its commit buffer.
+    """
+    if not class_layer_metadata(layer) or layer.isModified():
+        return False
+    if layer.customProperty("cvi/pending_state", ""):
+        return False
+    if layer.isEditable():
+        layer.dataProvider().reloadData()
+        layer.updateExtents()
+    else:
+        layer.reload()
+    layer.triggerRepaint()
+    return True
+
+
+def configure_class_columns(layer: QgsVectorLayer, metadata: dict) -> None:
+    """Present source fields as ordinary editable columns, protecting identity only."""
+    layer.setCustomProperty(classlayers.METADATA_PROPERTY, json.dumps(metadata, ensure_ascii=False))
+    config = layer.editFormConfig()
+    fields = layer.fields()
+    for spec in metadata.get("fields", []):
+        index = fields.indexOf(spec["name"])
+        if index < 0:
+            continue
+        title = spec.get("title") or spec.get("source_name") or spec["name"]
+        layer.setFieldAlias(index, str(title))
+        config.setReadOnly(index, bool(spec.get("read_only")))
+    for name in ("class_id", "revision", "label_id", "track_id"):
+        index = fields.indexOf(name)
+        if index >= 0:
+            config.setReadOnly(index, True)
+            if name in ("class_id", "revision"):
+                layer.setEditorWidgetSetup(index, QgsEditorWidgetSetup("Hidden", {}))
+    index = fields.indexOf("class_id")
+    if index >= 0:
+        literal = str(metadata["class_id"]).replace("'", "''")
+        layer.setDefaultValueDefinition(index, QgsDefaultValue(f"'{literal}'", False))
+    layer.setEditFormConfig(config)
 
 
 def _apply_class_renderer(
@@ -1323,8 +1390,11 @@ def _apply_class_renderer(
     no class yet really can be any shape.
     """
     geom_type = _layer_geometry_family(layer)
+    class_id = class_layer_metadata(layer).get("class_id")
     categories = []
     for label_class in registry:
+        if class_id and label_class.class_id != class_id:
+            continue
         # No family means QGIS could not type the layer (a mixed or empty collection):
         # show everything rather than guess, which is the old behaviour and the right
         # one when there is nothing to filter against.
@@ -1338,7 +1408,7 @@ def _apply_class_renderer(
         )
     if not categories:
         return
-    if geom_type:
+    if geom_type and not class_id:
         # QGIS treats a category with an empty value as "all other values". Anything this
         # plugin did not predict therefore still DRAWS, and draws as something a person
         # will ask about -- which is the outcome the old unfiltered legend was reaching for.

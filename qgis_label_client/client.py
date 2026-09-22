@@ -45,9 +45,10 @@ from typing import Any
 
 from qgis.core import QgsFeedback
 
-from .core import bulk, urls
+from .core import bulk, classlayers, urls
 from .core.assets import SignedAsset, parse_signed_assets
 from .core.collections import Collection, parse_collections
+from .core.errors import BackendError
 from .core.history import HistoryEntry, parse_history
 from .core.registry import ClassRegistry, parse_registry
 from .core.tracks import Track, parse_tracks
@@ -87,6 +88,24 @@ def fetch_tracks(
     """
     url = urls.tracks_url(base_url, tracks_path)
     return parse_tracks(request_json(url, authcfg=authcfg, feedback=feedback))
+
+
+def fetch_class_layers(
+    base_url: str, authcfg: str, feedback=None, track: str = ""
+) -> list[Collection]:
+    """Discover optional class layers; only an explicit 404 means legacy API."""
+    try:
+        document = request_json(
+            urls.join_path(base_url, classlayers.MANIFEST_PATH),
+            authcfg=authcfg,
+            feedback=feedback,
+            track=track,
+        )
+    except BackendError as exc:
+        if exc.status == 404:
+            return []
+        raise
+    return classlayers.parse_manifest(document)
 
 
 def fetch_registry(
@@ -165,7 +184,10 @@ def fetch_features(
     track: str = "",
 ) -> Any:
     """Fetch a raw FeatureCollection. Used by the coverage check for survey extents."""
-    url = urls.with_query(urls.items_url(base_url, collection_id), query or {})
+    url = urls.with_query(
+        urls.items_url(classlayers.collection_root(base_url, collection_id), collection_id),
+        query or {},
+    )
     return request_json(url, authcfg=authcfg, feedback=feedback, track=track)
 
 
