@@ -88,12 +88,14 @@ def test_startup_prompt_setting_persists_and_manual_prompt_remains_available(
     monkeypatch.setattr(plugin.startup, "show", lambda: calls.append("show"))
     plugin.startup.show_if_enabled()
     assert calls == ["show"]
-    plugin.startup.set_enabled(False)
+    plugin.dock.startupPromptChanged.emit(False)
+    plugin.dock.unpushedWarningsChanged.emit(False)
     plugin.startup.show_if_enabled()
     assert calls == ["show"]
     plugin.unload()
     reopened = LabelClientPlugin(fake_iface)
     assert reopened.settings.get("show_startup_connection") is False
+    assert reopened.settings.get("show_unpushed_warnings") is False
 
 
 def test_connection_buttons_delegate_to_existing_plugin_actions(fake_iface, monkeypatch):

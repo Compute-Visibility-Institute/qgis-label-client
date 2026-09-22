@@ -407,10 +407,10 @@ def exercise_native_fields(fixture, layers, checks, profile):
     register_provider()
     dock = LabelClientDock()
     groups = dock.findChildren(QgsCollapsibleGroupBox)
-    assert [group.title() for group in groups][-2:] == ["Bootstrap", "History track"]
+    assert [group.title() for group in groups][-2:] == ["Bootstrap", "Environment"]
     assert dock.remove_unused_fields_checkbox.isChecked()
     checks.append(
-        "Native Qt panel places Bootstrap above History track and defaults unused-field pruning on"
+        "Native Qt panel places Bootstrap above Environment and defaults unused-field pruning on"
     )
     dock.close()
     original = copy.deepcopy(fixture.records)

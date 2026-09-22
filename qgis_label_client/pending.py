@@ -132,18 +132,14 @@ class PendingEdits:
 
     def install(self, menu):
         self.menu = menu
-        self.warning_action = QAction("Warn about unpushed edits", self.plugin.iface.mainWindow())
-        self.warning_action.setCheckable(True)
-        self.warning_action.setChecked(self.plugin.settings.get("show_unpushed_warnings"))
-        self.warning_action.toggled.connect(self._toggle_warnings)
+        self.plugin.dock.unpushedWarningsChanged.connect(self._toggle_warnings)
         self.review_action = QAction("Unpushed edits…", self.plugin.iface.mainWindow())
         self.review_action.triggered.connect(self.review)
-        for action in (self.warning_action, self.review_action):
-            self.plugin.iface.addPluginToMenu(menu, action)
-            self.plugin.teardown.add(
-                f"menu: {action.text()}",
-                lambda item=action: self.plugin.iface.removePluginMenu(menu, item),
-            )
+        self.plugin.iface.addPluginToMenu(menu, self.review_action)
+        self.plugin.teardown.add(
+            "menu: Unpushed edits…",
+            lambda: self.plugin.iface.removePluginMenu(menu, self.review_action),
+        )
         project = QgsProject.instance()
         project.layersAdded.connect(self.watch_layers)
         project.layersWillBeRemoved.connect(self._removing)

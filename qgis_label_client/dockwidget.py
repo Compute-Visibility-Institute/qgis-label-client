@@ -182,6 +182,8 @@ class LabelClientDock(QDockWidget):
     loadLayersRequested = pyqtSignal(list)
     loadReadOnlyLayersRequested = pyqtSignal(list)
     removeUnusedFieldsChanged = pyqtSignal(bool)
+    startupPromptChanged = pyqtSignal(bool)
+    unpushedWarningsChanged = pyqtSignal(bool)
     asOfApplied = pyqtSignal()
     #: The transaction-time axis. Carries the rendered wire instant rather than a QDateTime
     #: so that the conversion happens exactly once, in core.recorded.instant, and the panel
@@ -348,6 +350,14 @@ class LabelClientDock(QDockWidget):
         actions.addWidget(self.connect_button)
         form.addRow(actions)
 
+        self.startup_prompt_checkbox = QCheckBox("Show connection prompt on startup", group)
+        self.startup_prompt_checkbox.setChecked(True)
+        self.startup_prompt_checkbox.setToolTip(
+            "Show the sign-in and connection prompt when the plugin starts."
+        )
+        self.startup_prompt_checkbox.toggled.connect(self.startupPromptChanged)
+        form.addRow(self.startup_prompt_checkbox)
+
         self.sign_in_button.clicked.connect(self.signInRequested)
         self.sign_out_button.clicked.connect(self.signOutRequested)
         self.copy_address_button.clicked.connect(self.copyAddressRequested)
@@ -356,12 +366,15 @@ class LabelClientDock(QDockWidget):
 
     def _build_track_group(self, parent: QWidget) -> QWidget:
         """The optional dataset selector; the current track is shown by Connection."""
+        # Keep cvi_history_track so existing collapsed-state preferences survive
+        # the user-facing rename.
         group = _collapsible("History track", parent, collapsed=True)
+        group.setTitle("Environment")
         layout = QVBoxLayout(group)
 
         hint = QLabel(
-            "Change the dataset you work in. New profiles use this server's default track; "
-            "the production server defaults to production.",
+            "Choose the label dataset on the connected server. New profiles use its default "
+            "environment; the production server defaults to production.",
             group,
         )
         hint.setWordWrap(True)
@@ -412,6 +425,15 @@ class LabelClientDock(QDockWidget):
         )
         self.remove_unused_fields_checkbox.toggled.connect(self.removeUnusedFieldsChanged)
         layout.addWidget(self.remove_unused_fields_checkbox)
+
+        self.unpushed_warnings_checkbox = QCheckBox("Warn about unpushed edits", group)
+        self.unpushed_warnings_checkbox.setChecked(True)
+        self.unpushed_warnings_checkbox.setToolTip(
+            "Show a warning when edits have not reached the server. "
+            "Local recovery copies are kept even when these warnings are turned off."
+        )
+        self.unpushed_warnings_checkbox.toggled.connect(self.unpushedWarningsChanged)
+        layout.addWidget(self.unpushed_warnings_checkbox)
         return group
 
     def _build_reference_group(self, parent: QWidget) -> QWidget:
@@ -699,6 +721,20 @@ class LabelClientDock(QDockWidget):
 
     def set_remove_unused_fields(self, enabled: bool) -> None:
         self.remove_unused_fields_checkbox.setChecked(enabled)
+
+    def set_startup_prompt(self, enabled: bool) -> None:
+        blocked = self.startup_prompt_checkbox.blockSignals(True)
+        try:
+            self.startup_prompt_checkbox.setChecked(enabled)
+        finally:
+            self.startup_prompt_checkbox.blockSignals(blocked)
+
+    def set_unpushed_warnings(self, enabled: bool) -> None:
+        blocked = self.unpushed_warnings_checkbox.blockSignals(True)
+        try:
+            self.unpushed_warnings_checkbox.setChecked(enabled)
+        finally:
+            self.unpushed_warnings_checkbox.blockSignals(blocked)
 
     def as_of(self) -> date | None:
         if not self.asof_enabled.isChecked():

@@ -81,8 +81,7 @@ class ConnectionDialog(QDialog):
             buttons.addWidget(button)
         layout.addLayout(buttons)
         note = QLabel(
-            "Change startup prompts in Plugins → CVI Label Client → "
-            "Show connection prompt on startup.",
+            "Change Show connection prompt on startup in the CVI panel's Backend section.",
             self,
         )
         note.setWordWrap(True)
@@ -106,16 +105,12 @@ class StartupConnection:
         self.closed = False
         show = QAction("Sign in and connect…", self.plugin.iface.mainWindow())
         show.triggered.connect(self.show)
-        toggle = QAction("Show connection prompt on startup", self.plugin.iface.mainWindow())
-        toggle.setCheckable(True)
-        toggle.setChecked(bool(self.plugin.settings.get("show_startup_connection")))
-        toggle.toggled.connect(self.set_enabled)
-        for label, action in (("connection prompt", show), ("startup prompt toggle", toggle)):
-            self.plugin.iface.addPluginToMenu(menu_name, action)
-            self.plugin.teardown.add(
-                f"menu: {label}",
-                lambda item=action: self.plugin.iface.removePluginMenu(menu_name, item),
-            )
+        self.plugin.iface.addPluginToMenu(menu_name, show)
+        self.plugin.teardown.add(
+            "menu: connection prompt",
+            lambda: self.plugin.iface.removePluginMenu(menu_name, show),
+        )
+        self.plugin.dock.startupPromptChanged.connect(self.set_enabled)
         self.start_timer = QTimer(self.plugin.dock)
         self.start_timer.setSingleShot(True)
         self.start_timer.timeout.connect(self.show_if_enabled)

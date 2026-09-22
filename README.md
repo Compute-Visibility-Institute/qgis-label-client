@@ -39,13 +39,13 @@ reconnecting to load a changed field schema; existing dirty layers are never rep
 Local uploads continue through the established bulk API, preserving all source data.
 Servers without the new capability keep the existing geometry-layer interface. An
 authentication, network or malformed-capability error is reported rather than silently
-downgrading. Version 0.3.0 is distributed through the usual stable plugin repository.
+downgrading. Version 0.3.1 is distributed through the usual stable plugin repository.
 The new backend capability is enabled on development servers first; the same plugin
 keeps the legacy interface on production servers until they advertise support.
 Use a separate QGIS profile when testing the development server so your production
 project and saved connection stay separate.
 
-The **History track** selector is collapsed at the bottom of the panel, immediately
+The **Environment** selector is collapsed at the bottom of the panel, immediately
 below **Bootstrap**. The current track remains visible beneath the connection controls.
 
 A QGIS 3.44 plugin for a bitemporal geospatial labeling backend that speaks
@@ -198,8 +198,9 @@ save or export unsaved feature edits first because project files do not store th
 
 At startup, the **CVI — sign in and connect** popup provides **Sign out**, **Sign in
 with Google**, and **Connect**. An existing valid sign-in can go straight to Connect.
-The popup is optional: toggle **Plugins → CVI Label Client → Show connection prompt
-on startup**. Open it manually using **Sign in and connect…** in the same menu.
+The popup is optional: toggle **Show connection prompt on startup** in the panel's
+**Backend** section. Open it manually using **Plugins → CVI Label Client → Sign in
+and connect…**.
 
 **Connect** refreshes the available collections, tracks, permissions, class/style
 metadata, and clean loaded live layers. Native providers fetch current data again
@@ -233,7 +234,8 @@ old recovery is restored are kept separately and require review. Missing origina
 layers must be reopened before recovery can be applied; the journal itself remains
 available if the project is unavailable.
 
-**Warn about unpushed edits** toggles the edit-warning popups independently of the
+**Warn about unpushed edits**, in the panel's **Label layers** section, toggles the
+edit-warning popups independently of the
 startup connection prompt. Turning popups off does not turn off journaling or the
 layer markers. Recovery write errors always remain visible in the QGIS message bar;
 keep QGIS open and export the edited layer if its local recovery copy cannot be saved.
@@ -573,8 +575,7 @@ about the analysts' one — the sentence alone cannot tell them apart.
 
 ## Publishing local layers (the one-time bootstrap)
 
-**Plugins → CVI Label Client → Publish local layers…**, or the button in the panel's
-*Bootstrap* group.
+Use **Publish local layers…** in the panel's **Bootstrap** section.
 
 The layer list follows the Layers panel from top to bottom, including nested groups.
 Use **Order → A → Z** for alphabetical sorting, or switch back to **Layers panel**.

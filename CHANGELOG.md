@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and `qgis-plugin-ci` copies the
 most recent entries into `metadata.txt` at release time.
 
+## [0.3.1] - 2026-09-22
+
+### Changed
+
+- Keep **Dataset as saved on a date** and **Publish local layers** in their existing
+  panel sections; remove their duplicate plugin-menu actions.
+- Move **Show connection prompt on startup** into **Backend**, and **Warn about
+  unpushed edits** into **Label layers**, preserving saved preferences.
+- Rename the bottom **History track** section to **Environment**. Bootstrap remains
+  immediately above it.
+
 ## [0.3.0] - 2026-09-22
 
 ### Added

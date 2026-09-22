@@ -27,7 +27,7 @@ from collections.abc import Callable, Sequence
 from contextlib import suppress
 from typing import Any
 
-from qgis.core import Qgis, QgsApplication, QgsFeedback, QgsProject
+from qgis.core import Qgis, QgsFeedback, QgsProject
 from qgis.PyQt.QtCore import Qt, QTimer
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import (
@@ -143,9 +143,8 @@ class LabelClientPlugin:
         # Every history track the backend offers. Empty until Connect: the plugin has no
         # opinion about what tracks exist, exactly as it has none about what classes do.
         self.tracks: list[Track] = []
-        # A publish in flight. Guarded rather than merely discouraged: the menu entry and
-        # the panel button both reach it, and two concurrent runs would double the data
-        # with nothing able to tell afterwards which copy is which.
+        # A publish in flight. Guard repeated requests so concurrent runs cannot
+        # duplicate the uploaded data.
         self.publishing = False
         self._session = SessionCoordinator()
         self._write_access: bool | None = None
@@ -196,37 +195,6 @@ class LabelClientPlugin:
         self.iface.addPluginToMenu(MENU_NAME, self.panel_action)
         self.teardown.add(
             "menu: panel", lambda: self.iface.removePluginMenu(MENU_NAME, self.panel_action)
-        )
-
-        self.recorded_action = QAction(
-            QgsApplication.getThemeIcon("/mActionHistory.svg"),
-            "Dataset as saved on a date…",
-            self.iface.mainWindow(),
-        )
-        self.recorded_action.setToolTip(
-            "Add a read-only layer showing the labels as the team believed them at a "
-            "chosen instant, including labels deleted since."
-        )
-        self.recorded_action.triggered.connect(self.request_recorded_view)
-        self.iface.addPluginToMenu(MENU_NAME, self.recorded_action)
-        self.teardown.add(
-            "menu: historical view",
-            lambda: self.iface.removePluginMenu(MENU_NAME, self.recorded_action),
-        )
-
-        self.publish_action = QAction(
-            QgsApplication.getThemeIcon("/mActionAddOgrLayer.svg"),
-            "Publish local layers…",
-            self.iface.mainWindow(),
-        )
-        self.publish_action.setToolTip(
-            "Send the vector layers open in this project to the backend as new labels."
-        )
-        self.publish_action.triggered.connect(self.publish_local_layers)
-        self.iface.addPluginToMenu(MENU_NAME, self.publish_action)
-        self.teardown.add(
-            "menu: publish local layers",
-            lambda: self.iface.removePluginMenu(MENU_NAME, self.publish_action),
         )
 
         self._connect_dock_signals()
@@ -346,6 +314,8 @@ class LabelClientPlugin:
             return
         self.dock.set_api_url(self.settings.api_base_url)
         self.dock.set_remove_unused_fields(self.settings.get("remove_unused_fields_on_import"))
+        self.dock.set_startup_prompt(self.settings.get("show_startup_connection"))
+        self.dock.set_unpushed_warnings(self.settings.get("show_unpushed_warnings"))
         self.dock.set_as_of(self.settings.as_of)
         self.dock.set_as_of_mechanism(self.settings.as_of_mechanism.value)
         # The picker's opening value only; the control stays disarmed. A remembered instant
@@ -515,8 +485,6 @@ class LabelClientPlugin:
                 self.teardown.add(f"access after editing: {layer.id()}", disconnect)
         if self.dock is not None:
             self.dock.set_write_access(writable)
-        if hasattr(self, "publish_action"):
-            self.publish_action.setEnabled(not self.publishing and writable is not False)
         if editing:
             self._message(
                 "Your account has read-only access. Unsaved edits were preserved in "
@@ -2261,7 +2229,6 @@ class LabelClientPlugin:
         )
 
         self.publishing = True
-        self.publish_action.setEnabled(False)
         destinations = ", ".join(plan.collections()) or routes.untyped
         self.dock.set_publish_status(
             f"Publishing {plan.total_features()} feature(s) to {destinations} "
