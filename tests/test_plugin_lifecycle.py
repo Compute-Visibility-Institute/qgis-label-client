@@ -191,6 +191,28 @@ def test_changing_valid_time_preserves_unsaved_edits_and_restores_controls(fake_
     plugin.unload()
 
 
+def test_picker_default_does_not_claim_a_historical_view_until_one_was_loaded(fake_iface):
+    plugin = _plugin(fake_iface)
+    selected = "2026-09-01T12:00:00Z"
+    plugin.settings.set_recorded_at(selected)
+    captions = []
+    plugin.dock.set_axes = captions.append
+    plugin.dock.recorded_at = lambda: selected
+    try:
+        plugin._restore_settings()
+        assert "Believed: now (live)" in captions[-1]
+        plugin._refresh_axes(selected)
+        assert "2026-09-01" in captions[-1]
+        assert "Believed: now (live)" not in captions[-1]
+        # Merely choosing a different date does not change the displayed view.
+        plugin.dock.recorded_at = lambda: "2026-09-02T12:00:00Z"
+        plugin._refresh_axes()
+        assert "2026-09-01" in captions[-1]
+        assert "2026-09-02" not in captions[-1]
+    finally:
+        plugin.unload()
+
+
 def test_a_transaction_time_collection_checked_in_the_list_is_refused(fake_iface):
     """The populated-and-wrong failure, closed at the point somebody would cause it.
 

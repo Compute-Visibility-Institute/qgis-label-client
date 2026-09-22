@@ -135,6 +135,7 @@ class LabelClientPlugin:
         self.registry: ClassRegistry | None = None
         self._track_change_serial = 0
         self._registry_pending = False
+        self._axes_recorded_at = ""
         self.collections: list[Collection] = []
         self.collection_roles: dict[str, str] = {}
         self.bulk_capability: bulk.BulkCapability | None = None
@@ -330,14 +331,13 @@ class LabelClientPlugin:
         self.dock.set_unpushed_warnings(self.settings.get("show_unpushed_warnings"))
         self.dock.set_as_of(self.settings.as_of)
         self.dock.set_as_of_mechanism(self.settings.as_of_mechanism.value)
-        # The picker's opening value only; the control stays disarmed. A remembered instant
-        # is a convenience, not a claim that a historical layer is in play.
+        # A remembered picker value does not imply a historical layer was loaded.
         self.dock.set_recorded_default(self.settings.recorded_at)
         self.dock.set_recorded_bounds()
         self._refresh_auth_label()
         self._refresh_axes()
 
-    def _refresh_axes(self, moment: str = "") -> None:
+    def _refresh_axes(self, moment: str | None = None) -> None:
         """Keep the two-axis line true, after anything that moves either axis.
 
         Both are named even when one of them is off, and that is load-bearing rather than
@@ -346,9 +346,11 @@ class LabelClientPlugin:
         """
         if self.dock is None:
             return
+        if moment is not None:
+            self._axes_recorded_at = moment
         self.dock.set_axes(
             recorded.describe_axes(
-                moment or self.dock.recorded_at(),
+                self._axes_recorded_at,
                 self.settings.as_of,
                 self.settings.as_of_mechanism,
             )
@@ -771,8 +773,9 @@ class LabelClientPlugin:
             if strays
             else ""
         )
+        environment = "Production" if track.name == "default" else track.describe()
         self.dock.set_track_banner(
-            f"<b>Working in: {track.describe()}</b>"
+            f"<b>Working in: {environment}</b>"
             + (f"<br/><b>{warning}</b>" if warning else "")
             + stray_note
         )
@@ -1776,7 +1779,7 @@ class LabelClientPlugin:
     # --------------------------------------------------- transaction time
 
     def request_recorded_view(self) -> None:
-        """The menu entry. One instant source, which is the panel's picker.
+        """Open the historical view using the panel's chosen instant.
 
         Deliberately not a second date dialog. Two pickers for one axis is two places for
         the remembered default to live and two chances for them to disagree about what UTC
@@ -1789,8 +1792,8 @@ class LabelClientPlugin:
         moment = self.dock.recorded_at()
         if not moment:
             self._message(
-                "Tick 'Pin a historical layer to an instant' in the panel's Historical "
-                "view box, choose the instant, then press Add historical layer.",
+                "Choose a valid instant under 'Labels as we have known on <Date>', "
+                "then press Add historical layer.",
                 Qgis.MessageLevel.Info,
             )
             return

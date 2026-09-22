@@ -167,8 +167,8 @@ class LabelClientDock(QDockWidget):
     """Connection, class layers, both time axes and QA, in one persistent panel.
 
     THE TWO TIME CONTROLS ARE TWO BOXES, and that is a design decision rather than a
-    layout one. "Labels valid on a date" asks what was true on the ground; "Dataset
-    as saved on a date" asks what the team believed. Merging them into one control
+    layout one. "Labels valid on the ground on <Date>" asks what was true on the ground;
+    "Labels as we have known on <Date>" asks what the team believed. Merging them into one control
     with a mode switch would hide the single most important thing about the pair.
     """
 
@@ -210,6 +210,7 @@ class LabelClientDock(QDockWidget):
         # Remembered so set_busy can re-enable only what set_connected allows.
         self._connected = False
         self._busy = False
+        self._as_of_active = False
         self._write_access: bool | None = None
         self._editable_collection_ids: list[str] = []
         self._readonly_collection_ids: list[str] = []
@@ -491,6 +492,8 @@ class LabelClientDock(QDockWidget):
 
     def _build_asof_group(self, parent: QWidget) -> QWidget:
         group = _collapsible("Labels valid on a date", parent)
+        # Preserve the saved collapsed state while updating the visible title.
+        group.setTitle("Labels valid on the ground on <Date>")
         group.setToolTip("Valid time: when the labels describe what was on the ground.")
         layout = QVBoxLayout(group)
 
@@ -501,9 +504,6 @@ class LabelClientDock(QDockWidget):
         hint.setWordWrap(True)
         hint.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(hint)
-
-        self.asof_enabled = QCheckBox("Pin layers to a date", group)
-        layout.addWidget(self.asof_enabled)
 
         form = QFormLayout()
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
@@ -528,15 +528,24 @@ class LabelClientDock(QDockWidget):
         advanced_form.addRow("Date query method", self.asof_mechanism)
         layout.addWidget(advanced)
 
-        self.apply_asof_button = QPushButton("Apply to loaded layers", group)
-        self.apply_asof_button.clicked.connect(self.asOfApplied)
+        self.apply_asof_button = QPushButton("Apply date", group)
+        self.apply_asof_button.clicked.connect(self._apply_asof_date)
         layout.addWidget(self.apply_asof_button)
 
-        self.asof_enabled.toggled.connect(self.asof_date.setEnabled)
-        self.asof_enabled.toggled.connect(self.asof_mechanism.setEnabled)
-        self.asof_date.setEnabled(False)
-        self.asof_mechanism.setEnabled(False)
+        self.clear_asof_button = QPushButton("Clear date filter", group)
+        self.clear_asof_button.clicked.connect(self._clear_asof_date)
+        layout.addWidget(self.clear_asof_button)
         return group
+
+    def _apply_asof_date(self) -> None:
+        self._as_of_active = True
+        self._sync_actions()
+        self.asOfApplied.emit()
+
+    def _clear_asof_date(self) -> None:
+        self._as_of_active = False
+        self._sync_actions()
+        self.asOfApplied.emit()
 
     def _build_recorded_group(self, parent: QWidget) -> QWidget:
         """The transaction-time control: what the team BELIEVED at a chosen instant.
@@ -555,6 +564,8 @@ class LabelClientDock(QDockWidget):
         once, and two historical ones at different instants if you want to compare beliefs.
         """
         group = _collapsible("Dataset as saved on a date", parent)
+        # Keep the original object name for saved expansion preferences.
+        group.setTitle("Labels as we have known on <Date>")
         group.setToolTip(
             "Transaction time: what the server contained then, before later edits or corrections."
         )
@@ -567,9 +578,6 @@ class LabelClientDock(QDockWidget):
         hint.setWordWrap(True)
         hint.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(hint)
-
-        self.recorded_enabled = QCheckBox("Choose a historical instant", group)
-        layout.addWidget(self.recorded_enabled)
 
         form = QFormLayout()
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
@@ -619,16 +627,12 @@ class LabelClientDock(QDockWidget):
         )
         layout.addWidget(self.axes_label)
 
-        self.recorded_enabled.toggled.connect(self.recorded_datetime.setEnabled)
-        self.recorded_enabled.toggled.connect(self._sync_recorded_button)
-        self.recorded_datetime.setEnabled(False)
         self.add_recorded_button.setEnabled(False)
         return group
 
     def _sync_recorded_button(self) -> None:
-        self.add_recorded_button.setEnabled(
-            self._connected and not self._busy and self.recorded_enabled.isChecked()
-        )
+        self.recorded_datetime.setEnabled(not self._busy)
+        self.add_recorded_button.setEnabled(self._connected and not self._busy)
 
     def _emit_recorded_view(self) -> None:
         moment = self.recorded_at()
@@ -710,9 +714,9 @@ class LabelClientDock(QDockWidget):
         self.remove_unused_fields_checkbox.setEnabled(not self._busy)
         self.track_combo.setEnabled(available)
         self.publish_button.setEnabled(available and self._write_access is not False)
-        # Gated on the checkbox as well as the connection: it is the one button here that
-        # adds a layer rather than changing one, and it sits next to "Apply to loaded
-        # layers" on the other axis.
+        self.asof_date.setEnabled(not self._busy)
+        self.asof_mechanism.setEnabled(not self._busy)
+        self.clear_asof_button.setEnabled(available and self._as_of_active)
         self._sync_recorded_button()
 
     def set_busy(self, busy: bool) -> None:
@@ -768,15 +772,16 @@ class LabelClientDock(QDockWidget):
             self.unpushed_warnings_checkbox.blockSignals(blocked)
 
     def as_of(self) -> date | None:
-        if not self.asof_enabled.isChecked():
+        if not self._as_of_active:
             return None
         value = self.asof_date.date()
         return date(value.year(), value.month(), value.day())
 
     def set_as_of(self, value: date | None) -> None:
-        self.asof_enabled.setChecked(value is not None)
+        self._as_of_active = value is not None
         if value is not None:
             self.asof_date.setDate(QDate(value.year, value.month, value.day))
+        self._sync_actions()
 
     def as_of_mechanism(self) -> str:
         return str(self.asof_mechanism.currentData())
@@ -789,15 +794,13 @@ class LabelClientDock(QDockWidget):
     # --- the transaction-time axis --------------------------------------------
 
     def recorded_at(self) -> str:
-        """The picked instant in wire form, or ``""`` when the control is off.
+        """The picked instant in wire form; selection alone does not load a view.
 
         Rendered here and nowhere else in the UI, so the header, the canary and the layer
         name all descend from one conversion. The widget's components are *read as UTC*,
         which is what the field label promises -- see :func:`_as_qdatetime` for why the
         widget itself is left in local time.
         """
-        if not self.recorded_enabled.isChecked():
-            return ""
         value = self.recorded_datetime.dateTime()
         day, clock = value.date(), value.time()
         try:
@@ -815,11 +818,10 @@ class LabelClientDock(QDockWidget):
         return recorded.instant(moment)
 
     def set_recorded_default(self, moment: str) -> None:
-        """Open the picker on a remembered instant. Does NOT arm the control.
+        """Open the picker on a remembered instant without loading a view.
 
-        A remembered default, never a restored state: a ticked box on startup would say a
-        historical layer is in play when none is. The instant a layer is actually a view of
-        lives on that layer, not here.
+        A remembered default is not a restored historical layer. The instant a layer
+        actually represents lives on that layer, not in this picker.
         """
         parsed = recorded.parse_instant(moment) or datetime.now(timezone.utc)
         self.recorded_datetime.setDateTime(_as_qdatetime(parsed))

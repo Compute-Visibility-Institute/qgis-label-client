@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and `qgis-plugin-ci` copies the
 most recent entries into `metadata.txt` at release time.
 
+## [0.3.3] - 2026-09-22
+
+### Changed
+
+- Show **Working in: Production** for the production (`default`) environment.
+- Rename the date sections to **Labels valid on the ground on &lt;Date&gt;** and
+  **Labels as we have known on &lt;Date&gt;**, preserving collapsed-state preferences.
+- Remove the two date-enabling checkboxes. Use **Apply date** or **Clear date filter**
+  for ground validity; choose a historical instant and add its layer directly.
+- Keep the historical status tied to a successfully loaded view, not an unapplied
+  value in the date picker.
+
 ## [0.3.2] - 2026-09-22
 
 ### Added

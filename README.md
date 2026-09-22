@@ -39,7 +39,7 @@ reconnecting to load a changed field schema; existing dirty layers are never rep
 Local uploads continue through the established bulk API, preserving all source data.
 Servers without the new capability keep the existing geometry-layer interface. An
 authentication, network or malformed-capability error is reported rather than silently
-downgrading. Version 0.3.2 is distributed through the usual stable plugin repository.
+downgrading. Version 0.3.3 is distributed through the usual stable plugin repository.
 The new backend capability is enabled on development servers first; the same plugin
 keeps the legacy interface on production servers until they advertise support.
 Use a separate QGIS profile when testing the development server so your production
@@ -434,6 +434,10 @@ rasters directly in QGIS.
 
 ## The as-of date, and why there are two mechanisms
 
+Under **Labels valid on the ground on &lt;Date&gt;**, choose a UTC date and press
+**Apply date**. Use **Clear date filter** to return loaded layers to the unpinned
+view. There is no enabling checkbox; dates take effect only when applied.
+
 The backend has **two independent time axes**. This control touches only one of them.
 
 - **Valid time** — when a thing was true on the ground. OGC API - Features has a standard
@@ -476,8 +480,8 @@ current state, switch mechanisms — that is the symptom.
 ## The historical view, and why the layer is read-only
 
 The other axis. **Transaction time** is when the team *believed* something, as distinct from
-when it was true on the ground. Ticking **Pin a historical layer to an instant** in the
-panel's *Dataset as saved on a date* box and pressing **Add historical layer** gives
+when it was true on the ground. Choosing an instant in the panel's
+**Labels as we have known on &lt;Date&gt;** section and pressing **Add historical layer** gives
 you a layer showing the labels as the team believed them at that instant — **including
 labels deleted since, and the superseded geometry of labels edited since**.
 
@@ -534,7 +538,7 @@ states, with the class colours unchanged in all three so the two layers stay com
 Hovering a superseded feature adds one line to the map tip: *believed until …* — which is
 the question a historical layer exists to answer.
 
-The status line inside **Dataset as saved on a date** names **both** axes, even
+The status line inside **Labels as we have known on &lt;Date&gt;** names **both** axes, even
 when one of them is off, and hides when that section is collapsed:
 
 ```
