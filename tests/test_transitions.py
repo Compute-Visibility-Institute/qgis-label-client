@@ -6,6 +6,7 @@ import pytest
 
 from qgis_label_client import layers
 from qgis_label_client.core.errors import BackendError
+from qgis_label_client.core.registry import parse_registry
 from qgis_label_client.core.tracks import Track
 from qgis_label_client.plugin import LabelClientPlugin
 from qgis_label_client.settings import PluginSettings
@@ -196,6 +197,9 @@ def test_controller_failure_keeps_settings_and_resets_controls(fake_iface, monke
     plugin.settings.set("track", "old")
     plugin.settings.set_as_of(date(2026, 1, 1))
     plugin.tracks = [Track("old"), Track("new")]
+    # Exercise a connected environment transition, not recovery from a failed
+    # connection (which intentionally has no registry or layers to repoint).
+    plugin.registry = parse_registry({"classes": [{"class_id": "example"}]})
     monkeypatch.setattr(layers, "dirty_layers", lambda: [])
     monkeypatch.setattr(layers, "plugin_layers", lambda: [])
 
