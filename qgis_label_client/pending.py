@@ -196,6 +196,7 @@ class PendingEdits:
             if (
                 not layers.is_plugin_layer(layer)
                 or layers.is_historical(layer)
+                or layers.is_date_view(layer)
                 or layer.id() in self.watches
             ):
                 continue

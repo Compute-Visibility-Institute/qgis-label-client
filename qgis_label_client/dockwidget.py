@@ -187,6 +187,8 @@ class LabelClientDock(QDockWidget):
     startupPromptChanged = pyqtSignal(bool)
     unpushedWarningsChanged = pyqtSignal(bool)
     asOfApplied = pyqtSignal()
+    #: Add a separate read-only snapshot at this UTC ground-validity instant.
+    groundViewRequested = pyqtSignal(str)
     #: The transaction-time axis. Carries the rendered wire instant rather than a QDateTime
     #: so that the conversion happens exactly once, in core.recorded.instant, and the panel
     #: and the layer cannot disagree about what was asked for.
@@ -498,7 +500,8 @@ class LabelClientDock(QDockWidget):
         layout = QVBoxLayout(group)
 
         hint = QLabel(
-            "Show what was on the ground on a chosen date.",
+            "Add read-only layers of all polygons, lines and points valid on this date, "
+            "using what we know now.",
             group,
         )
         hint.setWordWrap(True)
@@ -514,28 +517,29 @@ class LabelClientDock(QDockWidget):
         form.addRow("Date (UTC)", self.asof_date)
 
         layout.addLayout(form)
-        advanced = _collapsible("Advanced date options", group, collapsed=True)
-        advanced_form = QFormLayout(advanced)
-        advanced_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
-        self.asof_mechanism = QComboBox(advanced)
+        # Retained for restoring legacy global-filter settings. New read-only
+        # date views always use the server's datetime parameter.
+        self.asof_mechanism = QComboBox(group)
         self.asof_mechanism.addItem("datetime (OGC standard)", AsOfMechanism.DATETIME.value)
         self.asof_mechanism.addItem("CQL2 filter on valid_from/valid_to", AsOfMechanism.CQL2.value)
-        self.asof_mechanism.setToolTip(
-            "datetime is the standard parameter. Switch to CQL2 if the server does not "
-            "propagate it to item requests - CQL2 is sent on every request and cannot be "
-            "silently dropped."
-        )
-        advanced_form.addRow("Date query method", self.asof_mechanism)
-        layout.addWidget(advanced)
+        self.asof_mechanism.setVisible(False)
 
-        self.apply_asof_button = QPushButton("Apply date", group)
-        self.apply_asof_button.clicked.connect(self._apply_asof_date)
+        self.apply_asof_button = QPushButton("Add read-only layers for this date", group)
+        self.apply_asof_button.setToolTip(
+            "Add separate layers for the chosen ground date. Existing layers stay unchanged."
+        )
+        self.apply_asof_button.clicked.connect(self._emit_ground_view)
         layout.addWidget(self.apply_asof_button)
 
-        self.clear_asof_button = QPushButton("Clear date filter", group)
-        self.clear_asof_button.clicked.connect(self._clear_asof_date)
-        layout.addWidget(self.clear_asof_button)
+        note = QLabel("Your current layers stay open and unchanged for comparison.", group)
+        note.setWordWrap(True)
+        layout.addWidget(note)
         return group
+
+    def _emit_ground_view(self) -> None:
+        selected = self.asof_date.date()
+        day = date(selected.year(), selected.month(), selected.day()).isoformat()
+        self.groundViewRequested.emit(f"{day}T00:00:00Z")
 
     def _apply_asof_date(self) -> None:
         self._as_of_active = True
@@ -559,9 +563,8 @@ class LabelClientDock(QDockWidget):
         box above says **as-of**. If both said "as of", a screenshot of the panel would not
         say which axis produced the map.
 
-        IT ADDS A LAYER; it does not re-point the ones already loaded, unlike the as-of
-        control. That is the whole use case: the live layer and a historical one open at
-        once, and two historical ones at different instants if you want to compare beliefs.
+        Like the ground-date control, this adds separate read-only layers. Existing
+        layers stay unchanged so snapshots can be compared side by side.
         """
         group = _collapsible("Dataset as saved on a date", parent)
         # Keep the original object name for saved expansion preferences.
@@ -572,7 +575,8 @@ class LabelClientDock(QDockWidget):
         layout = QVBoxLayout(group)
 
         hint = QLabel(
-            "Add a read-only layer showing what the server contained at a chosen time.",
+            "Add read-only layers of all polygons, lines and points as the server knew "
+            "them at this time.",
             group,
         )
         hint.setWordWrap(True)
@@ -594,7 +598,11 @@ class LabelClientDock(QDockWidget):
         form.addRow("Instant (UTC)", self.recorded_datetime)
         layout.addLayout(form)
 
-        self.add_recorded_button = QPushButton("Add historical layer", group)
+        self.add_recorded_button = QPushButton("Add read-only layers for this date", group)
+        self.add_recorded_button.setToolTip(
+            "Add all label geometry types as known at the UTC date and time above. "
+            "Existing layers stay unchanged."
+        )
         self.add_recorded_button.setIcon(QgsApplication.getThemeIcon("/mActionHistory.svg"))
         self.add_recorded_button.clicked.connect(self._emit_recorded_view)
         layout.addWidget(self.add_recorded_button)
@@ -606,14 +614,6 @@ class LabelClientDock(QDockWidget):
         note.setWordWrap(True)
         note.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(note)
-
-        self.history_button = QPushButton("Selected label history…", group)
-        self.history_button.setIcon(QgsApplication.getThemeIcon("/mActionHistory.svg"))
-        self.history_button.setToolTip(
-            "Every recorded belief about the selected label, keyed on its immutable label_id."
-        )
-        self.history_button.clicked.connect(self.historyRequested)
-        layout.addWidget(self.history_button)
 
         self.recorded_floor_label = QLabel("", group)
         self.recorded_floor_label.setWordWrap(True)
@@ -700,7 +700,6 @@ class LabelClientDock(QDockWidget):
         for widget in (
             self.load_reference_button,
             self.apply_asof_button,
-            self.history_button,
         ):
             widget.setEnabled(available)
         self._sync_qa_visibility()
@@ -716,7 +715,6 @@ class LabelClientDock(QDockWidget):
         self.publish_button.setEnabled(available and self._write_access is not False)
         self.asof_date.setEnabled(not self._busy)
         self.asof_mechanism.setEnabled(not self._busy)
-        self.clear_asof_button.setEnabled(available and self._as_of_active)
         self._sync_recorded_button()
 
     def set_busy(self, busy: bool) -> None:

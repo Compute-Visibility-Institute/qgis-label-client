@@ -21,20 +21,25 @@ def _date_picker(monkeypatch, dock):
     return selected
 
 
-def test_valid_date_requires_apply_and_clear_emits_an_unpinned_view(monkeypatch):
+def test_ground_date_adds_snapshot_without_changing_existing_layer_filter(monkeypatch):
     dock = dockwidget.LabelClientDock(None)
     selected = _date_picker(monkeypatch, dock)
-    applied = []
-    dock.asOfApplied.connect(lambda: applied.append(dock.as_of()))
-    assert dock.as_of() is None
+    requested = []
+    repointed = Mock()
+    dock.groundViewRequested.connect(requested.append)
+    dock.asOfApplied.connect(repointed)
+    dock.set_as_of(date(2026, 8, 12))
     selected[0] = _day(2026, 9, 2)
+    assert requested == []
+    dock._emit_ground_view()
+    assert requested == ["2026-09-02T00:00:00Z"]
+    repointed.assert_not_called()
+    dock.set_as_of(None)
+    dock._emit_ground_view()
+    assert requested == ["2026-09-02T00:00:00Z", "2026-09-02T00:00:00Z"]
     assert dock.as_of() is None
-    assert applied == []
-    dock._apply_asof_date()
-    assert applied == [date(2026, 9, 2)]
-    dock._clear_asof_date()
-    assert applied == [date(2026, 9, 2), None]
-    assert dock.as_of() is None
+    assert not hasattr(dock, "clear_asof_button")
+    assert not hasattr(dock, "history_button")
 
 
 def test_restoring_applied_date_after_rejected_change_does_not_emit_another_request(monkeypatch):

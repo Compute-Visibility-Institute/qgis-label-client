@@ -115,6 +115,11 @@ GENERATED_NAME_PROPERTY = "cvi/generated_name"
 #: populated-and-wrong failure this feature exists to avoid.
 RECORDED_AT_PROPERTY = "cvi/recorded_at"
 
+# Date views are separate read-only layers. Their own time selection survives
+# reconnects and must never inherit the panel's global valid-time filter.
+DATE_VIEW_PROPERTY = "cvi/date_view"
+VALID_AT_PROPERTY = "cvi/valid_at"
+
 #: OAPIF provider key. QGIS registers it from the WFS provider library.
 OAPIF_PROVIDER = "OAPIF"
 CLASS_PROVIDER = "cvi_class"
@@ -518,6 +523,7 @@ def apply_canaries(
 
 def validate_repoint(layer, settings, registry, track) -> None:
     """Check a detached provider and its historical pin before changing project layers."""
+    settings = settings_for_date_view(layer, settings)
     recorded_at = recorded_at_of(layer)
     uri = build_layer_uri(
         settings,
@@ -559,6 +565,7 @@ def repoint_for(
     :func:`create_layer` still needs the two-step form, because on a first load there is no
     layer to ask.
     """
+    settings = settings_for_date_view(layer, settings)
     recorded_at = recorded_at_of(layer)
     uri = build_layer_uri(
         settings,
@@ -630,6 +637,28 @@ def is_historical(layer: QgsMapLayer) -> bool:
     return bool(recorded_at_of(layer))
 
 
+def is_date_view(layer: QgsMapLayer) -> bool:
+    """A separately added ground-date or known-on-date read-only view."""
+    return bool(layer.customProperty(DATE_VIEW_PROPERTY, False))
+
+
+def settings_for_date_view(layer: QgsMapLayer, settings: PluginSettings) -> PluginSettings:
+    if not is_date_view(layer):
+        return settings
+    # Local import avoids the transition module's import of this module.
+    from .transitions import PendingSettings
+
+    valid_at = str(layer.customProperty(VALID_AT_PROPERTY, "") or "")
+    return PendingSettings(
+        settings,
+        {
+            "as_of_enabled": bool(valid_at),
+            "as_of_date": valid_at[:10],
+            "as_of_mechanism": AsOfMechanism.DATETIME.value,
+        },
+    )
+
+
 def historical_layers(project: QgsProject | None = None) -> list[QgsVectorLayer]:
     """Every historical layer in the project, in load order."""
     return [layer for layer in plugin_layers(project) if is_historical(layer)]
@@ -643,7 +672,11 @@ def live_layers(project: QgsProject | None = None) -> list[QgsVectorLayer]:
     one or more historical ones open at once, and two historical layers at different
     instants are the case the header-versus-query decision turns on.
     """
-    return [layer for layer in plugin_layers(project) if not is_historical(layer)]
+    return [
+        layer
+        for layer in plugin_layers(project)
+        if not is_historical(layer) and not is_date_view(layer)
+    ]
 
 
 def mark_read_only(layer: QgsVectorLayer) -> None:

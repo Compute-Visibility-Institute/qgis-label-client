@@ -4,7 +4,7 @@ qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 supportsQt6=True
 description=Connect QGIS to an OGC API - Features labeling backend with Google sign-in, editable class layers and original attribute columns on supported servers, local edit recovery, and historical views.
-version=0.3.3
+version=0.3.4
 author=Compute Visibility Institute
 email=opensource@example.org
 
@@ -19,9 +19,8 @@ about=Connects QGIS to a labeling platform that serves OGC API - Features (Parts
       and falls back to legacy collections on older servers;
     * loads collections and the label class vocabulary from the backend, so forms and styling
       cannot drift from the server's class registry;
-    * an as-of-date control on valid time, sent as the OGC datetime parameter or as a CQL2
-      filter;
-    * a historical view on transaction time - a read-only layer showing the labels as the team
+    * a ground-date control that adds separate read-only polygon, line and point layers;
+    * a historical view on transaction time - read-only layers showing the labels as the team
       believed them at a chosen instant, including ones deleted since. Transaction time has no
       OGC parameter, so the instant is carried in the layer's landing URL. Historical
       collections and the plugin's native read-only flag prevent editing that view;

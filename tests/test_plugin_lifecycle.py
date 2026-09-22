@@ -200,7 +200,7 @@ def test_picker_default_does_not_claim_a_historical_view_until_one_was_loaded(fa
     plugin.dock.recorded_at = lambda: selected
     try:
         plugin._restore_settings()
-        assert "Believed: now (live)" in captions[-1]
+        assert captions[-1] == ""
         plugin._refresh_axes(selected)
         assert "2026-09-01" in captions[-1]
         assert "Believed: now (live)" not in captions[-1]
@@ -239,41 +239,116 @@ def test_an_ordinary_collection_is_loaded_normally(fake_iface):
     plugin.unload()
 
 
-def test_a_remembered_mixed_collection_is_forgotten_rather_than_refused_for_ever(
+def test_date_view_requires_all_geometry_collections_and_reports_provider_errors(
     fake_iface, monkeypatch
 ):
-    """The historical view asks which collection serves it ONCE, and remembers the answer.
-
-    So a remembered collection that mixes geometry types -- which every deployment has,
-    because the mixed views stay for the web viewer -- would refuse every historical view
-    from then on, with no control anywhere to change the answer. Clearing it on that one
-    failure makes the next attempt ask again, with the geometry-typed collections in the
-    list it asks with. Any other failure leaves the setting alone: a timeout is not a
-    reason to make somebody choose a collection again.
-    """
-    from qgis_label_client.core.errors import BackendError, MixedGeometryError
+    """An old single-collection preference cannot omit points or lines."""
+    from qgis_label_client.core.collections import Collection
+    from qgis_label_client.core.errors import BackendError
 
     plugin = _plugin(fake_iface)
     plugin.settings.set("recorded_collection", "mixes_everything")
 
     def refuse(*_args, **_kwargs):
-        raise MixedGeometryError("mixes_everything serves points, lines and polygons")
+        raise AssertionError("An incomplete geometry set must be refused before loading")
 
     monkeypatch.setattr(layer_tools, "create_layer", refuse)
     plugin.open_recorded_view("2026-01-15T08:00:00Z")
-    assert plugin.settings.get("recorded_collection") == ""
-    assert any("mixes_everything" in text for _, text, _ in fake_iface.messages)
+    assert any("polygon, line and point" in text for _, text, _ in fake_iface.messages)
 
-    # A different failure must not cost the analyst their answer.
-    plugin.settings.set("recorded_collection", "believed")
+    plugin.collections = [
+        Collection("label_asof_" + family, family) for family in ("polygon", "line", "point")
+    ]
 
     def outage(*_args, **_kwargs):
         raise BackendError("HTTP 503", status=503)
 
     monkeypatch.setattr(layer_tools, "create_layer", outage)
     plugin.open_recorded_view("2026-01-15T08:00:00Z")
-    assert plugin.settings.get("recorded_collection") == "believed"
+    assert any(
+        "No date-view layers were added: HTTP 503" in text for _, text, _ in fake_iface.messages
+    )
     plugin.unload()
+
+
+@pytest.mark.parametrize("historical", [False, True], ids=["ground", "known"])
+@pytest.mark.parametrize("fail_second", [False, True], ids=["complete", "second-provider-fails"])
+def test_date_views_add_all_geometry_families_atomically_without_repointing_live_layers(
+    fake_iface, monkeypatch, historical, fail_second
+):
+    from unittest.mock import Mock
+
+    from qgis.core import Qgis, QgsProject
+
+    from qgis_label_client.core.collections import Collection
+    from qgis_label_client.core.errors import BackendError
+    from qgis_label_client.core.tracks import Track
+
+    plugin = _plugin(fake_iface)
+    original_date = date(2026, 2, 3)
+    plugin.settings.set_as_of(original_date)
+    track = Track("dev", "dev-track-id")
+    monkeypatch.setattr(plugin, "current_track", lambda: track)
+    monkeypatch.setattr(plugin, "_warn_on_track_mismatch", Mock())
+    monkeypatch.setattr(plugin, "_warn_if_writable", Mock())
+    monkeypatch.setattr(layer_tools, "apply_registry", Mock())
+    repoint = Mock()
+    monkeypatch.setattr(layer_tools, "repoint_for", repoint)
+    prefix = "label_asof_" if historical else "label_"
+    families = ("polygon", "line", "point")
+    plugin.collections = [Collection(prefix + family, family) for family in families]
+    project = QgsProject.instance()
+    existing = _FakeLayer([], {layer_tools.COLLECTION_PROPERTY: "label_polygon"})
+    project._layers["existing"] = existing
+    add_layer = Mock()
+    monkeypatch.setattr(project, "addMapLayer", add_layer)
+    created = []
+    calls = []
+
+    def create(settings, collection_id, title, registry, selected_track, **kwargs):
+        calls.append((collection_id, settings.as_of, selected_track, kwargs))
+        if fail_second and len(calls) == 2:
+            raise BackendError("second collection unavailable", status=503)
+        layer = Mock()
+        layer.name.return_value = title
+        created.append(layer)
+        return layer
+
+    monkeypatch.setattr(layer_tools, "create_layer", create)
+    moment = "2026-01-15T08:00:00Z" if historical else "2026-01-15T00:00:00Z"
+    try:
+        if historical:
+            plugin.open_recorded_view(moment)
+        else:
+            plugin.open_ground_view(moment)
+
+        assert plugin.settings.as_of == original_date
+        assert project.mapLayers() == {"existing": existing}
+        assert existing.properties == {layer_tools.COLLECTION_PROPERTY: "label_polygon"}
+        repoint.assert_not_called()
+        if fail_second:
+            assert len(calls) == 2
+            add_layer.assert_not_called()
+            assert any(
+                "No date-view layers were added" in text for _, text, _ in fake_iface.messages
+            )
+        else:
+            assert [call[0] for call in calls] == [prefix + family for family in families]
+            assert [call.args[0] for call in add_layer.call_args_list] == created
+            for layer, (_, valid_date, selected_track, options) in zip(created, calls, strict=True):
+                assert valid_date == (None if historical else date(2026, 1, 15))
+                assert selected_track is track
+                assert options == {"recorded_at": moment if historical else "", "read_only": True}
+                layer.setReadOnly.assert_called_once_with(True)
+                layer.setAutoRefreshMode.assert_called_once_with(Qgis.AutoRefreshMode.Disabled)
+                layer.temporalProperties.return_value.setIsActive.assert_called_once_with(False)
+                layer.setCustomProperty.assert_any_call(layer_tools.DATE_VIEW_PROPERTY, True)
+                layer.setCustomProperty.assert_any_call(
+                    layer_tools.VALID_AT_PROPERTY, "" if historical else moment
+                )
+                layer.setCustomProperty.assert_any_call("cvi/read_only_view", True)
+    finally:
+        plugin.unload()
 
 
 def test_a_malformed_instant_never_reaches_the_wire(fake_iface):
@@ -301,6 +376,7 @@ def test_the_historical_view_is_wired_to_the_panel(fake_iface):
     plugin = _plugin(fake_iface)
     assert plugin.dock is not None
     assert plugin.open_recorded_view in plugin.dock.recordedViewRequested.slots
+    assert plugin.open_ground_view in plugin.dock.groundViewRequested.slots
     plugin.unload()
 
 

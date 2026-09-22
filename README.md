@@ -432,11 +432,13 @@ rasters directly in QGIS.
 
 ---
 
-## The as-of date, and why there are two mechanisms
+## Ground-date views
 
 Under **Labels valid on the ground on &lt;Date&gt;**, choose a UTC date and press
-**Apply date**. Use **Clear date filter** to return loaded layers to the unpinned
-view. There is no enabling checkbox; dates take effect only when applied.
+**Add read-only layers for this date**. This adds all polygons, lines and points
+valid at 00:00 UTC on that date, using current knowledge. Existing layers stay
+unchanged. There is one action button and no enabling checkbox or global clear
+button; remove a snapshot's layers when you no longer need them.
 
 The backend has **two independent time axes**. This control touches only one of them.
 
@@ -446,34 +448,21 @@ The backend has **two independent time axes**. This control touches only one of 
   understood the world in January, including the mistakes we hadn't caught yet". There is
   **no OGC parameter for it**, and no client-side answer either; it is a server-side query.
 
-For valid time you can choose how the instant is sent:
+New date views send the selected date through `datetime`. They read the full
+validity ranges rather than the current-only collection, so a label whose validity
+has since ended can still appear on its earlier ground date. The resulting layers
+are explicitly read-only. Their own date survives reconnection, and switching the
+environment or a legacy global date filter does not repoint them.
 
-| Mechanism | How it travels | When to use it |
-|---|---|---|
-| `datetime` *(default)* | Query parameter on the landing-page URL | The standard. Try this first |
-| `cql2` | `filter=…&filter-lang=cql2-text` on every items request | When the server does not propagate query parameters from the landing page to item requests |
-
-`datetime` is the standard and therefore the default. It is *not* guaranteed to arrive:
-QGIS's OAPIF provider builds item requests from the links the server returns, so a server
-emitting absolute `items` hrefs can drop it. `cql2` expresses the same question directly
-against `valid_from` / `valid_to` and rides on a first-class parameter of the QGIS OAPIF
-URI, so it cannot be silently discarded. If your as-of view looks suspiciously like the
-current state, switch mechanisms — that is the symptom.
-
-> **What the `filter` parameter actually takes.** Not CQL2. The QGIS OAPIF provider parses
-> it with `QgsExpression` and does the CQL2 conversion itself, so the plugin sends a QGIS
-> expression — `"valid_from" <= '2026-01-01T00:00:00Z' AND …` — and QGIS turns it into
-> `filter=("valid_from" <= TIMESTAMP('2026-01-01T00:00:00.000Z'))…&filter-lang=cql2-text`.
-> Writing literal CQL2 there does not degrade gracefully: an expression QGIS cannot parse
-> makes the layer **invalid**, so you get no data rather than unfiltered data. Verified
-> against QGIS 3.44.
+The older CQL2/global-filter implementation remains for compatibility with saved
+projects; the new section has only a date picker and its add-layers button.
 
 > **The Temporal Controller does not drive `datetime`, and cannot be made to.** Its filter
 > is built as `make_datetime(...)` — a function node where QGIS's Part 1 compiler requires a
 > literal — and every temporal mode wraps its comparison in `OR <field> IS NULL`, a
 > top-level `OR` the compiler will not walk. So the controller filters entirely on the
-> client. That is why this control exists at all. It is also why sliding the controller over
-> a historical layer is harmless: the two axes never share a code path.
+> client. New date-view layers disable that client-side temporal filter so the
+> canvas controller does not silently change the snapshot requested by either button.
 
 ---
 
@@ -481,16 +470,24 @@ current state, switch mechanisms — that is the symptom.
 
 The other axis. **Transaction time** is when the team *believed* something, as distinct from
 when it was true on the ground. Choosing an instant in the panel's
-**Labels as we have known on &lt;Date&gt;** section and pressing **Add historical layer** gives
-you a layer showing the labels as the team believed them at that instant — **including
+**Labels as we have known on &lt;Date&gt;** section and pressing
+**Add read-only layers for this date** adds all polygons, lines and points
+as the team believed them at that instant — **including
 labels deleted since, and the superseded geometry of labels edited since**.
+This section also has exactly one action button. It does not require selecting a
+feature, and it does not inherit a ground-date filter from the other picker.
+
+Each action adds three layers, named with the `CVI` prefix and the chosen date:
+polygons, lines and points. They include retired-class labels as well as active
+classes. These date views use the existing geometry collections and retain the
+legacy JSON attribute fields; current class layers keep their separate columns.
+All three layers are prepared before any are added, so an unavailable collection
+does not leave a partial set in the project. No API change or migration is needed.
 
 Two properties are worth stating plainly, because both are deliberate:
 
-- **It adds a layer. It does not re-point the ones you have.** Unlike the as-of control
-  above, which re-points everything. The whole use case is having the live layer and a
-  historical one open at once — and two historical ones at different instants if you are
-  comparing beliefs.
+- **Both controls add separate layers and leave existing layers unchanged.** You can
+  keep live layers and several dated snapshots open together for comparison.
 - **The layer is read-only, and QGIS greys the pencil out by itself.** Editing a past belief
   is incoherent: it would mean editing what you used to think. This is enforced rather than
   documented, in four places, and the first of them is not this plugin.
@@ -517,17 +514,16 @@ arrive refuses the layer by name instead of quietly showing the present.
 
 ### What you see
 
-The layer is named so it cannot be mistaken for the live one in a tree that truncates from
-the right:
+Each date-view layer names its geometry and the question it answers:
 
 ```
-[BELIEVED 2026-01-15 08:00Z] Labels — read-only        the historical layer
-Labels                                                 the live, editable one
+CVI Polygons — known on 2026-01-15T08:00:00Z (read only)
+CVI Polygons — valid on the ground on 2026-01-15 (read only)
+CVI Campus (editable)
 ```
 
-**BELIEVED**, never *as-of*: the box above says "as of" and means the other axis, and if
-both said it a screenshot would not tell you which question produced the map. Three visual
-states, with the class colours unchanged in all three so the two layers stay comparable:
+The names distinguish ground validity from what was known at a saved instant.
+Historical rendering retains these three visual states:
 
 | State | How it draws |
 |---|---|
@@ -538,15 +534,14 @@ states, with the class colours unchanged in all three so the two layers stay com
 Hovering a superseded feature adds one line to the map tip: *believed until …* — which is
 the question a historical layer exists to answer.
 
-The status line inside **Labels as we have known on &lt;Date&gt;** names **both** axes, even
-when one of them is off, and hides when that section is collapsed:
+The status line inside **Labels as we have known on &lt;Date&gt;** describes the
+last date view added in this session and hides when that section is collapsed:
 
 ```
-Believed: 2026-01-15 08:00Z (fixed)  ·  Valid: Temporal Controller (client-side)
+Last added: labels known on 2026-01-15T08:00:00Z · All ground-validity dates · Read only
 ```
 
-Each control on its own reads as "the" time control. Naming both means neither can be read
-as the only one in play.
+It does not imply that either picker filters the existing live layers.
 
 ### The canary, and what an empty layer means
 

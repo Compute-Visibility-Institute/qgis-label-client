@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and `qgis-plugin-ci` copies the
 most recent entries into `metadata.txt` at release time.
 
+## [0.3.4] - 2026-09-22
+
+### Changed
+
+- Give each date section one **Add read-only layers for this date** button. Both
+  add polygons, lines and points together without changing existing layers.
+- Ground-date layers show labels valid on the chosen date using current knowledge,
+  including validity intervals that have since ended. Historical layers show what
+  the server knew at the chosen instant, without inheriting a ground-date filter.
+- Remove the single-feature history, Apply date and Clear date filter buttons
+  from the date sections, and describe the last added date view clearly.
+- Preserve each date view's read-only state and date across reconnects; exclude
+  these views from environment changes, live refresh, pending edits and pushes.
+- Use existing geometry collections for complete date views, including retired
+  classes. Date-view attributes retain the legacy JSON format; current class
+  layers keep their separate attribute columns. No backend migration is required.
+
 ## [0.3.3] - 2026-09-22
 
 ### Changed

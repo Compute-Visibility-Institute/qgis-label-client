@@ -47,7 +47,7 @@ from .core import collections as collection_groups
 from .core.activity import ActivityRegistry, ActivityState
 from .core.asof import AsOfMechanism, describe
 from .core.collections import Collection
-from .core.errors import LabelClientError, MixedGeometryError
+from .core.errors import LabelClientError
 from .core.publish import PublishPlan, PublishReport
 from .core.registry import ClassRegistry
 from .core.session import SessionCoordinator
@@ -61,7 +61,7 @@ from .publishdialog import PublishDialog, PublishReportDialog
 from .settings import PluginSettings
 from .startup import StartupConnection, refresh_connected_layers
 from .tasks import TaskRunner
-from .transitions import TransitionError, transition
+from .transitions import PendingSettings, TransitionError, transition
 from .validtime import register_functions, unregister_functions
 
 MENU_NAME = "&CVI Label Client"
@@ -136,6 +136,7 @@ class LabelClientPlugin:
         self._track_change_serial = 0
         self._registry_pending = False
         self._axes_recorded_at = ""
+        self._date_view_caption = ""
         self.collections: list[Collection] = []
         self.collection_roles: dict[str, str] = {}
         self.bulk_capability: bulk.BulkCapability | None = None
@@ -316,6 +317,7 @@ class LabelClientPlugin:
             lambda enabled: self.settings.set("remove_unused_fields_on_import", enabled)
         )
         self.dock.asOfApplied.connect(self.apply_as_of)
+        self.dock.groundViewRequested.connect(self.open_ground_view)
         self.dock.recordedViewRequested.connect(self.open_recorded_view)
         self.dock.historyRequested.connect(self.show_history)
         self.dock.coverageRequested.connect(self.check_coverage)
@@ -338,23 +340,15 @@ class LabelClientPlugin:
         self._refresh_axes()
 
     def _refresh_axes(self, moment: str | None = None) -> None:
-        """Keep the two-axis line true, after anything that moves either axis.
-
-        Both are named even when one of them is off, and that is load-bearing rather than
-        tidy: each control on its own reads as "the" time control, and a person who has
-        only met one of them will assume the other axis is not in play.
-        """
+        """Describe the last added date view, independent of the live-layer settings."""
         if self.dock is None:
             return
         if moment is not None:
             self._axes_recorded_at = moment
-        self.dock.set_axes(
-            recorded.describe_axes(
-                self._axes_recorded_at,
-                self.settings.as_of,
-                self.settings.as_of_mechanism,
+            self._date_view_caption = (
+                f"Last added: labels known on {moment} · All ground-validity dates · Read only"
             )
-        )
+        self.dock.set_axes(self._date_view_caption)
 
     # ------------------------------------------------------------------- helpers
 
@@ -712,6 +706,7 @@ class LabelClientPlugin:
                 layer
                 for layer in layer_tools.plugin_layers()
                 if layer_tools.belongs_to_backend(layer, url)
+                and not layer_tools.is_date_view(layer)
             ]
             repointed = self._transition_layers(targets, {"track": name}, track, registry=registry)
             self._registry_pending = False
@@ -1738,7 +1733,9 @@ class LabelClientPlugin:
         as_of = self.dock.as_of()
         mechanism = AsOfMechanism.parse(self.dock.as_of_mechanism())
         track = self.current_track()
-        targets = layer_tools.plugin_layers()
+        targets = [
+            layer for layer in layer_tools.plugin_layers() if not layer_tools.is_date_view(layer)
+        ]
         changed = self._transition_layers(
             targets,
             {
@@ -1793,27 +1790,36 @@ class LabelClientPlugin:
         if not moment:
             self._message(
                 "Choose a valid instant under 'Labels as we have known on <Date>', "
-                "then press Add historical layer.",
+                "then press Add read-only layers for this date.",
                 Qgis.MessageLevel.Info,
             )
             return
         self.open_recorded_view(moment)
 
     def open_recorded_view(self, moment: str) -> None:
-        """Add a read-only layer showing what the team believed at `moment`.
+        """Add all geometry families as known then, without a ground-date filter."""
+        self._open_date_layers(moment, historical=True)
 
-        DISTINCT FROM :meth:`apply_as_of`, which re-points the layers already loaded on the
-        other axis. This *adds*, because the point of a historical view is comparing it
-        against the live one -- and against another historical one at a different instant,
-        which works because the instant lives in each layer's own data source rather than
-        in a session setting.
+    def open_ground_view(self, moment: str) -> None:
+        """Add all geometry families valid on this date under current knowledge."""
+        self._open_date_layers(moment, historical=False)
+
+    def _open_date_layers(self, moment: str, *, historical: bool) -> None:
+        """Stage a complete, typed, read-only view before adding any project layers.
+
+        The current class API has no recorded-time support and lists only active
+        classes. The legacy typed collections retain retired-class labels too.
+        Ground views use the full edit views for reads: current-only collections
+        would omit validity intervals which ended before today.
         """
         if self.dock is None:
             return
-        if not self.registry:
+        if self._registry_pending or not self.registry:
             self._fail("Connect first: the class registry drives layer configuration.")
             return
-        if self._defer_until_fresh(lambda: self.open_recorded_view(moment)):
+        if self._defer_until_fresh(
+            lambda: self._open_date_layers(moment, historical=historical)
+        ):
             return
         parsed = recorded.parse_instant(moment)
         if parsed is None:
@@ -1826,53 +1832,93 @@ class LabelClientPlugin:
             # The picker's ceiling already stops this, but the panel is a view and the
             # controller must not depend on a widget constraint: the bounds are set at
             # Connect, and a Connect that failed leaves them unset.
-            recorded.validate(parsed)
+            if historical:
+                recorded.validate(parsed)
+            elif any((parsed.hour, parsed.minute, parsed.second, parsed.microsecond)):
+                raise LabelClientError("Choose a ground date at midnight UTC from the panel.")
         except LabelClientError as exc:
             self._fail(str(exc))
             return
 
-        collection_id = self._collection_setting(
-            "recorded_collection",
-            "Historical view collection",
-            "Which collection serves the world as it was BELIEVED at a past instant?",
-        )
-        if not collection_id:
-            self._fail("No collection chosen. No historical layer was added.")
+        role = "historical" if historical else "editable"
+        candidates = [
+            item.collection_id
+            for item in self.collections
+            if item.class_layer is None
+            and classlayers.collection_role(item, self.bulk_capability, self.collection_roles)
+            == role
+        ]
+        routes = routing.build_routes(candidates)
+        families = (routing.POLYGON, routing.LINE, routing.POINT)
+        if set(routes.by_family) != set(families):
+            self._fail(
+                "This backend must expose separate polygon, line and point collections "
+                "for this date view. No layers were added; reconnect after updating the backend."
+            )
             return
 
-        # None is allowed, exactly as it is for any other read: the API answers a request
-        # naming no track from the deployment default. Nothing here writes.
         track = self.current_track()
-        title = next(
-            (c.display_name for c in self.collections if c.collection_id == collection_id), ""
+        view_settings = PendingSettings(
+            self.settings,
+            {
+                "as_of_enabled": not historical,
+                "as_of_date": parsed.date().isoformat() if not historical else "",
+                "as_of_mechanism": AsOfMechanism.DATETIME.value,
+            },
         )
-        name = recorded.layer_name(moment, recorded.base_name(title, collection_id))
-
+        caption = f"known on {moment}" if historical else f"valid on the ground on {parsed.date()}"
+        captions = {routing.POLYGON: "Polygons", routing.LINE: "Lines", routing.POINT: "Points"}
+        staged = []
         activity = self.activities.begin()
         try:
-            layer = layer_tools.create_layer(
-                self.settings, collection_id, name, self.registry, track, recorded_at=moment
-            )
-        except MixedGeometryError as exc:
-            # Forget the remembered id as well as reporting, or this refusal repeats for
-            # ever: the collection is asked for once and there is no other control that
-            # can change the answer. Cleared, the next attempt asks again -- and the
-            # geometry-typed collections are in the list it asks with.
-            self.settings.set("recorded_collection", "")
-            self._fail(str(exc))
-            return
+            for family in families:
+                layer = layer_tools.create_layer(
+                    view_settings,
+                    routes.by_family[family],
+                    f"{captions[family]} — {caption} (read only)",
+                    self.registry,
+                    track,
+                    recorded_at=moment if historical else "",
+                    read_only=True,
+                )
+                layer.setCustomProperty(layer_tools.DATE_VIEW_PROPERTY, True)
+                layer.setCustomProperty(layer_tools.VALID_AT_PROPERTY, "" if historical else moment)
+                layer.setCustomProperty("cvi/read_only_view", True)
+                layer_tools.apply_registry(layer, self.registry, historical=historical)
+                layer.setReadOnly(True)
+                layer.setAutoRefreshMode(Qgis.AutoRefreshMode.Disabled)
+                # Each button asks for one axis. The canvas Temporal Controller
+                # must not silently introduce a second date filter.
+                layer.temporalProperties().setIsActive(False)
+                if not historical:
+                    layer.setAbstract(
+                        f"Read-only labels valid at {moment}, using current server knowledge. "
+                        "Existing project layers are unchanged."
+                    )
+                staged.append(layer)
         except LabelClientError as exc:
-            self._fail(str(exc))
+            self._fail(f"No date-view layers were added: {exc}")
             return
         finally:
             activity.close()
 
-        layer_tools.apply_registry(layer, self.registry, historical=True)
-        QgsProject.instance().addMapLayer(layer)
-        self.settings.set_recorded_at(moment)
-        self._warn_on_track_mismatch(layer, track)
-        self._warn_if_writable(layer)
-        self._report_recorded_view(layer, moment, track)
+        project = QgsProject.instance()
+        for layer in staged:
+            project.addMapLayer(layer)
+            self._warn_on_track_mismatch(layer, track)
+            if historical:
+                self._warn_if_writable(layer)
+        if historical:
+            self.settings.set_recorded_at(moment)
+            self._refresh_axes(moment)
+        else:
+            self._date_view_caption = (
+                f"Last added: labels valid on the ground on {parsed.date()} (midnight UTC) "
+                "· Current knowledge · Read only"
+            )
+            self._refresh_axes()
+        self.dock.set_status(f"Added 3 read-only layers — {caption}. Existing layers are unchanged.")
+        log(f"Added complete date view ({caption}) on track {track.name if track else '(default)'}.")
 
     def _warn_if_writable(self, layer) -> None:
         """Say so if the server let a pinned request look editable.
