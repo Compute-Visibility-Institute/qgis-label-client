@@ -4,7 +4,7 @@ qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 supportsQt6=True
 description=Connect QGIS to an OGC API - Features labeling backend with Google sign-in, editable class layers and original attribute columns on supported servers, local edit recovery, and historical views.
-version=0.2.0
+version=0.2.1
 author=Compute Visibility Institute
 email=opensource@example.org
 
@@ -49,6 +49,6 @@ deprecated=False
 server=False
 hasProcessingProvider=no
 
-changelog=0.2.0
-    - Stable release with class layers and editable attributes on supported servers.
-    - Keep legacy API support, simplify layer controls, and recover local edits after reconnecting.
+changelog=0.2.1
+    - Show class layers and original attribute columns in read-only mode on supported servers.
+    - Avoid malformed track/class filters when opening attribute tables.

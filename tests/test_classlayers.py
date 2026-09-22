@@ -98,6 +98,7 @@ def test_discovery_hides_old_editable_rows_only_in_loading_ui():
     all_collections = [legacy, history, fresh]
     capability = SimpleNamespace(serves=lambda name: name == "labels_polygon")
     assert classlayers.visible_collections(all_collections, capability) == [fresh]
+    assert classlayers.readonly_collections(all_collections, capability) == [fresh]
     assert all_collections == [legacy, history, fresh]
 
 
@@ -118,6 +119,9 @@ def test_metadata_and_historical_collections_are_not_main_or_reference_options()
         "label_polygon"
     ]
     assert classlayers.reference_collections(all_collections) == []
+    assert [c.collection_id for c in classlayers.readonly_collections(all_collections)] == [
+        "label_current_polygon"
+    ]
 
 
 def test_native_class_uri_keeps_auth_track_and_relative_api_prefix():

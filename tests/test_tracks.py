@@ -124,7 +124,9 @@ def test_an_archived_track_is_never_the_implicit_default():
 
 def test_the_canary_filters_on_the_track_the_server_itself_supplies():
     clause = track_tools.canary_filter(TRACK)
-    assert clause == f"\"track_id\" = '{TRACK.track_id}'"
+    # A function on the left prevents the Part 1 compiler from turning this into
+    # track_id=, which QGIS cannot safely combine with a table's class_id= query.
+    assert clause == f"coalesce(\"track_id\", '') = '{TRACK.track_id}'"
 
 
 def test_a_track_with_no_uuid_cannot_be_verified_and_gets_no_filter():

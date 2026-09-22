@@ -209,7 +209,7 @@ def test_the_canary_clause_pins_the_layer_to_the_servers_own_value():
     # is itself a quoted URI value. Asserted literally rather than loosely: a filter that
     # loses its quoting is a layer QGIS refuses to open, and the message it gives names
     # neither the layer nor the cause.
-    assert "filter='\"track_id\" = \\'" + TRACK.track_id + "\\''" in uri
+    assert "filter='coalesce(\"track_id\", \\'\\') = \\'" + TRACK.track_id + "\\''" in uri
 
 
 def test_a_project_saved_on_another_track_is_noticed_rather_than_redirected(monkeypatch):

@@ -22,7 +22,7 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 REPO = Path(__file__).resolve().parents[1]
 API_SOURCE = REPO.parent / "labeling-platform" / "api"
@@ -146,6 +146,7 @@ class Fixture:
         self.created = 100
         self.history = copy.deepcopy(self.records)
         self.version = 1
+        self.malformed_filters = []
 
     def description(self, collection: str) -> dict:
         spec = self.contract["collections"][collection]["spec"]
@@ -200,7 +201,26 @@ class Fixture:
                 {
                     "openapi": "3.0.3",
                     "info": {"title": "Native fixture", "version": "1"},
-                    "paths": {},
+                    # Part 1 simple-queryable discovery uses concrete paths,
+                    # not the generic {collectionId} OpenAPI path parameter.
+                    "paths": {
+                        f"/collections/{collection}/items": {
+                            "get": {
+                                "parameters": [
+                                    {
+                                        "name": name,
+                                        "in": "query",
+                                        "style": "form",
+                                        "explode": False,
+                                        "schema": {"type": "string"},
+                                    }
+                                    for name in ("track_id", "class_id")
+                                ],
+                                "responses": {"200": {"description": "Features"}},
+                            }
+                        }
+                        for collection in self.records
+                    },
                 },
                 {},
             )
@@ -228,7 +248,18 @@ class Fixture:
             )
         if len(parts) == 4:
             if method == "GET":
+                query = parse_qs(urlsplit(path).query)
+                if "filter" in query and "(d=" in query["filter"][0]:
+                    self.malformed_filters.append(query["filter"][0])
+                    return 400, {"detail": "Malformed QGIS Part 1 filter combination"}, {}
                 features = list(records.values())
+                for name in ("track_id", "class_id"):
+                    if name in query:
+                        features = [
+                            feature
+                            for feature in features
+                            if feature["properties"].get(name) == query[name][0]
+                        ]
                 return (
                     200,
                     {
@@ -310,6 +341,7 @@ def run_native(contract: dict) -> dict:
         Qgis,
         QgsApplication,
         QgsFeature,
+        QgsFeatureRequest,
         QgsGeometry,
         QgsVectorLayer,
         QgsWkbTypes,
@@ -317,6 +349,7 @@ def run_native(contract: dict) -> dict:
     from qgis.PyQt.QtCore import QVariant
 
     sys.path.insert(0, str(REPO))
+    from qgis_label_client.core.tracks import Track, canary_filter
     from qgis_label_client.core.uri import build_oapif_uri
     from qgis_label_client.layers import configure_class_columns, refresh_class_layer_after_commit
 
@@ -393,6 +426,27 @@ def run_native(contract: dict) -> dict:
                 checks.append(
                     collection
                     + ": multipart geometry, typed scalar values, Unicode/nulls and protected identity"
+                )
+
+                readonly = QgsVectorLayer(uri, collection + " read only", "OAPIF")
+                layers.append(readonly)
+                assert readonly.isValid(), readonly.error().summary()
+                configure_class_columns(readonly, {**doc["spec"], "fields": doc["fields"]})
+                # Match _load_collections' separate read-only class layer path.
+                readonly.setCustomProperty("cvi/read_only_view", True)
+                readonly.setReadOnly(True)
+                assert readonly.readOnly() and not readonly.startEditing()
+                readonly_features = list(readonly.getFeatures())
+                assert len(readonly_features) == 2
+                assert all(feature[names["Name_Ch"]] == CHINESE for feature in readonly_features)
+                assert (
+                    readonly.attributeAlias(readonly.fields().indexOf(names["Company"]))
+                    == "Company"
+                )
+                assert readonly.fields().indexOf(names["Area_sqm"]) >= 0
+                checks.append(
+                    collection
+                    + ": read-only class layer keeps readable scalar columns and refuses editing"
                 )
 
                 # A single Save invokes separate native attribute and geometry
@@ -489,10 +543,87 @@ def run_native(contract: dict) -> dict:
                     + ": empty schema retains scalar/geometry types and create capability"
                 )
 
+            # Legacy OAPIF collections advertise Part 1 property parameters.
+            # Reproduce the QGIS 3.44 subset/request combination failure using
+            # the original canary, then exercise the production workaround.
+            legacy_doc = copy.deepcopy(contract["collections"]["cl_native_polygon__polygon"])
+            legacy_doc["spec"]["id"] = "label_polygon"
+            fixture.contract["collections"]["label_polygon"] = legacy_doc
+            expected_track = "00000000-0000-4000-8000-000000000099"
+            wrong_track = "00000000-0000-4000-8000-000000000100"
+            legacy_features = []
+            for index, (class_id, track_id) in enumerate(
+                [
+                    ("compound", expected_track),
+                    ("other_class", expected_track),
+                    ("compound", wrong_track),
+                    ("compound", None),
+                ]
+            ):
+                item = copy.deepcopy(legacy_doc["features"][0])
+                item["id"] = f"{900 + index}.{'a' * 24}"
+                item["properties"].update(class_id=class_id, track_id=track_id)
+                legacy_features.append(item)
+            fixture.records["label_polygon"] = {item["id"]: item for item in legacy_features}
+            old_uri = build_oapif_uri(
+                landing_url=fixture.root + "?track=dev",
+                collection_id="label_polygon",
+                restrict_to_request_bbox=False,
+                cql_filter=f"\"track_id\" = '{expected_track}'",
+            )
+            broken = QgsVectorLayer(old_uri, "Legacy broken canary", "OAPIF")
+            layers.append(broken)
+            assert broken.isValid(), broken.error().summary()
+            request = QgsFeatureRequest().setFilterExpression("\"class_id\" = 'compound'")
+            assert list(broken.getFeatures(request)) == []
+            assert fixture.malformed_filters, (
+                "Old canary did not reproduce the malformed Part 1 URL"
+            )
+            assert any(
+                "(d=" + expected_track in value and "(d=compound)" in value
+                for value in fixture.malformed_filters
+            ), fixture.malformed_filters
+            checks.append(
+                "legacy Part 1 raw track canary reproduces malformed combined CQL and HTTP 400"
+            )
+
+            fixed_uri = build_oapif_uri(
+                landing_url=fixture.root + "?track=dev",
+                collection_id="label_polygon",
+                restrict_to_request_bbox=False,
+                cql_filter=canary_filter(Track(name="dev", track_id=expected_track)),
+            )
+            fixed = QgsVectorLayer(fixed_uri, "Legacy safe canary", "OAPIF")
+            layers.append(fixed)
+            assert fixed.isValid(), fixed.error().summary()
+            malformed_before = len(fixture.malformed_filters)
+            requests_before = len(fixture.requests)
+            selected = list(fixed.getFeatures(request))
+            assert len(selected) == 1, [
+                (feature["class_id"], feature["track_id"]) for feature in selected
+            ]
+            assert selected[0]["class_id"] == "compound"
+            assert selected[0]["track_id"] == expected_track
+            assert len(fixture.malformed_filters) == malformed_before
+            assert all(
+                "filter" not in parse_qs(urlsplit(item["path"]).query)
+                for item in fixture.requests[requests_before:]
+            )
+            checks.append(
+                "coalesce track canary plus class filter returns correct class/track without malformed CQL"
+            )
+            all_allowed = list(fixed.getFeatures())
+            assert len(all_allowed) == 2
+            assert all(feature["track_id"] == expected_track for feature in all_allowed)
+            checks.append(
+                "local track canary rejects wrong-track and null-track features independently of server filtering"
+            )
+
             return {
                 "qgis": Qgis.QGIS_VERSION,
                 "checks": checks,
                 "requests": fixture.requests,
+                "reproduced_malformed_filters": fixture.malformed_filters,
                 "scope": "Real QGIS provider with actual API schema/feature builders and local fixture storage only",
             }
         finally:

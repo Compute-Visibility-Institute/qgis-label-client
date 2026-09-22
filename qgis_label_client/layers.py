@@ -397,7 +397,9 @@ def apply_canaries(
     filter on a value the server itself supplies is the cheapest possible detector.
 
     ONLY THE TRACK, and the asymmetry is deliberate. ``track_id`` is a UUID, which QGIS
-    types as a string, so a filter on it stays a filter. The transaction-time echo is an
+    types as a string. The canary wraps it in coalesce so Part 1 filtering keeps this
+    check local, avoiding QGIS's malformed subset/request-filter combination. The
+    transaction-time echo is an
     instant, and a filter on *that* was compiled into ``?datetime=`` and quietly changed
     which axis the layer was filtering on -- so it is verified by
     :func:`verify_recorded_echo` instead, after the layer loads. `recorded_at` is still

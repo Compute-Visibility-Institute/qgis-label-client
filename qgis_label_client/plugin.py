@@ -319,6 +319,9 @@ class LabelClientPlugin:
         self.dock.signOutRequested.connect(self.sign_out)
         self.dock.copyAddressRequested.connect(self.copy_address)
         self.dock.loadLayersRequested.connect(self.load_collections)
+        self.dock.loadReadOnlyLayersRequested.connect(
+            lambda collection_ids: self.load_collections(collection_ids, read_only=True)
+        )
         self.dock.asOfApplied.connect(self.apply_as_of)
         self.dock.recordedViewRequested.connect(self.open_recorded_view)
         self.dock.historyRequested.connect(self.show_history)
@@ -1405,7 +1408,7 @@ class LabelClientPlugin:
         )
         self.dock.set_collections(groups, checked=loaded)
         readonly_groups = collection_groups.group_by_mode(
-            classlayers.current_collections(
+            classlayers.readonly_collections(
                 self.collections, self.bulk_capability, self.collection_roles
             )
         )
@@ -1479,8 +1482,8 @@ class LabelClientPlugin:
 
     # -------------------------------------------------------------------- layers
 
-    def load_collections(self, collection_ids: Sequence[str]) -> None:
-        """Add a layer per checked collection and configure it from the registry.
+    def load_collections(self, collection_ids: Sequence[str], *, read_only: bool = False) -> None:
+        """Add layers in the requested mode and configure them from the registry.
 
         Layer creation is on the main thread on purpose. Building a ``QgsVectorLayer``
         does its own network round trip, but a layer cannot be constructed on a worker
@@ -1507,7 +1510,9 @@ class LabelClientPlugin:
         # The most important of these gates. Each layer built below hands an authcfg to
         # QGIS's own OAPIF provider, which then fetches with no plugin code in its path --
         # so a token that dies here produces a layer that 401s and cannot be retried.
-        if self._defer_until_fresh(lambda: self.load_collections(collection_ids)):
+        if self._defer_until_fresh(
+            lambda: self.load_collections(collection_ids, read_only=read_only)
+        ):
             return
 
         titles = {c.collection_id: c.display_name for c in self.collections}
@@ -1533,23 +1538,37 @@ class LabelClientPlugin:
         # case is the live layer and one or more past-belief layers open together, and a
         # historical layer occupying its collection's slot would make the live one
         # unloadable -- silently, by a `continue`.
-        existing = {layer_tools.collection_of(layer): layer for layer in layer_tools.live_layers()}
         # May be None, and that is allowed for a READ: the API answers a request naming no
         # track from the deployment default, which is the right thing for somebody looking
         # around. Writes are the ones that refuse -- see _require_track.
         track = self.current_track()
+        existing = {
+            (
+                layer_tools.collection_of(layer),
+                bool(layer.customProperty("cvi/read_only_view", False))
+                or layer_tools.collection_of(layer) in readonly_ids,
+            )
+            for layer in layer_tools.live_layers()
+            if layer_tools.belongs_to_backend(layer, self.settings.api_base_url)
+            and layer_tools.track_of(layer) == (track.name if track else "")
+        }
 
         added = 0
         activity = self.activities.begin()
         try:
             for collection_id in collection_ids:
-                if collection_id in existing:
+                view_only = read_only or collection_id in readonly_ids
+                identity = (collection_id, view_only)
+                if identity in existing:
                     continue
+                title = titles.get(collection_id, collection_id)
+                if view_only and collection_id in class_metadata:
+                    title += " (read only)"
                 try:
                     layer = layer_tools.create_layer(
                         self.settings,
                         collection_id,
-                        titles.get(collection_id, collection_id),
+                        title,
                         self.registry,
                         track,
                     )
@@ -1562,10 +1581,11 @@ class LabelClientPlugin:
                 if collection_id in class_metadata:
                     layer_tools.configure_class_columns(layer, dict(class_metadata[collection_id]))
                 layer_tools.apply_registry(layer, self.registry)
-                if collection_id in readonly_ids:
+                if view_only:
                     layer.setCustomProperty("cvi/read_only_view", True)
                     layer.setReadOnly(True)
                 layertree.add_collection_layer(project, layer, groups)
+                existing.add(identity)
                 added += 1
                 self._warn_on_track_mismatch(layer, track)
         finally:

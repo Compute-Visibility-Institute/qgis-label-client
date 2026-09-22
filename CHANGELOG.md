@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and `qgis-plugin-ci` copies the
 most recent entries into `metadata.txt` at release time.
 
+## [0.2.1] - 2026-09-22
+
+### Fixed
+
+- Use separate class layers and original attribute columns for read-only views
+  when supported, keeping read-only and editable copies distinct.
+- Avoid QGIS's malformed combination of the track canary and attribute-table
+  filters by evaluating the canary locally on Part 1 servers. Server-side track
+  authentication and database isolation remain in force.
+
 ## [0.2.0] - 2026-09-22
 
 ### Changed

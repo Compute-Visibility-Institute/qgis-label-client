@@ -91,6 +91,15 @@ def test_native_edit_buffers_are_preserved_for_newly_detected_reader():
     assert layer.edits == ["unsaved geometry"] and layer.editing
 
 
+def test_readonly_class_view_does_not_become_editable_after_access_refresh():
+    layer = Layer(readonly=True)
+    layer.properties["cvi/read_only_view"] = True
+    access = LayerAccess()
+    for writable in (False, True, None):
+        access.apply([layer], writable)
+        assert layer.readonly
+
+
 @pytest.mark.parametrize("access_after_relogin", [True, False])
 def test_logout_relogin_preserves_open_edits_and_rechecks_server_access(
     fake_iface, monkeypatch, access_after_relogin

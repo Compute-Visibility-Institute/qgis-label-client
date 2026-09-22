@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .errors import BackendError
-from .expressions import equals
+from .expressions import identifier, literal
 from .fields import DEFAULT_FIELDS, CoreFields
 
 #: Header naming the history track a request is for.
@@ -243,10 +243,18 @@ def canary_filter(track: Track | None, fields: CoreFields = DEFAULT_FIELDS) -> s
     :func:`qgis_label_client.layers.track_filter_for`. A collection that is shared between
     tracks by design -- the class registry, imagery captures -- has no ``track_id``, and
     filtering one on a column it does not have would make the layer invalid.
+
+    Keep the column inside a function so QGIS's Part 1 compiler evaluates this
+    canary locally. In QGIS 3.44, combining a simple subset query parameter with
+    an attribute-table request incorrectly treats both as ``filter=`` CQL,
+    stripping seven characters from ``track_id=`` and ``class_id=``. That yields
+    ``(d=uuid) AND (d=class)`` and HTTP 400. Row-level security and the track
+    authentication header remain the server-side isolation boundary; this local
+    canary still rejects features whose returned track differs from the request.
     """
     if track is None or not track.can_be_verified:
         return None
-    return equals(fields.track_id, track.track_id)
+    return f"coalesce({identifier(fields.track_id)}, '') = {literal(track.track_id)}"
 
 
 def mismatch(expected: Track | None, found: object) -> str:

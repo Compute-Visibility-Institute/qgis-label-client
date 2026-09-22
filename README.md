@@ -9,6 +9,10 @@ multipart features stay in their corresponding family. Source attributes appear 
 ordinary editable columns using the original field names as aliases. New features
 receive the layer's class automatically.
 
+**Add read only layers** uses those same class layers and attribute columns, with
+editing disabled. Read-only and editable copies can coexist in the project. On
+older servers, the read-only action keeps using the legacy current-label views.
+
 New classes and fields are discovered on Connect. Save or recover pending edits before
 reconnecting to load a changed field schema; existing dirty layers are never replaced.
 Local uploads continue through the established bulk API, preserving all source data.

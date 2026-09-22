@@ -180,6 +180,7 @@ class LabelClientDock(QDockWidget):
     #: an administrator, and retyping an address by eye is how a grant lands on nobody.
     copyAddressRequested = pyqtSignal()
     loadLayersRequested = pyqtSignal(list)
+    loadReadOnlyLayersRequested = pyqtSignal(list)
     asOfApplied = pyqtSignal()
     #: The transaction-time axis. Carries the rendered wire instant rather than a QDateTime
     #: so that the conversion happens exactly once, in core.recorded.instant, and the panel
@@ -388,9 +389,11 @@ class LabelClientDock(QDockWidget):
         layout.addWidget(hint)
 
         self.load_readonly_button = QPushButton("Add read only layers", group)
-        self.load_readonly_button.setToolTip("Add the server's current read-only label layers.")
+        self.load_readonly_button.setToolTip(
+            "Add current labels with separate attribute columns when supported, locked for viewing."
+        )
         self.load_readonly_button.clicked.connect(
-            lambda: self.loadLayersRequested.emit(list(self._readonly_collection_ids))
+            lambda: self.loadReadOnlyLayersRequested.emit(list(self._readonly_collection_ids))
         )
         layout.addWidget(self.load_readonly_button)
 

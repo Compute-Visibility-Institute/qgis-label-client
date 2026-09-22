@@ -137,3 +137,11 @@ def current_collections(
         for collection in collections
         if collection_role(collection, bulk_capability, roles) == "current"
     ]
+
+
+def readonly_collections(
+    collections: Sequence[Collection], bulk_capability=None, roles=None
+) -> list[Collection]:
+    """Use class columns for both modes; older servers retain their current views."""
+    discovered = [collection for collection in collections if collection.class_layer is not None]
+    return discovered or current_collections(collections, bulk_capability, roles)

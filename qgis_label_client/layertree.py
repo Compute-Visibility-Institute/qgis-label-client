@@ -24,7 +24,13 @@ def _context(layer) -> str:
     # appear interchangeable merely because they advertise the same collection ids.
     url = QgsDataSourceUri(layer.source()).param("url")
     return json.dumps(
-        [url, layers.track_of(layer), layers.recorded_at_of(layer)], separators=(",", ":")
+        [
+            url,
+            layers.track_of(layer),
+            layers.recorded_at_of(layer),
+            bool(layer.customProperty("cvi/read_only_view", False)),
+        ],
+        separators=(",", ":"),
     )
 
 
@@ -60,10 +66,15 @@ def _find_group(root, metadata: CollectionGroup, context: str):
     return None
 
 
-def _ensure_group(root, metadata: CollectionGroup, context: str, index: int = 0):
+def _ensure_group(
+    root, metadata: CollectionGroup, context: str, index: int = 0, *, read_only: bool = False
+):
     group = _find_group(root, metadata, context)
     if group is None:
-        group = root.insertGroup(index, metadata.display_name)
+        title = metadata.display_name
+        if read_only and any(member.class_layer is not None for member in metadata.members):
+            title += " (read only)"
+        group = root.insertGroup(index, title)
         group.setCustomProperty(GROUP_PROPERTY, metadata.stem)
         group.setCustomProperty(CONTEXT_PROPERTY, context)
         group.setExpanded(False)
@@ -76,7 +87,12 @@ def add_collection_layer(project, layer, groups: Sequence[CollectionGroup]) -> N
     if metadata is None:
         project.addMapLayer(layer)
         return
-    group = _ensure_group(project.layerTreeRoot(), metadata, _context(layer))
+    group = _ensure_group(
+        project.layerTreeRoot(),
+        metadata,
+        _context(layer),
+        read_only=bool(layer.customProperty("cvi/read_only_view", False)),
+    )
     project.addMapLayer(layer, False)
     node = group.addLayer(layer)
     node.setCustomProperty(PLACED_PROPERTY, True)
@@ -100,7 +116,13 @@ def group_existing_layers(project, groups: Sequence[CollectionGroup]) -> None:
         if metadata is None:
             continue
         index = root.children().index(node)
-        group = _ensure_group(root, metadata, _context(layer), index)
+        group = _ensure_group(
+            root,
+            metadata,
+            _context(layer),
+            index,
+            read_only=bool(layer.customProperty("cvi/read_only_view", False)),
+        )
         if node.isVisible() and not group.isVisible():
             # Adopting a visible root layer into a group the user disabled would hide
             # existing map content. Leave that arrangement for the user to resolve.
