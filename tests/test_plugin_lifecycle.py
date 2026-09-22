@@ -348,6 +348,9 @@ def test_date_views_add_all_geometry_families_atomically_without_repointing_live
                 )
                 layer.setCustomProperty.assert_any_call("cvi/read_only_view", True)
     finally:
+        # This lightweight source fixture models only the properties exercised
+        # above; remove it before the real unload path inspects QGIS layer types.
+        project._layers.pop("existing", None)
         plugin.unload()
 
 

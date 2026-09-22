@@ -38,8 +38,10 @@ def test_ground_date_adds_snapshot_without_changing_existing_layer_filter(monkey
     dock._emit_ground_view()
     assert requested == ["2026-09-02T00:00:00Z", "2026-09-02T00:00:00Z"]
     assert dock.as_of() is None
-    assert not hasattr(dock, "clear_asof_button")
-    assert not hasattr(dock, "history_button")
+    # The Qt stub dynamically supplies unknown methods, so hasattr is not a
+    # widget-presence check. These buttons must not be created on the instance.
+    assert "clear_asof_button" not in vars(dock)
+    assert "history_button" not in vars(dock)
 
 
 def test_restoring_applied_date_after_rejected_change_does_not_emit_another_request(monkeypatch):
