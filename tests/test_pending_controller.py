@@ -55,6 +55,8 @@ class Feature:
 class EditBuffer:
     def __init__(self, name=None):
         self.added = {-1: Feature(name)} if name is not None else {}
+        self.added_fields = []
+        self.deleted_fields = []
 
     def addedFeatures(self):  # noqa: N802
         return self.added
@@ -69,10 +71,10 @@ class EditBuffer:
         return set()
 
     def addedAttributes(self):  # noqa: N802
-        return []
+        return self.added_fields
 
     def deletedAttributeIds(self):  # noqa: N802
-        return []
+        return self.deleted_fields
 
 
 class Layer:
@@ -89,6 +91,8 @@ class Layer:
             "featureDeleted",
             "geometryChanged",
             "attributeValueChanged",
+            "attributeAdded",
+            "attributeDeleted",
             "beforeCommitChanges",
             "afterCommitChanges",
             "afterRollBack",
@@ -120,13 +124,22 @@ class Layer:
         return self.editable
 
     def isModified(self):  # noqa: N802
-        return bool(self.buffer.added)
+        return bool(self.buffer.added or self.buffer.added_fields or self.buffer.deleted_fields)
 
     def editBuffer(self):  # noqa: N802
         return self.buffer
 
     def fields(self):
-        return [SimpleNamespace(name=lambda: "name")]
+        return [SimpleNamespace(name=lambda: "name"), *self.buffer.added_fields]
+
+    def providerType(self):  # noqa: N802
+        return "oapif"
+
+    def dataProvider(self):  # noqa: N802
+        return SimpleNamespace(reset_write_session=lambda: None, last_refresh_error="")
+
+    def updateFields(self):  # noqa: N802
+        pass
 
     def crs(self):
         return SimpleNamespace(authid=lambda: "EPSG:4326", toWkt=lambda: "WGS 84")
@@ -136,6 +149,7 @@ class Layer:
         self.beforeCommitChanges.emit(stop_editing)
         self.afterCommitChanges.emit()
         self.buffer.added.clear()
+        self.buffer.added_fields.clear()
         return True
 
 
@@ -343,3 +357,189 @@ def test_restore_accepts_qgis_from_wkb_void_return(controller, monkeypatch):
     assert len(restored) == 1
     assert restored[0].attributes == {"name": "original edit"}
     assert restored[0].geometry.value.hex() == document["operations"][0]["geometry"]
+
+
+def _new_field(name="Inspection note"):
+    return SimpleNamespace(
+        name=lambda: name,
+        type=lambda: 10,
+        typeName=lambda: "Text",
+        subType=lambda: 0,
+        length=lambda: 80,
+        precision=lambda: 0,
+        comment=lambda: "Original local definition",
+    )
+
+
+def test_saved_field_definition_restores_type_length_precision_and_comment(monkeypatch):
+    captured = []
+    monkeypatch.setattr(pending, "QVariant", SimpleNamespace(Type=int))
+    monkeypatch.setattr(pending, "QgsField", lambda *args: captured.append(args) or args)
+    definition = pending._encode_field(_new_field())
+    pending._decode_field(definition)
+    assert captured == [("Inspection note", 10, "Text", 80, 0, "Original local definition", 0)]
+
+
+def test_native_added_field_is_journaled_without_feature_edits(controller):
+    layer = Layer(name=None)
+    layer.providerType = lambda: pending.layers.CLASS_PROVIDER
+    controller.watch_layers([layer])
+    layer.buffer.added_fields.append(_new_field())
+    revision = controller.revisions.get(layer.id(), 0)
+    layer.attributeAdded.emit(1)
+    assert controller.revisions[layer.id()] == revision + 1
+    document = controller.snapshot(layer)
+    assert document["operations"] == []
+    assert document["added_fields"] == [
+        {
+            "name": "Inspection note",
+            "type": 10,
+            "type_name": "Text",
+            "sub_type": 0,
+            "length": 80,
+            "precision": 0,
+            "comment": "Original local definition",
+        }
+    ]
+    assert controller.store.load(document["id"])["added_fields"] == document["added_fields"]
+    assert "Unpushed: 1" in layer.name()
+    # Adding a column itself sends no feature request, so a local save cannot
+    # have produced an ambiguous server mutation.
+    assert controller.before_commit(layer)
+    assert controller.documents[layer.id()]["state"] == "pending"
+
+
+def test_partial_native_save_keeps_added_field_definition_until_feature_save_acknowledged(
+    controller,
+):
+    layer = Layer()
+    layer.providerType = lambda: pending.layers.CLASS_PROVIDER
+    controller.watch_layers([layer])
+    field = _new_field()
+    layer.buffer.added_fields.append(field)
+    layer.buffer.added[-1].attributes["Inspection note"] = "Not sent yet"
+    original = controller.snapshot(layer)
+    assert controller.before_commit(layer)
+    # Native commit succeeds at the schema stage but fails while writing the
+    # feature. The field now belongs to the provider, not the edit buffer.
+    layer.buffer.added_fields.clear()
+    layer.fields = lambda: [SimpleNamespace(name=lambda: "name"), field]
+    recovered = controller.snapshot(layer)
+    assert recovered["state"] == "uncertain"
+    assert recovered["added_fields"] == original["added_fields"]
+    assert recovered["operations"][0]["attributes"]["Inspection note"] == "Not sent yet"
+    persisted = controller.store.load(recovered["id"])
+    assert persisted["added_fields"] == original["added_fields"]
+    # Repeated snapshots must not accumulate duplicate field definitions.
+    assert controller.snapshot(layer)["added_fields"] == original["added_fields"]
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_undo_or_cancel_discards_only_unsubmitted_field_only_recovery(controller, cancel):
+    layer = Layer(name=None)
+    layer.providerType = lambda: pending.layers.CLASS_PROVIDER
+    controller.watch_layers([layer])
+    layer.buffer.added_fields.append(_new_field())
+    controller.snapshot(layer)
+    layer.buffer.added_fields.clear()
+    if cancel:
+        controller.rolled_back(layer)
+    else:
+        layer.attributeDeleted.emit(1)
+        assert controller.snapshot(layer) is None
+    assert controller.store.list() == []
+
+
+def test_deleted_schema_and_legacy_added_schema_are_still_refused(controller):
+    layer = Layer(name=None)
+    layer.buffer.added_fields.append(_new_field())
+    with pytest.raises(ValueError, match="Field/schema"):
+        controller.snapshot(layer)
+    layer.providerType = lambda: pending.layers.CLASS_PROVIDER
+    layer.buffer.deleted_fields.append(0)
+    with pytest.raises(ValueError, match="Field/schema"):
+        controller.snapshot(layer)
+
+
+def test_restore_adds_native_field_within_edit_command_before_feature_values(
+    controller, monkeypatch
+):
+    layer = Layer(name=None)
+    layer.providerType = lambda: pending.layers.CLASS_PROVIDER
+    controller.watch_layers([layer])
+    layer.buffer.added_fields.append(_new_field())
+    document = controller.snapshot(layer)
+    document["operations"] = [
+        {"kind": "create", "attributes": {"Inspection note": "Needs review"}, "geometry": None}
+    ]
+    layer.buffer.added_fields.clear()
+    events = []
+    layer.dataProvider = lambda: SimpleNamespace(
+        reloadData=lambda: None, field_definitions=lambda: [], last_refresh_error=""
+    )
+    layer.beginEditCommand = lambda _name: events.append("begin")
+    layer.endEditCommand = lambda: events.append("end")
+    layer.destroyEditCommand = lambda: events.append("destroy")
+    layer.triggerRepaint = lambda: None
+
+    def add_field(field):
+        events.append("field")
+        layer.buffer.added_fields.append(field)
+        return True
+
+    class RestoredFeature:
+        def __init__(self, fields):
+            assert "Inspection note" in [field.name() for field in fields]
+            self.attributes = {}
+
+        def setAttribute(self, name, value):  # noqa: N802
+            self.attributes[name] = value
+
+    restored = []
+    layer.addAttribute = add_field
+    layer.addFeature = lambda feature: restored.append(feature) or events.append("feature") or True
+    monkeypatch.setattr(pending, "_decode_field", lambda _definition: _new_field())
+    monkeypatch.setattr(pending, "QgsFeature", RestoredFeature)
+    controller._restore(layer, document)
+    assert events == ["begin", "field", "feature", "end"]
+    assert restored[0].attributes == {"Inspection note": "Needs review"}
+
+
+def test_restore_reuses_inferred_source_column_without_duplicate_field(controller, monkeypatch):
+    layer = Layer(name=None)
+    layer.providerType = lambda: pending.layers.CLASS_PROVIDER
+    controller.watch_layers([layer])
+    layer.buffer.added_fields.append(_new_field())
+    document = controller.snapshot(layer)
+    document["operations"] = [
+        {"kind": "create", "attributes": {"Inspection note": "Kept"}, "geometry": None}
+    ]
+    layer.buffer.added_fields.clear()
+    wire_name = "src_" + b"Inspection note".hex()
+    layer.fields = lambda: [_new_field(wire_name)]
+    layer.dataProvider = lambda: SimpleNamespace(
+        reloadData=lambda: None,
+        last_refresh_error="",
+        field_definitions=lambda: [
+            {"origin": "src", "source_name": "Inspection note", "name": wire_name}
+        ],
+    )
+    layer.beginEditCommand = lambda _name: None
+    layer.endEditCommand = lambda: None
+    layer.destroyEditCommand = lambda: None
+    layer.triggerRepaint = lambda: None
+    layer.addAttribute = lambda _field: pytest.fail("Should reuse the existing source column")
+    restored = []
+
+    class RestoredFeature:
+        def __init__(self, _fields):
+            self.attributes = {}
+
+        def setAttribute(self, name, value):  # noqa: N802
+            self.attributes[name] = value
+
+    layer.addFeature = lambda feature: restored.append(feature) or True
+    monkeypatch.setattr(pending, "_decode_field", lambda _definition: _new_field())
+    monkeypatch.setattr(pending, "QgsFeature", RestoredFeature)
+    controller._restore(layer, document)
+    assert restored[0].attributes == {wire_name: "Kept"}

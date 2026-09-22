@@ -8,31 +8,54 @@ accepts several geometry families has separate point, line and polygon child lay
 multipart features stay in their corresponding family. Source attributes appear as
 ordinary editable columns using the original field names as aliases. New features
 receive the layer's class automatically.
+Generated layer names start with **CVI** so they remain recognizable outside a
+group. Existing generated names update on connection; custom user names are kept.
 
 **Add read only layers** uses those same class layers and attribute columns, with
 editing disabled. Read-only and editable copies can coexist in the project. On
 older servers, the read-only action keeps using the legacy current-label views.
+
+On servers advertising `native_add_field`, editable class layers support QGIS's
+native **New field / Add Field** action in the attribute table. Enter a name and
+type, edit values, then use **Save Layer Edits** as usual. Adding a field is local;
+feature saves write its values into the existing JSON source attributes. There is
+no separate column-creation API or database migration. Other clients discover the
+column from saved data when they reconnect. Text, integer, decimal, boolean, date
+and date/time columns are supported; JSON stores dates as text. A column that has
+no saved values has no inferable server type. Local column definitions survive in
+the saved QGIS project, and uncommitted fields and values use the recovery journal.
+
+**Remove unused fields on import**, under **Label layers**, is enabled by default.
+When adding supported class layers, optional attributes that are NULL/missing on
+every feature in that class and geometry family are omitted from the local layer.
+The decision covers the whole selected track, not just the visible map. Zero,
+false and empty text count as values. Server data and required identity fields are
+retained. Turn the option off before adding layers to include all discovered
+attributes. It does not remove columns from an active editing session or prune a
+newly added local field when refreshing.
 
 New classes and fields are discovered on Connect. Save or recover pending edits before
 reconnecting to load a changed field schema; existing dirty layers are never replaced.
 Local uploads continue through the established bulk API, preserving all source data.
 Servers without the new capability keep the existing geometry-layer interface. An
 authentication, network or malformed-capability error is reported rather than silently
-downgrading. Version 0.2.0 is distributed through the usual stable plugin repository.
+downgrading. Version 0.3.0 is distributed through the usual stable plugin repository.
 The new backend capability is enabled on development servers first; the same plugin
 keeps the legacy interface on production servers until they advertise support.
 Use a separate QGIS profile when testing the development server so your production
 project and saved connection stay separate.
 
-The **History track** selector is collapsed at the bottom of the panel. The current
-track remains visible beneath the connection controls.
+The **History track** selector is collapsed at the bottom of the panel, immediately
+below **Bootstrap**. The current track remains visible beneath the connection controls.
 
 A QGIS 3.44 plugin for a bitemporal geospatial labeling backend that speaks
 **OGC API - Features** (Parts 1, 2 and 4).
 
-It is deliberately thin. QGIS's native OAPIF provider already reads *and* writes vector
-features with no plugin code at all, so this plugin covers the things QGIS
-cannot do on its own.
+Legacy layers use QGIS's native OAPIF provider. Capability-enabled class layers use
+the plugin's provider to support native field creation and JSON-backed columns;
+the attribute table, edit buffer, undo and digitising remain native QGIS controls.
+These class layers load their collection into a local in-memory cache, then save
+feature edits through the authenticated API with revision conflict checks.
 
 ---
 
@@ -48,8 +71,9 @@ cannot do on its own.
 | **QA** — a label's edit history, and a survey-coverage check | Both are questions about the backend's schema, not about the map |
 | **Bootstrap** — publishes the local vector layers already open in the project as the founding dataset | The provider edits a collection it is already connected to. It has no concept of a shapefile that has never been part of one, and no way to map a decade of ad-hoc column names onto a class registry |
 
-Everything else — feature reading, paging, bbox filtering, the attribute table, digitising,
-create/update/delete — is stock QGIS.
+The attribute table and digitising tools are stock QGIS. Class-provider caching and
+JSON field mapping are implemented by the plugin; legacy layers retain native
+OAPIF reading, paging and writes.
 
 ---
 
@@ -99,9 +123,10 @@ Open the **CVI Label Client** panel from the toolbar, then:
    controls. Survey extents are not offered in the add-layer UI. Imagery is managed
    outside this plugin.
 
-Nothing is stored anywhere except `QgsSettings` (URLs, page size, as-of state, the
-selected track, the signed-in address and the token's expiry instant — none of them a
-secret) and `qgis-auth.db` (the tokens). No credential is written to a project file.
+Preferences live in `QgsSettings`; credentials stay in `qgis-auth.db`. Saved QGIS
+projects retain layer configuration and locally added field definitions. Unpushed
+edits have private recovery journals in the QGIS profile. No credential is written
+to a project file or an edit journal.
 
 ### Upgrading an existing profile after the deployment moves
 
@@ -438,7 +463,7 @@ current state, switch mechanisms — that is the symptom.
 
 The other axis. **Transaction time** is when the team *believed* something, as distinct from
 when it was true on the ground. Ticking **Pin a historical layer to an instant** in the
-panel's *Historical view (transaction time)* box and pressing **Add historical layer** gives
+panel's *Dataset as saved on a date* box and pressing **Add historical layer** gives
 you a layer showing the labels as the team believed them at that instant — **including
 labels deleted since, and the superseded geometry of labels edited since**.
 

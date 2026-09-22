@@ -433,7 +433,7 @@ def unpinned_warning(collection_id: str) -> str:
         f"{collection_id!r} serves the world as it was BELIEVED at a chosen instant, so it "
         "cannot be loaded from the collection list: a layer built that way carries no "
         "instant, and the server would answer it with the current state under a name that "
-        "says otherwise. Use 'Historical view (transaction time)' in the panel, which "
+        "says otherwise. Use 'Dataset as saved on a date' in the panel, which "
         "pins the instant into the layer's own data source."
     )
 

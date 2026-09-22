@@ -2,9 +2,10 @@
 
 HOW LITTLE OF THIS IS DATA ACCESS
 
-None of it. QGIS's native ``OAPIF`` provider does the reading, the paging, the bbox
-filtering and -- through Part 4 -- the create, update and delete. What the plugin adds is
-the three things the provider has no way to know:
+Legacy layers use QGIS's native ``OAPIF`` provider for reads and writes. Servers
+advertising native field creation use :mod:`.classprovider`, which maps ordinary
+QGIS columns to JSON attributes. This module chooses the provider and adds the
+context either provider needs:
 
 * which collection, with which credential and which as-of filter (:mod:`.core.uri`);
 * **which history track**, which has to be in the layer's own data source rather than in
@@ -103,6 +104,7 @@ COLLECTION_PROPERTY = "cvi/collection_id"
 #: is loaded against what is selected and say so.
 TRACK_PROPERTY = "cvi/track"
 GENERATED_RENDERER_PROPERTY = "cvi/generated_renderer"
+GENERATED_NAME_PROPERTY = "cvi/generated_name"
 
 #: The transaction-time instant a layer is a view of, or absent for a live layer.
 #:
@@ -115,6 +117,66 @@ RECORDED_AT_PROPERTY = "cvi/recorded_at"
 
 #: OAPIF provider key. QGIS registers it from the WFS provider library.
 OAPIF_PROVIDER = "OAPIF"
+CLASS_PROVIDER = "cvi_class"
+
+
+def plugin_layer_title(title: str) -> str:
+    """Make plugin ownership visible without doubling an existing prefix."""
+    return title if title == "CVI" or title.startswith("CVI ") else f"CVI {title}"
+
+
+def refresh_plugin_layer_title(layer: QgsVectorLayer, display_name: str = "") -> bool:
+    """Prefix generated captions only; a user's renamed layer stays theirs."""
+    generated = str(layer.customProperty(GENERATED_NAME_PROPERTY, ""))
+    if not generated:
+        metadata = class_layer_metadata(layer)
+        generated = display_name or str(metadata.get("title") or metadata.get("class_name") or "")
+        if not generated:
+            return False
+        if metadata and layer.customProperty("cvi/read_only_view", False):
+            generated += " (read only)"
+        moment = recorded_at_of(layer)
+        if moment:
+            generated = recorded.layer_name(
+                moment, recorded.base_name(generated, collection_of(layer))
+            )
+    current = layer.name()
+    title, suffix = current, ""
+    if layer.customProperty("cvi/pending_state", "") and " [Unpushed:" in current:
+        title, marker, rest = current.partition(" [Unpushed:")
+        suffix = marker + rest
+    if title not in {generated, plugin_layer_title(generated)}:
+        return False
+    replacement = plugin_layer_title(generated)
+    layer.setCustomProperty(GENERATED_NAME_PROPERTY, replacement)
+    if suffix:
+        layer.setCustomProperty("cvi/pending_original_name", replacement)
+    if replacement + suffix == current:
+        return False
+    layer.setName(replacement + suffix)
+    return True
+
+
+def class_provider_uri(uri: str, *, remove_unused: bool, read_only: bool = False) -> str:
+    source = QgsDataSourceUri(uri)
+    source.removeParam("removeUnusedFields")
+    source.setParam("removeUnusedFields", "1" if remove_unused else "0")
+    source.removeParam("cviReadOnly")
+    source.setParam("cviReadOnly", "1" if read_only else "0")
+    return source.uri(False)
+
+
+def _preserve_class_options(layer: QgsVectorLayer, uri: str) -> str:
+    """Keep local column names/types and the import choice across reconnects."""
+    if layer.providerType() != CLASS_PROVIDER:
+        return uri
+    old = QgsDataSourceUri(layer.dataProvider().dataSourceUri())
+    source = QgsDataSourceUri(uri)
+    for key in ("removeUnusedFields", "cviReadOnly", "localFields", "uncertainCreate"):
+        if old.hasParam(key):
+            source.removeParam(key)
+            source.setParam(key, old.param(key))
+    return source.uri(False)
 
 
 def landing_url(
@@ -326,6 +388,9 @@ def create_layer(
     registry: ClassRegistry | None = None,
     track: Track | None = None,
     recorded_at: str = "",
+    *,
+    class_metadata: dict | None = None,
+    read_only: bool = False,
 ) -> QgsVectorLayer:
     """Build a vector layer for one collection. Raises if the provider rejects it.
 
@@ -341,7 +406,19 @@ def create_layer(
     the new provider's capabilities.
     """
     uri = build_layer_uri(settings, collection_id, registry, track, recorded_at=recorded_at)
-    layer = QgsVectorLayer(uri, display_name, OAPIF_PROVIDER)
+    provider = OAPIF_PROVIDER
+    if class_metadata and class_metadata.get("native_add_field") is True and not recorded_at:
+        from .classprovider import register_provider
+
+        register_provider()
+        provider = CLASS_PROVIDER
+        uri = class_provider_uri(
+            uri,
+            remove_unused=bool(settings.get("remove_unused_fields_on_import")),
+            read_only=read_only,
+        )
+    title = plugin_layer_title(display_name)
+    layer = QgsVectorLayer(uri, title, provider)
     if not layer.isValid():
         raise BackendError(
             f"QGIS could not open collection {collection_id!r}. "
@@ -362,6 +439,7 @@ def create_layer(
         # name asserting a past instant.
         raise BackendError(recorded.cannot_be_pinned(collection_id, fields))
     layer.setCustomProperty(COLLECTION_PROPERTY, collection_id)
+    layer.setCustomProperty(GENERATED_NAME_PROPERTY, title)
     if track is not None:
         layer.setCustomProperty(TRACK_PROPERTY, track.name)
     if recorded_at:
@@ -410,6 +488,20 @@ def apply_canaries(
     track_clause = track_filter_for(layer, track, registry)
     if not track_clause:
         return False
+    if layer.providerType() == CLASS_PROVIDER:
+        uri = build_layer_uri(
+            settings,
+            collection_of(layer),
+            registry,
+            track,
+            track_filter=track_clause,
+            recorded_at=recorded_at,
+        )
+        # The complete class cache is already loaded. Apply the canary locally
+        # instead of downloading it a second time to rebuild the provider.
+        if not layer.setSubsetString(QgsDataSourceUri(uri).param("filter")):
+            raise BackendError("Could not apply the class layer's track filter.")
+        return True
     repoint_layer(
         layer,
         build_layer_uri(
@@ -435,7 +527,9 @@ def validate_repoint(layer, settings, registry, track) -> None:
         track_filter=track_filter_for(layer, track, registry),
         recorded_at=recorded_at,
     )
-    candidate = QgsVectorLayer(uri, layer.name(), OAPIF_PROVIDER)
+    candidate = QgsVectorLayer(
+        _preserve_class_options(layer, uri), layer.name(), layer.providerType()
+    )
     if not candidate.isValid():
         raise BackendError(f"Could not open the proposed view for {layer.name()!r}.")
     verify_recorded_echo(candidate, recorded_at, registry)
@@ -446,6 +540,8 @@ def repoint_for(
     settings: PluginSettings,
     registry: ClassRegistry | None,
     track: Track | None,
+    *,
+    class_metadata: dict | None = None,
 ) -> None:
     """Re-point an already-loaded layer at the current track and as-of state. Once.
 
@@ -464,17 +560,34 @@ def repoint_for(
     layer to ask.
     """
     recorded_at = recorded_at_of(layer)
-    repoint_layer(
-        layer,
-        build_layer_uri(
-            settings,
-            collection_of(layer),
-            registry,
-            track,
-            track_filter=track_filter_for(layer, track, registry),
-            recorded_at=recorded_at,
-        ),
+    uri = build_layer_uri(
+        settings,
+        collection_of(layer),
+        registry,
+        track,
+        track_filter=track_filter_for(layer, track, registry),
+        recorded_at=recorded_at,
     )
+    provider = None
+    if (
+        class_metadata
+        and class_metadata.get("native_add_field") is True
+        and layer.providerType() == OAPIF_PROVIDER
+        and not recorded_at
+    ):
+        from .classprovider import register_provider
+
+        register_provider()
+        uri = class_provider_uri(
+            uri,
+            remove_unused=bool(settings.get("remove_unused_fields_on_import")),
+            read_only=bool(layer.customProperty("cvi/read_only_view", False)),
+        )
+        provider = CLASS_PROVIDER
+    if provider is None:
+        repoint_layer(layer, uri)
+    else:
+        repoint_layer(layer, uri, provider=provider)
     layer.setCustomProperty(TRACK_PROPERTY, track.name if track is not None else "")
     if recorded_at:
         # setDataSource rebuilt the provider, and QGIS recomputes a layer's read-only state
@@ -791,7 +904,7 @@ def find_extent_layer(
     return find_layer_with_fields((registry.fields.class_id, registry.fields.completeness), project)
 
 
-def repoint_layer(layer: QgsVectorLayer, uri: str) -> None:
+def repoint_layer(layer: QgsVectorLayer, uri: str, *, provider: str | None = None) -> None:
     """Swap a layer's data source, keeping its styling and form configuration.
 
     ``setDataSource`` rebuilds the provider, and the renderer, field aliases and editor
@@ -808,7 +921,13 @@ def repoint_layer(layer: QgsVectorLayer, uri: str) -> None:
         raise BackendError(f"Could not save the style of {layer.name()!r} before re-pointing.")
 
     options = QgsDataProvider.ProviderOptions()
-    layer.setDataSource(uri, layer.name(), OAPIF_PROVIDER, options, False)
+    layer.setDataSource(
+        _preserve_class_options(layer, uri),
+        layer.name(),
+        provider or layer.providerType(),
+        options,
+        False,
+    )
 
     if not layer.isValid():
         raise BackendError(f"Could not open the new provider for {layer.name()!r}.")
@@ -845,7 +964,7 @@ def repair_track_auth(layer: QgsVectorLayer, authcfg: str, backend_url: str) -> 
 
 def belongs_to_backend(layer: QgsVectorLayer, backend_url: str) -> bool:
     """Keep credentials and track changes away from another saved connection."""
-    if not is_plugin_layer(layer) or layer.providerType() != OAPIF_PROVIDER:
+    if not is_plugin_layer(layer) or layer.providerType() not in {OAPIF_PROVIDER, CLASS_PROVIDER}:
         return False
     uri = QgsDataSourceUri(layer.source())
     try:
@@ -1331,8 +1450,20 @@ def refresh_class_layer_after_commit(layer: QgsVectorLayer) -> bool:
         layer.updateExtents()
     else:
         layer.reload()
+    if layer.providerType() == CLASS_PROVIDER:
+        check_class_refresh(layer)
+        layer.updateFields()
+        configure_class_columns(layer, class_layer_metadata(layer))
     layer.triggerRepaint()
     return True
+
+
+def check_class_refresh(layer: QgsVectorLayer) -> None:
+    """A retained cache after an HTTP failure must not look like a fresh read."""
+    if layer.providerType() == CLASS_PROVIDER:
+        error = layer.dataProvider().last_refresh_error
+        if error:
+            raise BackendError(error)
 
 
 def configure_class_columns(layer: QgsVectorLayer, metadata: dict) -> None:
@@ -1340,7 +1471,10 @@ def configure_class_columns(layer: QgsVectorLayer, metadata: dict) -> None:
     layer.setCustomProperty(classlayers.METADATA_PROPERTY, json.dumps(metadata, ensure_ascii=False))
     config = layer.editFormConfig()
     fields = layer.fields()
-    for spec in metadata.get("fields", []):
+    definitions = metadata.get("fields", [])
+    if layer.providerType() == CLASS_PROVIDER:
+        definitions = layer.dataProvider().field_definitions()
+    for spec in definitions:
         index = fields.indexOf(spec["name"])
         if index < 0:
             continue

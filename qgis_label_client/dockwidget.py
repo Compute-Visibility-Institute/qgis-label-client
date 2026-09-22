@@ -167,8 +167,8 @@ class LabelClientDock(QDockWidget):
     """Connection, class layers, both time axes and QA, in one persistent panel.
 
     THE TWO TIME CONTROLS ARE TWO BOXES, and that is a design decision rather than a
-    layout one. "As-of date (valid time)" asks what was true on the ground; "Historical
-    view (transaction time)" asks what the team believed. Merging them into one control
+    layout one. "Labels valid on a date" asks what was true on the ground; "Dataset
+    as saved on a date" asks what the team believed. Merging them into one control
     with a mode switch would hide the single most important thing about the pair.
     """
 
@@ -181,6 +181,7 @@ class LabelClientDock(QDockWidget):
     copyAddressRequested = pyqtSignal()
     loadLayersRequested = pyqtSignal(list)
     loadReadOnlyLayersRequested = pyqtSignal(list)
+    removeUnusedFieldsChanged = pyqtSignal(bool)
     asOfApplied = pyqtSignal()
     #: The transaction-time axis. Carries the rendered wire instant rather than a QDateTime
     #: so that the conversion happens exactly once, in core.recorded.instant, and the panel
@@ -235,7 +236,6 @@ class LabelClientDock(QDockWidget):
         self.track_banner.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(self.track_banner)
         layout.addWidget(self._build_collections_group(container))
-        layout.addWidget(self._build_bootstrap_group(container))
         layout.addWidget(self._build_asof_group(container))
         # Immediately below, and never inside it. Two time axes, two boxes -- see
         # _build_recorded_group.
@@ -253,6 +253,7 @@ class LabelClientDock(QDockWidget):
         layout.addWidget(self._build_qa_group(container))
         layout.addWidget(self._build_vocabulary_group(container))
         layout.addWidget(self._build_reference_group(container))
+        layout.addWidget(self._build_bootstrap_group(container))
         layout.addWidget(self._build_track_group(container))
 
         layout.addStretch(1)
@@ -402,6 +403,15 @@ class LabelClientDock(QDockWidget):
         self.load_button.setToolTip("Add separate class layers when supported by the server.")
         self.load_button.clicked.connect(self._emit_load_layers)
         layout.addWidget(self.load_button)
+
+        self.remove_unused_fields_checkbox = QCheckBox("Remove unused fields on import", group)
+        self.remove_unused_fields_checkbox.setChecked(True)
+        self.remove_unused_fields_checkbox.setToolTip(
+            "When adding label layers from the server, omit optional attributes whose values "
+            "are all NULL. Empty text, zero and false are kept. Server data is unchanged."
+        )
+        self.remove_unused_fields_checkbox.toggled.connect(self.removeUnusedFieldsChanged)
+        layout.addWidget(self.remove_unused_fields_checkbox)
         return group
 
     def _build_reference_group(self, parent: QWidget) -> QWidget:
@@ -449,7 +459,8 @@ class LabelClientDock(QDockWidget):
         return group
 
     def _build_asof_group(self, parent: QWidget) -> QWidget:
-        group = _collapsible("As-of date (valid time)", parent)
+        group = _collapsible("Labels valid on a date", parent)
+        group.setToolTip("Valid time: when the labels describe what was on the ground.")
         layout = QVBoxLayout(group)
 
         hint = QLabel(
@@ -512,11 +523,14 @@ class LabelClientDock(QDockWidget):
         control. That is the whole use case: the live layer and a historical one open at
         once, and two historical ones at different instants if you want to compare beliefs.
         """
-        group = _collapsible("Historical view (transaction time)", parent)
+        group = _collapsible("Dataset as saved on a date", parent)
+        group.setToolTip(
+            "Transaction time: what the server contained then, before later edits or corrections."
+        )
         layout = QVBoxLayout(group)
 
         hint = QLabel(
-            "Add a read-only layer showing what the team believed at a chosen time.",
+            "Add a read-only layer showing what the server contained at a chosen time.",
             group,
         )
         hint.setWordWrap(True)
@@ -640,6 +654,7 @@ class LabelClientDock(QDockWidget):
             available and bool(self._editable_collection_ids) and self._write_access is not False
         )
         self.connect_button.setEnabled(not self._busy)
+        self.remove_unused_fields_checkbox.setEnabled(not self._busy)
         self.track_combo.setEnabled(available)
         self.publish_button.setEnabled(available and self._write_access is not False)
         # Gated on the checkbox as well as the connection: it is the one button here that
@@ -681,6 +696,9 @@ class LabelClientDock(QDockWidget):
 
     def set_api_url(self, url: str) -> None:
         self.url_edit.setText(url)
+
+    def set_remove_unused_fields(self, enabled: bool) -> None:
+        self.remove_unused_fields_checkbox.setChecked(enabled)
 
     def as_of(self) -> date | None:
         if not self.asof_enabled.isChecked():

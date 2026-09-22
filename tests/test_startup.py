@@ -32,6 +32,9 @@ class Layer:
     def dataProvider(self):  # noqa: N802
         return self
 
+    def providerType(self):  # noqa: N802
+        return "OAPIF"
+
     def reloadData(self):  # noqa: N802
         self.reloads += 1
 

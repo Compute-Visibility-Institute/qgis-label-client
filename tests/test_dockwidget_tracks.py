@@ -30,8 +30,8 @@ def test_history_track_is_the_last_panel_section(monkeypatch):
 
         monkeypatch.setattr(LabelClientDock, method_name, build)
     dock = LabelClientDock(None)
-    assert sections[-1] == "track"
-    assert sections.index("reference") < sections.index("track")
+    assert sections[-2:] == ["bootstrap", "track"]
+    assert sections.index("reference") < sections.index("bootstrap")
     assert "refresh_imagery_button" not in vars(dock)
 
 

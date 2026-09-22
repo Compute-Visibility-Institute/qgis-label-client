@@ -169,6 +169,50 @@ class Fixture:
     def handle(self, method: str, path: str, body: dict | None) -> tuple[int, dict, dict]:
         parts = unquote(urlsplit(path).path).strip("/").split("/")
         self.requests.append({"method": method, "path": path, "body": body})
+        if parts == ["v1", "class-layers"]:
+            collections = []
+            for key, value in self.contract["collections"].items():
+                if not key.startswith("cl_"):
+                    continue
+                definitions = copy.deepcopy(value["fields"])
+                known = {field["name"] for field in definitions}
+                rows = list(self.records[key].values())
+                for row in rows:
+                    for name, item in row["properties"].items():
+                        if name in known or not name.startswith("src_"):
+                            continue
+                        source = bytes.fromhex(name[4:]).decode("utf-8")
+                        definitions.append(
+                            {
+                                "name": name,
+                                "title": source,
+                                "source_name": source,
+                                "origin": "src",
+                                "read_only": False,
+                                "type": (
+                                    "boolean"
+                                    if isinstance(item, bool)
+                                    else "integer"
+                                    if isinstance(item, int)
+                                    else "number"
+                                    if isinstance(item, float)
+                                    else "string"
+                                ),
+                            }
+                        )
+                        known.add(name)
+                for field in definitions:
+                    field["has_values"] = any(
+                        row["properties"].get(field["name"]) is not None for row in rows
+                    )
+                collections.append(
+                    {
+                        **value["spec"],
+                        "fields": definitions,
+                        "native_add_field": True,
+                    }
+                )
+            return 200, {"enabled": True, "version": 1, "collections": collections}, {}
         if parts == ["class-layers"]:
             return (
                 200,
@@ -276,6 +320,12 @@ class Fixture:
                 feature = copy.deepcopy(body)
                 feature["id"] = f"{self.created}.{'a' * 24}"
                 feature["properties"]["revision"] = "a" * 24
+                feature["properties"].update(
+                    label_id=f"00000000-0000-4000-8000-{self.created:012d}",
+                    class_id=self.contract["collections"][collection]["spec"]["class_id"],
+                    track_id="00000000-0000-4000-8000-000000000099",
+                    updated_at="2026-09-22T00:00:00Z",
+                )
                 records[feature["id"]] = feature
                 return (
                     201,
@@ -311,7 +361,7 @@ class Fixture:
                     continue
                 previous = baseline["properties"].get(key)
                 actual = current["properties"].get(key)
-                if value != previous:
+                if key not in baseline["properties"] or value != previous:
                     if actual != previous and actual != value:
                         return 409, {"detail": "Concurrent field change"}, {}
                     feature["properties"][key] = value
@@ -332,6 +382,206 @@ class Fixture:
                 {"Location": self.root + "/collections/" + collection + "/items/" + feature["id"]},
             )
         return 405, {"detail": "Unsupported fixture operation"}, {}
+
+
+def exercise_native_fields(fixture, layers, checks, profile):
+    """Exercise the actual native Add Field/edit-buffer lifecycle, not mocks."""
+    from qgis.core import (
+        Qgis,
+        QgsDataSourceUri,
+        QgsFeature,
+        QgsField,
+        QgsGeometry,
+        QgsProject,
+        QgsVectorLayer,
+    )
+    from qgis.gui import QgsCollapsibleGroupBox
+    from qgis.PyQt.QtCore import QVariant
+
+    from qgis_label_client.classprovider import PROVIDER_KEY, register_provider
+    from qgis_label_client.core.uri import build_oapif_uri
+    from qgis_label_client.dockwidget import LabelClientDock
+    from qgis_label_client.layers import configure_class_columns
+    from qgis_label_client.plugin import LabelClientPlugin
+
+    register_provider()
+    dock = LabelClientDock()
+    groups = dock.findChildren(QgsCollapsibleGroupBox)
+    assert [group.title() for group in groups][-2:] == ["Bootstrap", "History track"]
+    assert dock.remove_unused_fields_checkbox.isChecked()
+    checks.append(
+        "Native Qt panel places Bootstrap above History track and defaults unused-field pruning on"
+    )
+    dock.close()
+    original = copy.deepcopy(fixture.records)
+    original_history = copy.deepcopy(fixture.history)
+    try:
+        for collection, doc in fixture.contract["collections"].items():
+            if not collection.startswith("cl_"):
+                continue
+            print("Native Add Field: " + collection, file=sys.stderr, flush=True)
+            # One logical label can have multiple valid-time rows. Both must load.
+            duplicate = copy.deepcopy(doc["features"][0])
+            duplicate["id"] = "700." + "b" * 24
+            duplicate["properties"]["valid_from"] = "2026-01-01T00:00:00Z"
+            fixture.records[collection][duplicate["id"]] = duplicate
+            base = build_oapif_uri(
+                landing_url=fixture.root + "?track=dev",
+                collection_id=collection,
+                restrict_to_request_bbox=False,
+            )
+            uri = QgsDataSourceUri(base)
+            uri.setParam("removeUnusedFields", "1")
+            layer = QgsVectorLayer(uri.uri(False), "Native " + collection, PROVIDER_KEY)
+            layers.append(layer)
+            assert layer.isValid(), (
+                collection,
+                layer.error().summary(),
+                layer.dataProvider().errors(),
+            )
+            data = layer.dataProvider()
+            configure_class_columns(layer, {**doc["spec"], "fields": data.field_definitions()})
+            features = list(layer.getFeatures())
+            assert len(features) == 3, (collection, len(features), data.errors())
+            label_ids = [feature["label_id"] for feature in features]
+            assert len(set(label_ids)) == 2, (
+                label_ids,
+                [feature.attributes() for feature in features],
+            )
+            assert len({feature.id() for feature in features}) == 3
+            year = "src_" + b"Year".hex()
+            assert layer.fields().indexOf(year) < 0
+            assert layer.fields().indexOf("attr_" + b"confirmed".hex()) >= 0
+            checks.append(
+                collection
+                + ": native provider loads distinct physical rows and prunes only null fields"
+            )
+
+            assert data.capabilities() & Qgis.VectorProviderCapability.AddAttributes
+            before = len(fixture.requests)
+            assert layer.startEditing()
+            assert layer.addAttribute(QgsField("Undo this", QVariant.String, "text"))
+            assert layer.fields().indexOf("Undo this") >= 0
+            layer.undoStack().undo()
+            assert layer.fields().indexOf("Undo this") < 0
+            assert layer.rollBack()
+            assert len(fixture.requests) == before, fixture.requests[before:]
+            checks.append(collection + ": native Add Field undo/cancel sends no server request")
+
+            column = "安装数量"
+            encoded = "src_" + column.encode("utf-8").hex()
+            assert layer.startEditing()
+            assert layer.addAttribute(QgsField(column, QVariant.Int, "integer"))
+            index = layer.fields().indexOf(column)
+            assert layer.changeAttributeValue(features[0].id(), index, 7)
+            moved = QgsGeometry(features[0].geometry())
+            moved.translate(0.0001, 0.0001)
+            assert layer.changeGeometry(features[0].id(), moved)
+            before = len(fixture.requests)
+            assert layer.commitChanges(), (collection, layer.commitErrors())
+            writes = [
+                request
+                for request in fixture.requests[before:]
+                if request["method"] in {"PUT", "POST"}
+            ]
+            assert len(writes) == 1, writes
+            assert writes[0]["body"]["properties"][encoded] == 7
+            assert "/fields" not in writes[0]["path"]
+            saved = next(
+                feature for feature in layer.getFeatures() if feature.id() == features[0].id()
+            )
+            assert saved[column] == 7
+            data.reloadData()
+            assert not data.last_refresh_error, data.last_refresh_error
+            layer.updateFields()
+            assert layer.fields().indexOf(column) == index
+            assert layer.fields()[index].type() == QVariant.Int
+            assert any(feature[column] == 7 for feature in layer.getFeatures())
+            checks.append(
+                collection
+                + ": native field plus geometry save uses one JSON PUT and survives reload"
+            )
+
+            assert layer.startEditing()
+            assert layer.addAttribute(QgsField("Empty integer", QVariant.Int, "integer"))
+            before = len(fixture.requests)
+            assert layer.commitChanges(), layer.commitErrors()
+            assert len(fixture.requests) == before
+            reconnect = QgsVectorLayer(data.dataSourceUri(), "Reconnect", PROVIDER_KEY)
+            layers.append(reconnect)
+            assert reconnect.isValid(), reconnect.dataProvider().errors()
+            assert reconnect.fields().indexOf("Empty integer") >= 0, (
+                data.dataSourceUri(),
+                data.local_fields(),
+                reconnect.fields().names(),
+                reconnect.dataProvider().local_fields(),
+            )
+            assert reconnect.fields().field("Empty integer").type() == QVariant.Int
+            assert reconnect.fields().field(column).type() == QVariant.Int
+            checks.append(
+                collection
+                + ": local all-null field type survives reconnect without a schema API call"
+            )
+
+            uri.removeParam("removeUnusedFields")
+            uri.setParam("removeUnusedFields", "0")
+            uri.setParam("cviReadOnly", "1")
+            readonly = QgsVectorLayer(uri.uri(False), "Read only full columns", PROVIDER_KEY)
+            layers.append(readonly)
+            assert readonly.isValid(), readonly.dataProvider().errors()
+            assert readonly.fields().indexOf(year) >= 0
+            assert not readonly.startEditing()
+            assert not readonly.dataProvider().addAttributes(
+                [QgsField("Forbidden", QVariant.String)]
+            )
+            checks.append(
+                collection
+                + ": disabling pruning restores null columns; read-only provider rejects native editing"
+            )
+
+            assert layer.startEditing()
+            added = QgsFeature(layer.fields())
+            added.setGeometry(QgsGeometry(features[0].geometry()))
+            added["valid_from"] = "2026-02-03T00:00:00Z"
+            added[column] = 11
+            assert layer.addFeature(added)
+            assert layer.commitChanges(), layer.commitErrors()
+            post = next(item for item in reversed(fixture.requests) if item["method"] == "POST")
+            assert post["body"]["properties"][encoded] == 11
+            assert post["body"]["properties"]["valid_from"] == "2026-02-03T00:00:00Z"
+            created = next(feature for feature in layer.getFeatures() if feature[column] == 11)
+            assert layer.startEditing()
+            assert layer.deleteFeature(created.id())
+            assert layer.commitChanges(), layer.commitErrors()
+            checks.append(
+                collection
+                + ": native create preserves date/typed field and native delete acknowledges revision"
+            )
+
+            project = QgsProject()
+            project_layer = QgsVectorLayer(
+                data.dataSourceUri(), "Saved native fields", PROVIDER_KEY
+            )
+            project.addMapLayer(project_layer)
+            project.writeMapLayer.connect(
+                lambda saved_layer, element, document: LabelClientPlugin._write_class_layer_source(
+                    None, saved_layer, element, document
+                )
+            )
+            project_path = str(Path(profile) / (collection + ".qgs"))
+            assert project.write(project_path)
+            reopened = QgsProject()
+            assert reopened.read(project_path)
+            restored = next(iter(reopened.mapLayers().values()))
+            assert restored.isValid(), restored.dataProvider().errors()
+            assert restored.fields().field("Empty integer").type() == QVariant.Int
+            assert restored.fields().field(column).type() == QVariant.Int
+            checks.append(collection + ": saved QGIS project restores committed local field schema")
+            reopened.clear()
+            project.clear()
+    finally:
+        fixture.records = original
+        fixture.history = original_history
 
 
 def run_native(contract: dict) -> dict:
@@ -390,6 +640,7 @@ def run_native(contract: dict) -> dict:
         thread.start()
         layers = []
         try:
+            exercise_native_fields(fixture, layers, checks, profile)
             for collection, doc in contract["collections"].items():
                 uri = build_oapif_uri(
                     landing_url=fixture.root + "?track=dev",

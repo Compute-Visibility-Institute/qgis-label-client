@@ -48,7 +48,11 @@ class LayerState:
             )
         return cls(
             layer,
-            layer.source(),
+            (
+                layer.dataProvider().dataSourceUri()
+                if layer.providerType() == layers.CLASS_PROVIDER
+                else layer.source()
+            ),
             layer.providerType(),
             style,
             layer.readOnly(),

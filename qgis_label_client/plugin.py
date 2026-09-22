@@ -118,6 +118,10 @@ class LabelClientPlugin:
     """Entry point QGIS instantiates once per load."""
 
     def __init__(self, iface) -> None:
+        # Saved class layers need their provider before QGIS reads a project.
+        from .classprovider import register_provider
+
+        register_provider()
         self.iface = iface
         self.settings = PluginSettings()
         self.activities = ActivityRegistry(self._sync_activity)
@@ -196,7 +200,7 @@ class LabelClientPlugin:
 
         self.recorded_action = QAction(
             QgsApplication.getThemeIcon("/mActionHistory.svg"),
-            "Historical view (transaction time)…",
+            "Dataset as saved on a date…",
             self.iface.mainWindow(),
         )
         self.recorded_action.setToolTip(
@@ -230,6 +234,11 @@ class LabelClientPlugin:
         self._apply_access()
         project = QgsProject.instance()
         project.readProject.connect(self._on_project_read)
+        project.writeMapLayer.connect(self._write_class_layer_source)
+        self.teardown.add(
+            "class layer project source",
+            lambda: project.writeMapLayer.disconnect(self._write_class_layer_source),
+        )
         self.teardown.add(
             "project access state", lambda: project.readProject.disconnect(self._on_project_read)
         )
@@ -322,6 +331,9 @@ class LabelClientPlugin:
         self.dock.loadReadOnlyLayersRequested.connect(
             lambda collection_ids: self.load_collections(collection_ids, read_only=True)
         )
+        self.dock.removeUnusedFieldsChanged.connect(
+            lambda enabled: self.settings.set("remove_unused_fields_on_import", enabled)
+        )
         self.dock.asOfApplied.connect(self.apply_as_of)
         self.dock.recordedViewRequested.connect(self.open_recorded_view)
         self.dock.historyRequested.connect(self.show_history)
@@ -333,6 +345,7 @@ class LabelClientPlugin:
         if self.dock is None:
             return
         self.dock.set_api_url(self.settings.api_base_url)
+        self.dock.set_remove_unused_fields(self.settings.get("remove_unused_fields_on_import"))
         self.dock.set_as_of(self.settings.as_of)
         self.dock.set_as_of_mechanism(self.settings.as_of_mechanism.value)
         # The picker's opening value only; the control stays disarmed. A remembered instant
@@ -462,7 +475,20 @@ class LabelClientPlugin:
         self._publish_backend_url = ""
 
     def _on_project_read(self, *_args):
+        for layer in layer_tools.plugin_layers():
+            layer_tools.refresh_plugin_layer_title(layer)
         self._refresh_access()
+
+    def _write_class_layer_source(self, layer, element, document):
+        """Save local field definitions without rebuilding an active edit buffer."""
+        if layer.providerType() != layer_tools.CLASS_PROVIDER or not layer.dataProvider():
+            return
+        source = element.firstChildElement("datasource")
+        if source.isNull():
+            return
+        while not source.firstChild().isNull():
+            source.removeChild(source.firstChild())
+        source.appendChild(document.createTextNode(layer.dataProvider().dataSourceUri()))
 
     def _current_write_access(self):
         expiry = self.settings.oauth_expires_at
@@ -1426,9 +1452,13 @@ class LabelClientPlugin:
         class_metadata = {
             c.collection_id: c.class_layer for c in self.collections if c.class_layer is not None
         }
+        collection_titles = {c.collection_id: c.display_name for c in self.collections}
         for layer in layer_tools.plugin_layers():
             if not layer_tools.belongs_to_backend(layer, self.settings.api_base_url):
                 continue
+            layer_tools.refresh_plugin_layer_title(
+                layer, collection_titles.get(layer_tools.collection_of(layer), "")
+            )
             track_authcfg = stored.get(layer_tools.track_of(layer))
             if track_authcfg:
                 try:
@@ -1449,7 +1479,12 @@ class LabelClientPlugin:
                         Qgis.MessageLevel.Warning,
                     )
                 else:
-                    layer_tools.repoint_for(layer, self.settings, self.registry, selected)
+                    if layer.providerType() != layer_tools.CLASS_PROVIDER:
+                        layer_tools.repoint_for(
+                            layer, self.settings, self.registry, selected, class_metadata=metadata
+                        )
+                    # Class providers append newly discovered columns during the
+                    # normal connection refresh without pruning existing ones.
                     layer_tools.configure_class_columns(layer, dict(metadata))
             refreshed = layer_tools.refresh_generated_style(layer, self.registry)
             if layer_tools.refresh_generated_captions(layer, self.registry) or refreshed:
@@ -1571,6 +1606,8 @@ class LabelClientPlugin:
                         title,
                         self.registry,
                         track,
+                        class_metadata=class_metadata.get(collection_id),
+                        read_only=view_only,
                     )
                 except LabelClientError as exc:
                     log_warning(str(exc))

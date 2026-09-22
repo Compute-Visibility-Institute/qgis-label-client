@@ -440,6 +440,7 @@ class QgsProject(Stub):
         self.layersAdded = Signal("layersAdded")
         self.layersWillBeRemoved = Signal("layersWillBeRemoved")
         self.readProject = Signal("readProject")
+        self.writeMapLayer = Signal("writeMapLayer")
         self._layers = {}
         self._filename = ""
 
@@ -584,6 +585,25 @@ _QTCORE_EXPLICIT = {
     "pyqtSignal": pyqtSignal,
     "pyqtSlot": pyqtSlot,
 }
+
+
+# Attribute-provider type maps are constructed when the plugin is imported.
+# Keep Qt's real scalar IDs here; generic enum namespaces are not integer types.
+class QVariant(Stub):
+    Invalid = 0
+    Bool = 1
+    Int = 2
+    UInt = 3
+    LongLong = 4
+    ULongLong = 5
+    Double = 6
+    String = 10
+    Date = 14
+    DateTime = 16
+    Type = int
+
+
+_QTCORE_EXPLICIT["QVariant"] = QVariant
 
 _QTWIDGETS_EXPLICIT = {
     "QAction": QAction,

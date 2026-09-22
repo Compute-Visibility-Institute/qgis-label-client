@@ -66,6 +66,9 @@ DEFAULTS: dict[str, Any] = {
     "signed_out_connection": "",
     "show_startup_connection": True,
     "show_unpushed_warnings": True,
+    # Hide all-NULL optional attributes when importing server labels into QGIS.
+    # This only changes the local layer's columns, never stored server attributes.
+    "remove_unused_fields_on_import": True,
     # Who is signed in, for the panel label. An email address, not a credential: it is
     # already visible in the QGIS window and on every server log line, and holding it here
     # is what lets the panel say "Signed in as ..." without decrypting anything -- which

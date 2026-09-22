@@ -18,11 +18,12 @@ from qgis.core import (
     QgsApplication,
     QgsFeature,
     QgsFeatureRequest,
+    QgsField,
     QgsGeometry,
     QgsProject,
     QgsVariantUtils,
 )
-from qgis.PyQt.QtCore import QDate, QDateTime, Qt, QTime, QTimer
+from qgis.PyQt.QtCore import QDate, QDateTime, Qt, QTime, QTimer, QVariant
 from qgis.PyQt.QtWidgets import QAction, QDialog, QLabel, QMessageBox, QPushButton, QVBoxLayout
 
 from . import client, layers
@@ -34,6 +35,39 @@ from .core.urls import normalise_base_url
 JOURNAL_PROPERTY = "cvi/pending_journal"
 STATE_PROPERTY = "cvi/pending_state"
 NAME_PROPERTY = "cvi/pending_original_name"
+
+
+def _encode_field(field):
+    """Keep a new local column's definition even when every value is NULL."""
+    return {
+        "name": field.name(),
+        "type": int(field.type()),
+        "type_name": field.typeName(),
+        "sub_type": int(field.subType()),
+        "length": field.length(),
+        "precision": field.precision(),
+        "comment": field.comment(),
+    }
+
+
+def _decode_field(value):
+    if not isinstance(value, dict) or not isinstance(value.get("name"), str) or not value["name"]:
+        raise ValueError("A saved field has no valid name")
+    for key in ("type", "sub_type", "length", "precision"):
+        if type(value.get(key)) is not int:
+            raise ValueError(f"A saved field has an invalid {key}")
+    for key in ("type_name", "comment"):
+        if not isinstance(value.get(key), str):
+            raise ValueError(f"A saved field has an invalid {key}")
+    return QgsField(
+        value["name"],
+        QVariant.Type(value["type"]),
+        value["type_name"],
+        value["length"],
+        value["precision"],
+        value["comment"],
+        QVariant.Type(value["sub_type"]),
+    )
 
 
 def _encode(value):
@@ -177,6 +211,8 @@ class PendingEdits:
                 ("editingStarted", lambda target=layer: self._editing_started(target)),
                 ("featureAdded", lambda fid, target=layer: self.changed(target, fid)),
                 ("featureDeleted", lambda fid, target=layer: self.changed(target, fid)),
+                ("attributeAdded", lambda *_args, target=layer: self.changed(target)),
+                ("attributeDeleted", lambda *_args, target=layer: self.changed(target)),
                 ("geometryChanged", lambda fid, *_args, target=layer: self.changed(target, fid)),
                 (
                     "attributeValueChanged",
@@ -295,8 +331,12 @@ class PendingEdits:
         geometries = buffer.changedGeometries()
         deleted = buffer.deletedFeatureIds()
         names = [field.name() for field in layer.fields()]
-        if buffer.addedAttributes() or buffer.deletedAttributeIds():
+        added_fields = buffer.addedAttributes()
+        if buffer.deletedAttributeIds() or (
+            added_fields and layer.providerType() != layers.CLASS_PROVIDER
+        ):
             raise ValueError("Field/schema changes must be saved or exported explicitly")
+        added_fields = [_encode_field(field) for field in added_fields]
         operations = []
         for feature in added.values():
             operations.append(
@@ -320,7 +360,18 @@ class PendingEdits:
                 }
             )
         previous = self.documents.get(layer.id())
-        if not operations:
+        if previous and operations and layer.providerType() == layers.CLASS_PROVIDER:
+            # QGIS may commit AddAttributes before a later feature PUT fails. The
+            # field then leaves addedAttributes(), while its values remain unpushed.
+            # Keep the definition until the complete save is acknowledged, so an
+            # older saved project can still restore the field after reopening.
+            remembered_names = {definition["name"] for definition in added_fields}
+            for definition in previous.get("added_fields", []):
+                name = definition["name"]
+                if name in names and name not in remembered_names:
+                    added_fields.append(definition)
+                    remembered_names.add(name)
+        if not operations and not added_fields:
             if previous and layer.id() not in self.bound_buffers:
                 return previous
             if previous and previous["state"] == "pending":
@@ -328,7 +379,10 @@ class PendingEdits:
             return previous if previous and previous["state"] != "pending" else None
         inherited_conflict = bool(layer.customProperty(STATE_PROPERTY, "") == "conflict")
         if previous and layer.id() not in self.bound_buffers:
-            if previous["operations"] != operations:
+            if (
+                previous["operations"] != operations
+                or previous.get("added_fields", []) != added_fields
+            ):
                 # The recovery copy has not been loaded into this new edit buffer.
                 # Keep both rather than replacing yesterday's work with today's edit.
                 previous = dict(
@@ -361,6 +415,7 @@ class PendingEdits:
                 "Sign in and connect this layer's track before editing; its owner cannot be identified"
             )
         document["operations"] = operations
+        document["added_fields"] = added_fields
         self._persist(layer, document)
         self.bound_buffers.add(layer.id())
         return self.documents[layer.id()]
@@ -390,7 +445,9 @@ class PendingEdits:
 
     def _mark(self, layer, document):
         label = (
-            "needs review" if document["state"] != "pending" else str(len(document["operations"]))
+            "needs review"
+            if document["state"] != "pending"
+            else str(len(document["operations"]) + len(document.get("added_fields", [])))
         )
         suffix = f" [Unpushed: {label}]"
         name = layer.name().split(" [Unpushed:", 1)[0]
@@ -404,8 +461,11 @@ class PendingEdits:
         try:
             document = self.snapshot(layer)
             if document:
-                document["state"] = "uncertain"
-                document["note"] = "A save was attempted. Check the server result before retrying."
+                if document["operations"]:
+                    document["state"] = "uncertain"
+                    document["note"] = (
+                        "A save was attempted. Check the server result before retrying."
+                    )
                 self._persist(layer, document)
                 self.commits[layer.id()] = document["id"]
                 QTimer.singleShot(0, lambda: self._warn_failed_save(layer))
@@ -448,6 +508,8 @@ class PendingEdits:
         layer.setName(layer.name().split(" [Unpushed:", 1)[0])
 
     def committed(self, layer):
+        if layer.providerType() == layers.CLASS_PROVIDER:
+            layer.dataProvider().reset_write_session()
         # An empty Save or a different recovery copy is not acknowledgement of this journal.
         journal_id = self.commits.pop(layer.id(), None)
         if journal_id and self.documents.get(layer.id(), {}).get("id") == journal_id:
@@ -459,14 +521,25 @@ class PendingEdits:
             return
         try:
             layers.refresh_class_layer_after_commit(layer)
+        except LabelClientError as exc:
+            self._error(f"Edits were saved, but the layer could not refresh: {exc}")
         except RuntimeError:
             # The project may have removed the Qt layer before the queued callback.
             return
 
     def rolled_back(self, layer):
+        if layer.providerType() == layers.CLASS_PROVIDER:
+            layer.dataProvider().reset_write_session()
         self.bound_buffers.discard(layer.id())
         document = self.documents.get(layer.id())
         if document:
+            if (
+                document["state"] == "pending"
+                and document.get("added_fields")
+                and not document["operations"]
+            ):
+                self.saved(layer)
+                return
             document["state"] = "conflict"
             document["note"] = (
                 "Editing was cancelled in QGIS. The recovery copy is held for review, not automatic upload."
@@ -638,11 +711,48 @@ class PendingEdits:
             raise ValueError("The layer already has unsaved edits; recovery will not replace them")
         if layer.crs().toWkt() != document["crs"]:
             raise ValueError("The layer coordinate system changed")
-        names = [field.name() for field in layer.fields()]
         targets = []
         layer.dataProvider().reloadData()
+        if layer.providerType() == layers.CLASS_PROVIDER:
+            layers.check_class_refresh(layer)
+            layer.updateFields()
+        names = [field.name() for field in layer.fields()]
+        added_fields = document.get("added_fields", [])
+        if not isinstance(added_fields, list):
+            raise ValueError("The recovery copy has invalid field definitions")
+        if added_fields and layer.providerType() != layers.CLASS_PROVIDER:
+            raise ValueError("This layer cannot restore locally added fields")
+        field_mapping = {}
+        missing_fields = []
+        descriptors = layer.dataProvider().field_definitions() if added_fields else []
+        for definition in added_fields:
+            field = _decode_field(definition)
+            name = field.name()
+            if name in field_mapping:
+                raise ValueError("The recovery copy has duplicate field definitions")
+            matches = [
+                descriptor["name"]
+                for descriptor in descriptors
+                if descriptor.get("origin") == "src"
+                and descriptor.get("source_name") == name
+                and descriptor.get("name") in names
+            ]
+            if len(matches) > 1:
+                raise ValueError(
+                    "The server returned duplicate source fields; review before restoring"
+                )
+            if matches:
+                # A populated native field may be inferred by the server before a
+                # project is reopened. Use its canonical source key, never add both.
+                field_mapping[name] = matches[0]
+            elif name in names:
+                raise ValueError(f"The saved field {name!r} now names a different server attribute")
+            else:
+                field_mapping[name] = name
+                missing_fields.append(field)
+        recoverable_names = set(names) | set(field_mapping)
         for operation in document["operations"]:
-            if not set(operation["attributes"]).issubset(names):
+            if not set(operation["attributes"]).issubset(recoverable_names):
                 raise ValueError("The server fields changed; export/review the recovery copy")
             fid = None
             if operation["kind"] != "create":
@@ -664,6 +774,9 @@ class PendingEdits:
         self.saving.add(layer.id())
         layer.beginEditCommand("Restore unpushed edits")
         try:
+            for field in missing_fields:
+                if not layer.addAttribute(field):
+                    raise ValueError(f"Could not restore the added field {field.name()!r}")
             for operation, fid in targets:
                 geometry = None
                 if operation["geometry"] is not None:
@@ -674,7 +787,7 @@ class PendingEdits:
                 if operation["kind"] == "create":
                     feature = QgsFeature(layer.fields())
                     for name, value in operation["attributes"].items():
-                        feature.setAttribute(name, _decode(value))
+                        feature.setAttribute(field_mapping.get(name, name), _decode(value))
                     if geometry is not None:
                         feature.setGeometry(geometry)
                     if not layer.addFeature(feature):
@@ -685,7 +798,9 @@ class PendingEdits:
                 else:
                     for name, value in operation["attributes"].items():
                         if not layer.changeAttributeValue(
-                            fid, layer.fields().indexFromName(name), _decode(value)
+                            fid,
+                            layer.fields().indexFromName(field_mapping.get(name, name)),
+                            _decode(value),
                         ):
                             raise ValueError("Could not restore an attribute edit")
                     if geometry is not None and not layer.changeGeometry(fid, geometry):
@@ -717,6 +832,7 @@ class PendingEdits:
             text = (
                 f"{document.get('layer_name', document['collection'])}: {len(document['operations'])} edit(s) — "
                 f"{document['state']}\n{document['email']} · {document['track']}\n"
+                f"{len(document.get('added_fields', []))} added field(s)\n"
                 f"{document.get('note', 'Will upload after reconnect and server checks.')}\n"
                 f"Recovery file: {self.store.directory / (document['id'] + '.json')}"
             )

@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and `qgis-plugin-ci` copies the
 most recent entries into `metadata.txt` at release time.
 
+## [0.3.0] - 2026-09-22
+
+### Added
+
+- Support QGIS's native Add Field on servers advertising the new capability.
+  Save values as original JSON attributes through existing feature writes, with
+  local field types retained in projects and unpushed-field recovery journals.
+- Add **Remove unused fields on import**, enabled by default, for editable and
+  read-only class layers. Omit optional fields that are NULL throughout the
+  selected class/geometry layer; retain zero, false and empty text.
+
+### Changed
+
+- Prefix generated layer names with **CVI**, including existing generated names
+  on reconnect, while preserving custom user names.
+- Move **Bootstrap** immediately above the final **History track** section.
+- Rename date controls to **Labels valid on a date** and
+  **Dataset as saved on a date**.
+- Keep the legacy provider on production and older APIs. Native field creation
+  requires the updated development API; no database migration is needed.
+
 ## [0.2.1] - 2026-09-22
 
 ### Fixed

@@ -157,6 +157,7 @@ def test_original_fields_editable_identity_locked_and_new_class_defaulted():
         setReadOnly=lambda index, value: read_only.update({names[index]: value})
     )
     layer = SimpleNamespace(
+        providerType=lambda: "OAPIF",
         fields=lambda: fields,
         editFormConfig=lambda: config,
         setEditFormConfig=lambda cfg: None,
@@ -191,6 +192,7 @@ def test_commit_refresh_gets_new_revision_ids_without_discarding_edits(
     events = []
     monkeypatch.setattr(layers, "class_layer_metadata", lambda layer: entry())
     layer = SimpleNamespace(
+        providerType=lambda: "OAPIF",
         isModified=lambda: dirty,
         isEditable=lambda: editing,
         customProperty=lambda key, default: pending,

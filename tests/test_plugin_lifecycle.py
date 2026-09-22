@@ -63,6 +63,7 @@ def test_every_attachment_registers_a_teardown(fake_iface):
         "menu: panel",
         "menu: historical view",
         "menu: publish local layers",
+        "class layer project source",
         "project access state",
         "menu: connection prompt",
         "menu: startup prompt toggle",

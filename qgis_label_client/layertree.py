@@ -70,14 +70,23 @@ def _ensure_group(
     root, metadata: CollectionGroup, context: str, index: int = 0, *, read_only: bool = False
 ):
     group = _find_group(root, metadata, context)
+    title = metadata.display_name
+    if read_only and any(member.class_layer is not None for member in metadata.members):
+        title += " (read only)"
+    generated = layers.plugin_layer_title(title)
     if group is None:
-        title = metadata.display_name
-        if read_only and any(member.class_layer is not None for member in metadata.members):
-            title += " (read only)"
-        group = root.insertGroup(index, title)
+        group = root.insertGroup(index, generated)
         group.setCustomProperty(GROUP_PROPERTY, metadata.stem)
         group.setCustomProperty(CONTEXT_PROPERTY, context)
+        group.setCustomProperty(layers.GENERATED_NAME_PROPERTY, generated)
         group.setExpanded(False)
+    else:
+        previous = str(group.customProperty(layers.GENERATED_NAME_PROPERTY, title))
+        if group.name() in {previous, layers.plugin_layer_title(previous)}:
+            group.setName(layers.plugin_layer_title(previous))
+            group.setCustomProperty(
+                layers.GENERATED_NAME_PROPERTY, layers.plugin_layer_title(previous)
+            )
     return group
 
 

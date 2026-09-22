@@ -41,6 +41,10 @@ def refresh_connected_layers(backend_url: str) -> RefreshResult:
                 layer.updateExtents()
             else:
                 layer.reload()
+            if layer.providerType() == layers.CLASS_PROVIDER:
+                layers.check_class_refresh(layer)
+                layer.updateFields()
+                layers.configure_class_columns(layer, layers.class_layer_metadata(layer))
             layer.triggerRepaint()
             result.refreshed.append(layer.name())
         except Exception as exc:  # noqa: BLE001 - one failed provider must not block others

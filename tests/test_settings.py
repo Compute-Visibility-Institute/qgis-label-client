@@ -49,6 +49,7 @@ def test_defaults_are_returned_when_nothing_is_stored():
     settings = PluginSettings()
     assert settings.get("page_size") == 1000
     assert settings.get("restrict_to_canvas") is True
+    assert settings.get("remove_unused_fields_on_import") is True
 
 
 def test_values_round_trip():

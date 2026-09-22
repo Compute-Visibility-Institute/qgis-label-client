@@ -77,7 +77,7 @@ def loading(fake_iface, monkeypatch):
     monkeypatch.setattr(
         layers,
         "create_layer",
-        lambda settings, cid, title, registry, track: Layer(title, cid, track.name),
+        lambda settings, cid, title, registry, track, **kwargs: Layer(title, cid, track.name),
     )
     monkeypatch.setattr(
         layertree,
@@ -158,6 +158,12 @@ class Group:
         self.title = title
         self.properties = {}
 
+    def name(self):
+        return self.title
+
+    def setName(self, title):  # noqa: N802
+        self.title = title
+
     def customProperty(self, key, default=""):  # noqa: N802
         return self.properties.get(key, default)
 
@@ -198,6 +204,6 @@ def test_tree_group_identity_separates_modes_and_labels_readonly_copy(monkeypatc
         root, metadata, layertree._context(readonly), read_only=True
     )
     assert editing_group is not reading_group
-    assert editing_group.title == "Alpha"
-    assert reading_group.title == "Alpha (read only)"
+    assert editing_group.title == "CVI Alpha"
+    assert reading_group.title == "CVI Alpha (read only)"
     assert layertree._ensure_group(root, metadata, layertree._context(editable)) is editing_group

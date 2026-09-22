@@ -29,6 +29,9 @@ class _Field:
     def name(self) -> str:
         return self._name
 
+    def providerType(self):  # noqa: N802
+        return "OAPIF"
+
 
 class _Fields(list):
     """A field list that can also answer indexOf, which QgsFields does."""
@@ -66,6 +69,9 @@ class _FakeLayer:
     def name(self) -> str:
         return self._name
 
+    def setName(self, name: str) -> None:  # noqa: N802
+        self._name = name
+
     def fields(self) -> _Fields:
         return self._fields
 
@@ -94,6 +100,92 @@ class _FakeLayer:
 LABEL_FIELDS = ["label_id", "class_id", "names", "attrs", "valid_from", "valid_to"]
 AUDIT_FIELDS = ["history_id", "label_id", "operation", "changed", "actor", "class_id"]
 EXTENT_FIELDS = ["extent_id", "class_id", "completeness", "caveat"]
+
+
+@pytest.mark.parametrize(
+    "title,expected",
+    [("Cooling Unit", "CVI Cooling Unit"), ("CVI Labels", "CVI Labels"), ("CVI", "CVI")],
+)
+def test_generated_layer_title_has_exactly_one_cvi_prefix(title, expected):
+    assert layer_tools.plugin_layer_title(title) == expected
+
+
+@pytest.mark.parametrize("readonly", [False, True])
+def test_existing_generated_class_title_is_prefixed_without_touching_data(readonly):
+    import json
+
+    suffix = " (read only)" if readonly else ""
+    layer = _FakeLayer("Cooling Unit" + suffix, LABEL_FIELDS)
+    layer.properties["cvi/class_layer"] = json.dumps({"class_name": "Cooling Unit"})
+    layer.properties["cvi/read_only_view"] = readonly
+    assert layer_tools.refresh_plugin_layer_title(layer)
+    assert layer.name() == "CVI Cooling Unit" + suffix
+    assert not layer_tools.refresh_plugin_layer_title(layer)
+    assert [field.name() for field in layer.fields()] == LABEL_FIELDS
+
+
+def test_custom_layer_name_is_preserved_after_generated_name_is_recorded():
+    layer = _FakeLayer("My inspection notes", LABEL_FIELDS)
+    layer.properties[layer_tools.GENERATED_NAME_PROPERTY] = "CVI Cooling Unit"
+    assert not layer_tools.refresh_plugin_layer_title(layer, "Cooling Unit")
+    assert layer.name() == "My inspection notes"
+
+
+def test_legacy_custom_class_name_is_not_replaced_using_an_advertised_title():
+    layer = _FakeLayer("Units to inspect tomorrow", LABEL_FIELDS)
+    assert not layer_tools.refresh_plugin_layer_title(layer, "Cooling Unit")
+    assert layer.name() == "Units to inspect tomorrow"
+
+
+def test_generated_prefix_keeps_pending_edits_status_suffix():
+    layer = _FakeLayer("Cooling Unit [Unpushed: 2]", LABEL_FIELDS)
+    layer.properties["cvi/pending_state"] = "pending"
+    assert layer_tools.refresh_plugin_layer_title(layer, "Cooling Unit")
+    assert layer.name() == "CVI Cooling Unit [Unpushed: 2]"
+    assert layer.properties["cvi/pending_original_name"] == "CVI Cooling Unit"
+
+
+def test_class_provider_options_replace_existing_uri_values(monkeypatch):
+    import json
+
+    class AppendingUri:
+        """QgsDataSourceUri.setParam appends; it does not replace old values."""
+
+        def __init__(self, source):
+            self.values = json.loads(source)
+
+        def removeParam(self, key):  # noqa: N802
+            self.values.pop(key, None)
+
+        def setParam(self, key, value):  # noqa: N802
+            self.values.setdefault(key, []).append(value)
+
+        def hasParam(self, key):  # noqa: N802
+            return key in self.values
+
+        def param(self, key):
+            return self.values[key][0]
+
+        def uri(self, _expand_auth):
+            return json.dumps(self.values)
+
+    monkeypatch.setattr(layer_tools, "QgsDataSourceUri", AppendingUri)
+    old = json.dumps({"removeUnusedFields": ["0"], "cviReadOnly": ["0"]})
+    assert json.loads(layer_tools.class_provider_uri(old, remove_unused=True, read_only=True)) == {
+        "removeUnusedFields": ["1"],
+        "cviReadOnly": ["1"],
+    }
+    layer = SimpleNamespace(
+        providerType=lambda: layer_tools.CLASS_PROVIDER,
+        dataProvider=lambda: SimpleNamespace(
+            dataSourceUri=lambda: json.dumps({"localFields": ["current"], "cviReadOnly": ["1"]})
+        ),
+    )
+    stale_source = json.dumps({"localFields": ["old"], "cviReadOnly": ["0"]})
+    assert json.loads(layer_tools._preserve_class_options(layer, stale_source)) == {
+        "localFields": ["current"],
+        "cviReadOnly": ["1"],
+    }
 
 
 def _with_layers(monkeypatch, *layers):

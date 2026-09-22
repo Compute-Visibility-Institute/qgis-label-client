@@ -4,13 +4,13 @@ qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 supportsQt6=True
 description=Connect QGIS to an OGC API - Features labeling backend with Google sign-in, editable class layers and original attribute columns on supported servers, local edit recovery, and historical views.
-version=0.2.1
+version=0.3.0
 author=Compute Visibility Institute
 email=opensource@example.org
 
 about=Connects QGIS to a labeling platform that serves OGC API - Features (Parts 1, 2 and 4).
-    QGIS's native provider does all vector reading and editing, so this plugin only covers what
-    QGIS cannot do on its own:
+    Uses native QGIS editing tools, with JSON-backed field creation on supported servers
+    and the native OAPIF provider on older servers:
     .
     * signs in with Google in your browser and stores the resulting token in QgsAuthManager,
       so no credential is ever written into a .qgz - and renews that token in the background,
@@ -49,6 +49,8 @@ deprecated=False
 server=False
 hasProcessingProvider=no
 
-changelog=0.2.1
-    - Show class layers and original attribute columns in read-only mode on supported servers.
-    - Avoid malformed track/class filters when opening attribute tables.
+changelog=0.3.0
+    - Support native Add Field with JSON-backed saves on supported development servers.
+    - Default to removing all-NULL optional fields when importing class layers.
+    - Prefix generated layer names with CVI; keep custom names.
+    - Move Bootstrap above History track and clarify the two date controls.
