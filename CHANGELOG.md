@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and `qgis-plugin-ci` copies the
 most recent entries into `metadata.txt` at release time.
 
+## [0.3.5] - 2026-09-22
+
+### Fixed
+
+- Connect without a stale environment header when changing API deployments.
+  Read discovery metadata using the advertised default when the saved environment
+  is unavailable, while requiring an explicit supported selection before writes.
+- Keep discovered environments selectable after a connection failure, and
+  reconnect after choosing one without repointing existing layers prematurely.
+
 ## [0.3.4] - 2026-09-22
 
 ### Changed

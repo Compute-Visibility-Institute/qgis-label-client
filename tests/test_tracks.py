@@ -63,6 +63,20 @@ def test_a_bare_array_is_accepted_too():
     assert [t.name for t in parse_tracks([{"name": "solo"}])] == ["solo"]
 
 
+@pytest.mark.parametrize("include_database_default", [False, True])
+def test_effective_deployment_default_overrides_the_shared_database_default(include_database_default):
+    rows = [{"name": "dev", "is_default": False}]
+    if include_database_default:
+        rows.append({"name": "default", "is_default": True})
+
+    parsed = parse_tracks({"tracks": rows, "effective_default": "dev"})
+
+    assert [track.name for track in parsed if track.is_default] == ["dev"]
+    assert track_tools.resolve(parsed, "").name == "dev"
+    if not include_database_default:
+        assert track_tools.resolve(parsed, "default") is None
+
+
 @pytest.mark.parametrize("document", [{}, {"tracks": "alpha"}, "alpha", None, 7])
 def test_a_response_that_is_not_a_track_list_is_an_error_not_an_empty_list(document):
     # An empty list reads as "this deployment has no tracks", which is a completely

@@ -150,8 +150,10 @@ def parse_tracks(document: Any) -> list[Track]:
     A response that is neither is an error, because the alternative is a silently empty
     track list, which reads as "this deployment has no tracks" and is much worse.
     """
+    effective_default = None
     if isinstance(document, Mapping):
         raw_tracks = document.get("tracks")
+        effective_default = document.get("effective_default")
     elif _is_list(document):
         raw_tracks = document
     else:
@@ -182,7 +184,13 @@ def parse_tracks(document: Any) -> list[Track]:
                     raw.get("description") if isinstance(raw.get("description"), str) else None
                 ),
                 status=status if isinstance(status, str) and status else STATUS_ACTIVE,
-                is_default=bool(raw.get("is_default") or raw.get("default")),
+                # The shared database's default can differ from this service's
+                # or caller's pin. Discovery advertises the actual read default.
+                is_default=(
+                    name == effective_default
+                    if isinstance(effective_default, str) and effective_default
+                    else bool(raw.get("is_default") or raw.get("default"))
+                ),
                 sort_order=_int(raw.get("sort_order"), 100),
                 earliest_recorded=str(raw.get("earliest_recorded") or ""),
             )

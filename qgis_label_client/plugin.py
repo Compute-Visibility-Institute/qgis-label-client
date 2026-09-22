@@ -674,6 +674,15 @@ class LabelClientPlugin:
                 "Wait for publishing to finish before changing tracks.", Qgis.MessageLevel.Warning
             )
             return
+        if self.registry is None:
+            # Discovery can succeed while a later connection request fails. Let
+            # the user choose an offered environment and reconnect; there is no
+            # loaded registry with which to repoint existing layers safely yet.
+            self.settings.set("track", name)
+            self.dock.set_tracks(self.tracks, name)
+            self._refresh_track_banner()
+            self.connect_backend()
+            return
         url = self.settings.api_base_url
         authcfg = self.settings.authcfg_for(track.name if track else "")
         registry_path = str(self.settings.get("class_registry_path"))
@@ -1308,7 +1317,10 @@ class LabelClientPlugin:
         if not url:
             self._fail("Enter the API URL first.")
             return
-        authcfg = self.settings.authcfg
+        # A per-track APIHeader credential adds X-Track after request headers
+        # are prepared. Discovery must not inherit a saved production header
+        # when the URL now points at a dev-only deployment.
+        authcfg = self.settings.authcfg_for("")
         registry_path = str(self.settings.get("class_registry_path"))
         tracks_path = str(self.settings.get("tracks_path"))
         capabilities_path = str(self.settings.get("capabilities_path"))
@@ -1322,6 +1334,7 @@ class LabelClientPlugin:
 
         self.dock.set_status("Connecting…")
         context = self._permission_context()
+        discovery: dict[str, Any] = {}
 
         def work(feedback: QgsFeedback) -> dict[str, Any]:
             # Worker thread. Nothing here may touch widgets, iface or QgsProject.
@@ -1332,7 +1345,11 @@ class LabelClientPlugin:
             # there are no tracks and every write is refused, which is the honest state
             # rather than a broken one.
             tracks = _fetch_tracks_or_none(url, tracks_path, authcfg, feedback)
-            selected = resolve_track(tracks, selected_track_name)
+            discovery["tracks"] = tracks
+            # Read discovery data from the advertised default when a saved
+            # environment is unavailable. Keep the saved selection unchanged:
+            # the user must choose an offered track before writing anything.
+            selected = resolve_track(tracks, selected_track_name) or resolve_track(tracks, "")
             track = selected.name if selected else ""
             capabilities = _fetch_capabilities_or_empty(
                 url, capabilities_path, authcfg, feedback, track=track
@@ -1360,6 +1377,10 @@ class LabelClientPlugin:
             if serial == self._track_change_serial:
                 self._registry_pending = False
                 self.registry = None
+                if "tracks" in discovery:
+                    self.tracks = discovery["tracks"] or []
+                    self.dock.set_tracks(self.tracks, self.settings.track)
+                    self._refresh_track_banner()
                 self.dock.set_connected(False)
 
         self._run_read_task("Connect to labeling API", work, self._on_connected, failed)

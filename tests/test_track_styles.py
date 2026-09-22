@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from qgis_label_client import client, layers
+from qgis_label_client.core.errors import BackendError
 from qgis_label_client.core.registry import parse_registry
 from qgis_label_client.core.tracks import Track
 from qgis_label_client.plugin import LabelClientPlugin
@@ -128,6 +129,105 @@ def test_reconnect_resolves_saved_track_after_discovery(plugin, monkeypatch):
     task = plugin.tasks._tasks[-1]
     assert task.run()
     assert observed == ["new"]
+
+
+def test_dev_connection_uses_neutral_auth_and_advertised_track_for_metadata(plugin, monkeypatch):
+    plugin.settings.set("track", "default")
+    plugin.settings.set_authcfg_by_track({"": "neutral", "default": "production-auth"})
+    observed = []
+
+    def tracks(_url, _path, authcfg, _feedback):
+        observed.append(("tracks", authcfg, ""))
+        return [Track("dev", is_default=True)]
+
+    def capabilities(_url, _path, authcfg, _feedback, *, track):
+        observed.append(("capabilities", authcfg, track))
+        return {}
+
+    def collections(_url, authcfg, _feedback, *, track):
+        observed.append(("collections", authcfg, track))
+        return []
+
+    def class_layers(_url, authcfg, _feedback, *, track):
+        observed.append(("class_layers", authcfg, track))
+        return []
+
+    def classes(_url, _path, authcfg, _feedback, *, track):
+        observed.append(("registry", authcfg, track))
+        return registry("#00ff00")
+
+    monkeypatch.setattr(client, "fetch_tracks", tracks)
+    monkeypatch.setattr(client, "fetch_capabilities", capabilities)
+    monkeypatch.setattr(client, "fetch_collections", collections)
+    monkeypatch.setattr(client, "fetch_class_layers", class_layers)
+    monkeypatch.setattr(client, "fetch_registry", classes)
+    monkeypatch.setattr(plugin, "_fetch_access", lambda *_args: True)
+
+    plugin.connect_backend()
+    task = plugin.tasks._tasks[-1]
+    assert task.run()
+    assert observed == [
+        ("tracks", "neutral", ""),
+        ("capabilities", "neutral", "dev"),
+        ("collections", "neutral", "dev"),
+        ("class_layers", "neutral", "dev"),
+        ("registry", "neutral", "dev"),
+    ]
+    assert task._result["registry_track"] == "dev"
+    assert plugin.settings.track == "default"
+
+
+def test_failed_metadata_keeps_discovered_environments_for_recovery(plugin, monkeypatch):
+    plugin.settings.set("track", "default")
+    offered = [Track("dev", is_default=True)]
+    monkeypatch.setattr(client, "fetch_tracks", lambda *_: offered)
+    monkeypatch.setattr(client, "fetch_capabilities", lambda *_args, **_kwargs: {})
+
+    def unavailable(*_args, **_kwargs):
+        raise BackendError("HTTP 503 from /collections", status=503)
+
+    monkeypatch.setattr(client, "fetch_collections", unavailable)
+    plugin.connect_backend()
+    task = plugin.tasks._tasks[-1]
+    assert not task.run()
+    task.finished(False)
+
+    assert plugin.tracks == offered
+    assert plugin.registry is None
+    assert not plugin._registry_pending
+    assert not plugin.dock._connected
+    assert plugin.settings.track == "default"
+
+
+def test_selecting_environment_after_failed_connection_reconnects_without_repointing(
+    plugin, monkeypatch
+):
+    plugin.registry = None
+    plugin.settings.set("track", "default")
+    plugin.tracks = [Track("dev", is_default=True)]
+    connected = []
+    monkeypatch.setattr(plugin, "connect_backend", lambda: connected.append(plugin.settings.track))
+    monkeypatch.setattr(
+        layers, "repoint_for", lambda *_args, **_kwargs: pytest.fail("must not repoint layers")
+    )
+
+    plugin.set_track("dev")
+
+    assert plugin.settings.track == "dev"
+    assert connected == ["dev"]
+    assert plugin.registry is None
+
+
+def test_failed_connection_recovery_preserves_unsaved_edits(plugin, monkeypatch):
+    plugin.registry = None
+    plugin.settings.set("track", "default")
+    plugin.tracks = [Track("dev", is_default=True)]
+    monkeypatch.setattr(layers, "dirty_layers", lambda: [SimpleNamespace(name=lambda: "Edited")])
+    monkeypatch.setattr(plugin, "connect_backend", lambda: pytest.fail("must preserve edit context"))
+
+    plugin.set_track("dev")
+
+    assert plugin.settings.track == "default"
 
 
 @pytest.mark.parametrize(

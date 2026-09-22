@@ -711,7 +711,9 @@ class LabelClientDock(QDockWidget):
         self.pull_all_remote_button.setEnabled(available)
         self.connect_button.setEnabled(not self._busy)
         self.remove_unused_fields_checkbox.setEnabled(not self._busy)
-        self.track_combo.setEnabled(available)
+        # An offered environment must remain selectable if metadata loading
+        # fails after track discovery; otherwise the user cannot recover.
+        self.track_combo.setEnabled(not self._busy and bool(self._tracks))
         self.publish_button.setEnabled(available and self._write_access is not False)
         self.asof_date.setEnabled(not self._busy)
         self.asof_mechanism.setEnabled(not self._busy)
@@ -945,7 +947,7 @@ class LabelClientDock(QDockWidget):
             self.track_combo.setCurrentIndex(index)
         finally:
             self._loading_tracks = False
-        self._sync_qa_visibility()
+        self._sync_actions()
 
     def selected_track(self) -> str:
         return str(self.track_combo.currentData() or "")

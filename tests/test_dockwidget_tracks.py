@@ -121,3 +121,18 @@ def test_readers_can_pull_without_being_offered_push_and_busy_blocks_both():
     dock.set_busy(True)
     dock.push_all_local_button.setEnabled.assert_called_with(False)
     dock.pull_all_remote_button.setEnabled.assert_called_with(False)
+
+
+@pytest.mark.parametrize("advertised,enabled", [([], False), ([Track("dev")], True)])
+def test_disconnected_environment_selector_allows_recovery_but_not_while_busy(advertised, enabled):
+    dock = LabelClientDock(None)
+    dock.track_combo = Mock()
+    dock._tracks = advertised
+
+    dock.set_connected(False)
+
+    dock.track_combo.setEnabled.assert_called_with(enabled)
+    dock.set_busy(True)
+    dock.track_combo.setEnabled.assert_called_with(False)
+    dock.set_busy(False)
+    dock.track_combo.setEnabled.assert_called_with(enabled)
