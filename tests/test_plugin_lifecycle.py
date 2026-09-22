@@ -26,8 +26,8 @@ def test_one_cycle_attaches_and_detaches_everything(fake_iface):
     plugin.initGui()
     assert len(fake_iface.toolbar_icons) == 1
     assert len(fake_iface.docks) == 1
-    # Layer tools, connection controls, recovery controls and push-all-local.
-    assert [menu for menu, _ in fake_iface.plugin_menu] == [MENU_NAME] * 8
+    # Panel, connection prompt, recovery review and push-all-local remain in the menu.
+    assert [menu for menu, _ in fake_iface.plugin_menu] == [MENU_NAME] * 4
 
     plugin.unload()
     assert fake_iface.toolbar_icons == []
