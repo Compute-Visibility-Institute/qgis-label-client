@@ -293,7 +293,7 @@ def test_the_menu_entry_sends_people_to_the_panel_rather_than_a_second_picker(fa
     # chances for them to disagree about what UTC means.
     plugin = _plugin(fake_iface)
     plugin.request_recorded_view()
-    assert any("Historical view" in text for _, text, _ in fake_iface.messages)
+    assert any("Labels as we have known on <Date>" in text for _, text, _ in fake_iface.messages)
     plugin.unload()
 
 
