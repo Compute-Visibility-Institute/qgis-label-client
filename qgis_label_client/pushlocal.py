@@ -170,7 +170,7 @@ class PushAllLocal:
         action.setToolTip(
             "Upload missing local points, lines and polygons to the connected track; review new mappings."
         )
-        action.triggered.connect(self.push_all)
+        action.triggered.connect(self.plugin.push_all_local)
         self.plugin.iface.addPluginToMenu(menu_name, action)
         self.plugin.teardown.add(
             "menu: push all local", lambda: self.plugin.iface.removePluginMenu(menu_name, action)

@@ -4,7 +4,7 @@ qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 supportsQt6=True
 description=Connect QGIS to an OGC API - Features labeling backend with Google sign-in, editable class layers and original attribute columns on supported servers, local edit recovery, and historical views.
-version=0.3.1
+version=0.3.2
 author=Compute Visibility Institute
 email=opensource@example.org
 
@@ -49,7 +49,8 @@ deprecated=False
 server=False
 hasProcessingProvider=no
 
-changelog=0.3.1
-    - Keep historical views and local publishing in their panel sections, without duplicate menu actions.
-    - Move startup and unpushed-edit warning preferences into the panel.
-    - Rename the bottom History track section to Environment.
+changelog=0.3.2
+    - Add Pull all remote; show push and pull in the menu and Label layers section.
+    - Preserve unpushed edits when pulling remote labels.
+    - Close the connection popup after a successful connection and refresh.
+    - Show survey coverage QA only in dev and move time status inside its collapsible.

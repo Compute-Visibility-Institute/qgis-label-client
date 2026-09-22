@@ -181,6 +181,8 @@ class LabelClientDock(QDockWidget):
     copyAddressRequested = pyqtSignal()
     loadLayersRequested = pyqtSignal(list)
     loadReadOnlyLayersRequested = pyqtSignal(list)
+    pushAllLocalRequested = pyqtSignal()
+    pullAllRemoteRequested = pyqtSignal()
     removeUnusedFieldsChanged = pyqtSignal(bool)
     startupPromptChanged = pyqtSignal(bool)
     unpushedWarningsChanged = pyqtSignal(bool)
@@ -242,15 +244,6 @@ class LabelClientDock(QDockWidget):
         # Immediately below, and never inside it. Two time axes, two boxes -- see
         # _build_recorded_group.
         layout.addWidget(self._build_recorded_group(container))
-
-        # Directly under both time controls, because it is about both of them.
-        self.axes_label = QLabel("", container)
-        self.axes_label.setWordWrap(True)
-        self.axes_label.setToolTip(
-            "Valid time is when a label was true on the ground. Transaction time is when "
-            "the team believed it. Both are always in force, so both are always named."
-        )
-        layout.addWidget(self.axes_label)
 
         layout.addWidget(self._build_qa_group(container))
         layout.addWidget(self._build_vocabulary_group(container))
@@ -389,6 +382,7 @@ class LabelClientDock(QDockWidget):
     def _emit_track_changed(self) -> None:
         if self._loading_tracks:
             return
+        self._sync_qa_visibility()
         self.trackChanged.emit(self.selected_track())
 
     def _build_collections_group(self, parent: QWidget) -> QWidget:
@@ -416,6 +410,21 @@ class LabelClientDock(QDockWidget):
         self.load_button.setToolTip("Add separate class layers when supported by the server.")
         self.load_button.clicked.connect(self._emit_load_layers)
         layout.addWidget(self.load_button)
+
+        self.push_all_local_button = QPushButton("Push all local", group)
+        self.push_all_local_button.setToolTip(
+            "Review local features missing from the server and upload them to their label layers."
+        )
+        self.push_all_local_button.clicked.connect(self.pushAllLocalRequested)
+        layout.addWidget(self.push_all_local_button)
+
+        self.pull_all_remote_button = QPushButton("Pull all remote", group)
+        self.pull_all_remote_button.setToolTip(
+            "Refresh loaded current label layers from the connected server and environment. "
+            "Layers with unpushed edits are preserved, and historical views stay fixed."
+        )
+        self.pull_all_remote_button.clicked.connect(self.pullAllRemoteRequested)
+        layout.addWidget(self.pull_all_remote_button)
 
         self.remove_unused_fields_checkbox = QCheckBox("Remove unused fields on import", group)
         self.remove_unused_fields_checkbox.setChecked(True)
@@ -602,6 +611,14 @@ class LabelClientDock(QDockWidget):
         self.recorded_floor_label.setWordWrap(True)
         layout.addWidget(self.recorded_floor_label)
 
+        self.axes_label = QLabel("", group)
+        self.axes_label.setWordWrap(True)
+        self.axes_label.setToolTip(
+            "Valid time is when a label was true on the ground. Transaction time is when "
+            "the team believed it. Both are always in force, so both are always named."
+        )
+        layout.addWidget(self.axes_label)
+
         self.recorded_enabled.toggled.connect(self.recorded_datetime.setEnabled)
         self.recorded_enabled.toggled.connect(self._sync_recorded_button)
         self.recorded_datetime.setEnabled(False)
@@ -620,6 +637,8 @@ class LabelClientDock(QDockWidget):
 
     def _build_qa_group(self, parent: QWidget) -> QWidget:
         group = _collapsible("QA", parent, collapsed=True)
+        self.qa_group = group
+        group.setVisible(False)
         layout = QVBoxLayout(group)
 
         self.coverage_button = QPushButton("Check survey coverage", group)
@@ -634,6 +653,16 @@ class LabelClientDock(QDockWidget):
         self.qa_result.setWordWrap(True)
         layout.addWidget(self.qa_result)
         return group
+
+    def _sync_qa_visibility(self) -> None:
+        selected = self.selected_track()
+        visible = (
+            self._connected
+            and selected == "dev"
+            and any(track.name == selected for track in self._tracks)
+        )
+        self.qa_group.setVisible(visible)
+        self.coverage_button.setEnabled(visible and not self._busy)
 
     def _build_vocabulary_group(self, parent: QWidget) -> QWidget:
         group = _collapsible("Class vocabulary", parent, collapsed=True)
@@ -668,13 +697,15 @@ class LabelClientDock(QDockWidget):
             self.load_reference_button,
             self.apply_asof_button,
             self.history_button,
-            self.coverage_button,
         ):
             widget.setEnabled(available)
+        self._sync_qa_visibility()
         self.load_readonly_button.setEnabled(available and bool(self._readonly_collection_ids))
         self.load_button.setEnabled(
             available and bool(self._editable_collection_ids) and self._write_access is not False
         )
+        self.push_all_local_button.setEnabled(available and self._write_access is not False)
+        self.pull_all_remote_button.setEnabled(available)
         self.connect_button.setEnabled(not self._busy)
         self.remove_unused_fields_checkbox.setEnabled(not self._busy)
         self.track_combo.setEnabled(available)
@@ -914,6 +945,7 @@ class LabelClientDock(QDockWidget):
             self.track_combo.setCurrentIndex(index)
         finally:
             self._loading_tracks = False
+        self._sync_qa_visibility()
 
     def selected_track(self) -> str:
         return str(self.track_combo.currentData() or "")

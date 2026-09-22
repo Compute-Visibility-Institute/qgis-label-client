@@ -39,7 +39,7 @@ reconnecting to load a changed field schema; existing dirty layers are never rep
 Local uploads continue through the established bulk API, preserving all source data.
 Servers without the new capability keep the existing geometry-layer interface. An
 authentication, network or malformed-capability error is reported rather than silently
-downgrading. Version 0.3.1 is distributed through the usual stable plugin repository.
+downgrading. Version 0.3.2 is distributed through the usual stable plugin repository.
 The new backend capability is enabled on development servers first; the same plugin
 keeps the legacy interface on production servers until they advertise support.
 Use a separate QGIS profile when testing the development server so your production
@@ -243,7 +243,8 @@ Field/schema edits require explicit saving or export rather than automatic recov
 
 ### Push all local features
 
-**Plugins → CVI Label Client → Push all local** saves eligible native pending edits,
+**Push all local**, available under **Label layers** and in **Plugins → CVI Label
+Client**, saves eligible native pending edits,
 then checks local point, line and polygon layers (including multipart geometries).
 Connect also performs this check. New or invalid class mappings open the existing
 upload review; previously reviewed mappings and exclusions are remembered for that
@@ -271,6 +272,17 @@ layers to a file. The upload journal does not preserve their unsaved feature pay
 
 These workflows are included in version 0.2.0. Save remote edits and your QGIS
 project before upgrading; recovery journals do not replace saving local source files.
+
+### Pull remote labels
+
+**Pull all remote**, available under **Label layers** and in **Plugins → CVI Label
+Client**, refreshes all loaded live label layers for the connected server and
+selected environment. It is available to read-only users too. Add read-only or
+editable layers first if none are loaded.
+
+Pull preserves each layer's existing filters, skips layers with unpushed local
+edits, and reports any skipped or failed layers. Historical snapshots and other
+environments are left untouched. Pull never uploads local work.
 
 ### Why the plugin runs the OAuth flow itself
 
@@ -522,7 +534,8 @@ states, with the class colours unchanged in all three so the two layers stay com
 Hovering a superseded feature adds one line to the map tip: *believed until …* — which is
 the question a historical layer exists to answer.
 
-The status line under both boxes always names **both** axes, even when one of them is off:
+The status line inside **Dataset as saved on a date** names **both** axes, even
+when one of them is off, and hides when that section is collapsed:
 
 ```
 Believed: 2026-01-15 08:00Z (fixed)  ·  Valid: Temporal Controller (client-side)
@@ -550,6 +563,9 @@ something nobody has ever believed.
 ---
 
 ## Survey coverage QA
+
+The **QA** section and **Check survey coverage** are available only while connected
+with **Development (dev)** selected in **Environment**.
 
 `labeled_extent` records **where someone actually looked**, per class and per date. The
 coverage check finds labels sitting outside any `completeness = 'exhaustive'` extent for

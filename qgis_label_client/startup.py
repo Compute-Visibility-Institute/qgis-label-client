@@ -19,7 +19,9 @@ class RefreshResult:
     failed: list[str] = field(default_factory=list)
 
 
-def refresh_connected_layers(backend_url: str) -> RefreshResult:
+def refresh_connected_layers(
+    backend_url: str, *, track: str | None = None, collection_ids: set[str] | None = None
+) -> RefreshResult:
     """Invalidate clean live providers' caches without touching any edit buffer.
 
     The next canvas/table request fetches fresh server data using the layer's existing
@@ -29,6 +31,10 @@ def refresh_connected_layers(backend_url: str) -> RefreshResult:
     result = RefreshResult()
     for layer in layers.live_layers():
         if not layers.belongs_to_backend(layer, backend_url):
+            continue
+        if track is not None and layers.track_of(layer) != track:
+            continue
+        if collection_ids is not None and layers.collection_of(layer) not in collection_ids:
             continue
         if layer.isModified() or layer.customProperty("cvi/pending_state", ""):
             result.editing.append(layer.name())
@@ -197,6 +203,10 @@ class StartupConnection:
             self.connection_note += " Some layers could not refresh; see the QGIS message bar."
             self.plugin._message("; ".join(result.failed), Qgis.MessageLevel.Warning)
         self.update_status()
+        if self.dialog is not None and not result.failed:
+            # Accept only after Connect and the layer refresh complete. The
+            # dialog's finished signal also stops its status-update timer.
+            self.dialog.accept()
         return result
 
     def close(self):

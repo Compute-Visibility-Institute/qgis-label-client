@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and `qgis-plugin-ci` copies the
 most recent entries into `metadata.txt` at release time.
 
+## [0.3.2] - 2026-09-22
+
+### Added
+
+- Add **Pull all remote** to the plugin menu and place both **Push all local** and
+  **Pull all remote** under **Label layers**. Pull refreshes loaded live label layers
+  in the selected environment, preserves unpushed edits and never uploads.
+
+### Changed
+
+- Close the startup connection popup automatically after Connect succeeds and
+  loaded layers finish refreshing. Keep it open when refreshing fails.
+- Show **QA / Check survey coverage** only in the Development (`dev`) environment.
+- Move the time-status line inside the **Dataset as saved on a date** collapsible.
+
 ## [0.3.1] - 2026-09-22
 
 ### Changed

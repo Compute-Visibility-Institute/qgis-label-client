@@ -26,8 +26,8 @@ def test_one_cycle_attaches_and_detaches_everything(fake_iface):
     plugin.initGui()
     assert len(fake_iface.toolbar_icons) == 1
     assert len(fake_iface.docks) == 1
-    # Panel, connection prompt, recovery review and push-all-local remain in the menu.
-    assert [menu for menu, _ in fake_iface.plugin_menu] == [MENU_NAME] * 4
+    # Panel, connection prompt, recovery review, push and pull remain in the menu.
+    assert [menu for menu, _ in fake_iface.plugin_menu] == [MENU_NAME] * 5
 
     plugin.unload()
     assert fake_iface.toolbar_icons == []
@@ -71,6 +71,7 @@ def test_every_attachment_registers_a_teardown(fake_iface):
         "menu: push all local",
         "local source additions",
         "local source project read",
+        "menu: pull all remote",
     ]
     plugin.unload()
     assert len(plugin.teardown) == 0

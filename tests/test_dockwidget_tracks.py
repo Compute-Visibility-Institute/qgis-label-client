@@ -62,3 +62,62 @@ def test_panel_selection_respects_default_saved_and_unavailable_tracks(
 
     combo.setCurrentIndex.assert_called_once_with(expected_index)
     assert not dock._loading_tracks
+
+
+@pytest.mark.parametrize(
+    "connected,selected,advertised,visible",
+    [
+        (True, "dev", ["dev", "default"], True),
+        (True, "default", ["dev", "default"], False),
+        (True, "dev", ["default"], False),
+        (True, "", ["dev", "default"], False),
+        (False, "dev", ["dev", "default"], False),
+    ],
+)
+def test_qa_requires_connected_explicit_advertised_development_environment(
+    monkeypatch, connected, selected, advertised, visible
+):
+    dock = LabelClientDock(None)
+    dock.qa_group = Mock()
+    dock.coverage_button = Mock()
+    monkeypatch.setattr(dock, "selected_track", lambda: selected)
+    dock._tracks = [Track(name) for name in advertised]
+    dock.set_connected(connected)
+    dock.qa_group.setVisible.assert_called_with(visible)
+    dock.coverage_button.setEnabled.assert_called_with(visible)
+    dock.set_busy(True)
+    dock.qa_group.setVisible.assert_called_with(visible)
+    dock.coverage_button.setEnabled.assert_called_with(False)
+
+
+def test_qa_hides_immediately_when_leaving_dev_or_disconnecting(monkeypatch):
+    dock = LabelClientDock(None)
+    dock.qa_group = Mock()
+    dock.coverage_button = Mock()
+    selected = ["dev"]
+    monkeypatch.setattr(dock, "selected_track", lambda: selected[0])
+    dock._tracks = [Track("dev"), Track("default")]
+    dock.set_connected(True)
+    dock.qa_group.setVisible.assert_called_with(True)
+    selected[0] = "default"
+    dock._emit_track_changed()
+    dock.qa_group.setVisible.assert_called_with(False)
+    dock.coverage_button.setEnabled.assert_called_with(False)
+    selected[0] = "dev"
+    dock._emit_track_changed()
+    dock.qa_group.setVisible.assert_called_with(True)
+    dock.set_connected(False)
+    dock.qa_group.setVisible.assert_called_with(False)
+
+
+def test_readers_can_pull_without_being_offered_push_and_busy_blocks_both():
+    dock = LabelClientDock(None)
+    dock.push_all_local_button = Mock()
+    dock.pull_all_remote_button = Mock()
+    dock.set_connected(True)
+    dock.set_write_access(False)
+    dock.push_all_local_button.setEnabled.assert_called_with(False)
+    dock.pull_all_remote_button.setEnabled.assert_called_with(True)
+    dock.set_busy(True)
+    dock.push_all_local_button.setEnabled.assert_called_with(False)
+    dock.pull_all_remote_button.setEnabled.assert_called_with(False)

@@ -59,7 +59,7 @@ from .historydialog import HistoryDialog
 from .log import log, log_error, log_warning
 from .publishdialog import PublishDialog, PublishReportDialog
 from .settings import PluginSettings
-from .startup import StartupConnection
+from .startup import StartupConnection, refresh_connected_layers
 from .tasks import TaskRunner
 from .transitions import TransitionError, transition
 from .validtime import register_functions, unregister_functions
@@ -224,6 +224,16 @@ class LabelClientPlugin:
 
         self.push_local = PushAllLocal(self)
         self.push_local.install(MENU_NAME)
+        self.pull_action = QAction("Pull all remote", self.iface.mainWindow())
+        self.pull_action.setToolTip(
+            "Refresh loaded label layers in the selected environment; keep unpushed edits."
+        )
+        self.pull_action.triggered.connect(self.pull_all_remote)
+        self.iface.addPluginToMenu(MENU_NAME, self.pull_action)
+        self.teardown.add(
+            "menu: pull all remote",
+            lambda: self.iface.removePluginMenu(MENU_NAME, self.pull_action),
+        )
         log("Plugin loaded.")
 
     def unload(self) -> None:
@@ -299,6 +309,8 @@ class LabelClientPlugin:
         self.dock.loadReadOnlyLayersRequested.connect(
             lambda collection_ids: self.load_collections(collection_ids, read_only=True)
         )
+        self.dock.pushAllLocalRequested.connect(self.push_all_local)
+        self.dock.pullAllRemoteRequested.connect(self.pull_all_remote)
         self.dock.removeUnusedFieldsChanged.connect(
             lambda enabled: self.settings.set("remove_unused_fields_on_import", enabled)
         )
@@ -1485,6 +1497,78 @@ class LabelClientPlugin:
 
     # -------------------------------------------------------------------- layers
 
+    def push_all_local(self) -> None:
+        """Share the same reviewed upload between the menu and panel."""
+        if self.dock is None or self.push_local is None:
+            return
+        state = self.activities.state
+        renewing = self._session.resuming and state.count == 1
+        if (state.busy and not renewing) or self._registry_pending or self.publishing:
+            self._message("Wait for the current operation before pushing local edits.")
+            return
+        if not self.registry or self._current_write_access() is not True:
+            self._message("Connect with label write access before pushing local edits.")
+            return
+        if self._defer_until_fresh(self.push_all_local):
+            return
+        self.push_local.push_all()
+
+    def pull_all_remote(self) -> None:
+        """Refresh loaded live label layers without invoking Connect's upload path."""
+        if self.dock is None:
+            return
+        # Renewal resumes queued actions before its task releases the activity.
+        state = self.activities.state
+        renewing = self._session.resuming and state.count == 1
+        if (state.busy and not renewing) or self._registry_pending or self.publishing:
+            self._message("Wait for the current operation before pulling remote labels.")
+            return
+        if not self.registry or not self.settings.authcfg:
+            self._message("Sign in and Connect before pulling remote labels.")
+            return
+        track = self.current_track()
+        if track is None:
+            self._message("Choose an environment and Connect before pulling remote labels.")
+            return
+        if self._defer_until_fresh(self.pull_all_remote):
+            return
+        collection_ids = {
+            collection.collection_id
+            for collection in self.collections
+            if classlayers.collection_role(collection, self.bulk_capability, self.collection_roles)
+            in {"editable", "current"}
+        }
+        activity = self.activities.begin()
+        self.dock.set_status("Pulling remote labels…")
+        try:
+            result = refresh_connected_layers(
+                self.settings.api_base_url, track=track.name, collection_ids=collection_ids
+            )
+        finally:
+            activity.close()
+        summary = f"Refreshed {len(result.refreshed)} loaded label layer(s) in {track.name}."
+        if result.editing:
+            summary += f" Kept {len(result.editing)} layer(s) with unpushed local edits unchanged."
+        if result.failed:
+            summary += f" {len(result.failed)} layer(s) could not refresh."
+        if not (result.refreshed or result.editing or result.failed):
+            summary = (
+                "No loaded label layers in this environment. "
+                "Add read only or editable layers first."
+            )
+        details = []
+        if result.editing:
+            details.append("Local edits preserved: " + ", ".join(result.editing))
+        details.extend(result.failed)
+        self.dock.set_status(summary)
+        self._message(
+            summary,
+            Qgis.MessageLevel.Warning
+            if result.failed or result.editing
+            else Qgis.MessageLevel.Info,
+            "\n".join(details),
+        )
+
     def load_collections(self, collection_ids: Sequence[str], *, read_only: bool = False) -> None:
         """Add layers in the requested mode and configure them from the registry.
 
@@ -2026,6 +2110,10 @@ class LabelClientPlugin:
     def check_coverage(self) -> None:
         """Flag labels sitting outside any exhaustive survey extent for their class."""
         if self.dock is None:
+            return
+        track = self.current_track()
+        if track is None or track.name != "dev":
+            self._message("Survey coverage checks are available only in Development (dev).")
             return
         if not self.registry:
             self._fail("Connect first.")
