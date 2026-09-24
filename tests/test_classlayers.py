@@ -203,3 +203,50 @@ def test_commit_refresh_gets_new_revision_ids_without_discarding_edits(
     )
     assert layers.refresh_class_layer_after_commit(layer) is bool(expected)
     assert events == expected
+
+
+@pytest.mark.parametrize("view,axis", [("ground", "datetime"), ("recorded", "recorded_at")])
+def test_snapshot_discovery_preserves_axis_and_readonly_metadata(monkeypatch, view, axis):
+    from urllib.parse import parse_qs, urlsplit
+
+    moment = "2026-01-15T00:00:00Z"
+    document = {
+        **manifest({**entry(), "read_only": True, "native_add_field": True}),
+        "temporal_views": True,
+        "snapshot_view": view,
+        "snapshot_instant": moment,
+    }
+    seen = []
+    monkeypatch.setattr(
+        client, "request_json", lambda url, **kw: seen.append((url, kw)) or document
+    )
+    (collection,) = client.fetch_class_layers(
+        "https://example.org", "AUTH", track="dev", view=view, instant=moment
+    )
+    assert parse_qs(urlsplit(seen[0][0]).query) == {"view": [view], axis: [moment]}
+    assert seen[0][1]["track"] == "dev"
+    assert collection.transactional is False
+    assert collection.class_layer["snapshot_view"] == view
+    assert collection.class_layer["snapshot_instant"] == moment
+    assert collection.class_layer["temporal_views"] is True
+
+
+@pytest.mark.parametrize("response", ["missing", "live", "wrong-date", "writable"])
+def test_snapshot_discovery_never_downgrades_or_accepts_another_date(monkeypatch, response):
+    moment = "2026-01-15T00:00:00Z"
+    document = {
+        **manifest({**entry(), "read_only": response != "writable"}),
+        "snapshot_view": "ground",
+        "snapshot_instant": "2026-01-16T00:00:00Z" if response == "wrong-date" else moment,
+    }
+
+    def request(*args, **kwargs):
+        if response == "missing":
+            raise BackendError("Not found", status=404)
+        return manifest() if response == "live" else document
+
+    monkeypatch.setattr(client, "request_json", request)
+    with pytest.raises(BackendError):
+        client.fetch_class_layers(
+            "https://example.org", "AUTH", track="dev", view="ground", instant=moment
+        )

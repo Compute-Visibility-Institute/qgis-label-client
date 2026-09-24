@@ -32,6 +32,7 @@ from qgis.core import (
 from qgis.PyQt.QtCore import QByteArray, QDate, QDateTime, Qt, QVariant
 
 from . import network
+from .core import recorded
 from .core.errors import BackendError
 from .log import log_warning
 
@@ -47,6 +48,7 @@ CORE_FIELDS = {
     "capture_id",
     "name_en",
     "name_zh",
+    "recorded_at",
 }
 REQUIRED_FIELDS = CORE_FIELDS - {"capture_id", "name_en", "name_zh"}
 TYPES = {
@@ -62,9 +64,10 @@ TYPE_NAMES[int(QVariant.Int)] = "integer"
 _METADATA = None
 
 
-def _row_identity(document):
+def _row_identity(document, *, snapshot=False):
     identity = str(document.get("id") or "")
-    if not re.fullmatch(r"[1-9][0-9]*\.[0-9a-f]+", identity):
+    pattern = r"(?:[1-9][0-9]*|[0-9a-f]{32})\.[0-9a-f]+" if snapshot else r"[1-9][0-9]*\.[0-9a-f]+"
+    if not re.fullmatch(pattern, identity):
         raise ValueError("Server feature has no valid versioned row identity")
     return identity.split(".", 1)[0]
 
@@ -178,11 +181,26 @@ class ClassLayerProvider(QgsVectorDataProvider):
             parsed = urlsplit(self._uri.param("url"))
             landing_query = parse_qs(parsed.query)
             self._track = landing_query.get("track", [""])[0]
-            if "recorded_at" in landing_query:
-                raise ValueError("Historical snapshots require the read-only OAPIF provider")
+            self._snapshot_view = landing_query.get("view", [""])[0]
+            if self._snapshot_view not in {"", "ground", "recorded"}:
+                raise ValueError("Unknown class-layer snapshot view")
+            if self._snapshot_view:
+                axis = "datetime" if self._snapshot_view == "ground" else "recorded_at"
+                other_axis = "recorded_at" if self._snapshot_view == "ground" else "datetime"
+                if not self._read_only or not landing_query.get(axis, [""])[0]:
+                    raise ValueError(
+                        "Class snapshots require a read-only layer and an explicit date"
+                    )
+                if recorded.parse_instant(landing_query[axis][0]) is None:
+                    raise ValueError("Class snapshots require a UTC date and time")
+                if other_axis in landing_query:
+                    raise ValueError("Class snapshots must select exactly one time axis")
+            elif "recorded_at" in landing_query:
+                raise ValueError("Historical snapshots require an explicit read-only view")
             self._item_query = {"track": self._track, "limit": 1000}
-            if "datetime" in landing_query:
-                self._item_query["datetime"] = landing_query["datetime"][0]
+            for key in ("datetime", "recorded_at", "view"):
+                if key in landing_query:
+                    self._item_query[key] = landing_query[key][0]
             if parsed.scheme not in {"https", "http"} or not parsed.netloc:
                 raise ValueError(
                     "The class layer has no valid HTTP(S) API URL; reconnect and add it again"
@@ -281,9 +299,17 @@ class ClassLayerProvider(QgsVectorDataProvider):
         url = (
             self._root.removesuffix("/class-layers")
             + "/v1/class-layers?"
-            + urlencode({"track": self._track})
+            + urlencode({key: value for key, value in self._item_query.items() if key != "limit"})
         )
         document = self._http("GET", url)
+        if self._snapshot_view:
+            axis = "datetime" if self._snapshot_view == "ground" else "recorded_at"
+            if (
+                document.get("temporal_views") is not True
+                or document.get("snapshot_view") != self._snapshot_view
+                or recorded.echo_mismatch(self._item_query[axis], document.get("snapshot_instant"))
+            ):
+                raise ValueError("Server did not confirm the requested class-layer snapshot")
         spec = next(
             (
                 item
@@ -294,6 +320,12 @@ class ClassLayerProvider(QgsVectorDataProvider):
         )
         if not spec or spec.get("native_add_field") is not True:
             raise ValueError("Server does not support native Add Field for this layer; reconnect")
+        if self._snapshot_view and spec.get("read_only") is not True:
+            raise ValueError("Server did not advertise a read-only class-layer snapshot")
+        if self._snapshot_view == "recorded" and not any(
+            field.get("name") == "recorded_at" for field in spec.get("fields", [])
+        ):
+            raise ValueError("Server snapshot schema has no recorded-time echo")
         return spec
 
     def _load(self):
@@ -328,9 +360,17 @@ class ClassLayerProvider(QgsVectorDataProvider):
                 query = parse_qs(parsed.query)
                 if query.get("track", [""])[0] != self._track:
                     raise ValueError("Feature pagination changed the selected track")
-                if query.get("datetime", [""])[0] != self._item_query.get("datetime", ""):
-                    raise ValueError("Feature pagination changed the selected date")
-        rowids = [_row_identity(row) for row in documents]
+                for key in ("datetime", "recorded_at", "view"):
+                    if query.get(key, [""])[0] != self._item_query.get(key, ""):
+                        raise ValueError("Feature pagination changed the selected snapshot or date")
+        if self._snapshot_view == "recorded":
+            for row in documents:
+                problem = recorded.echo_mismatch(
+                    self._item_query["recorded_at"], row.get("properties", {}).get("recorded_at")
+                )
+                if problem:
+                    raise ValueError("Class-layer snapshot: " + problem)
+        rowids = [_row_identity(row, snapshot=bool(self._snapshot_view)) for row in documents]
         if len(set(rowids)) != len(rowids):
             raise ValueError("Feature pages contain duplicate row identities; retry refresh")
         # Build and decode against a temporary schema first. Malformed geometry,
@@ -445,7 +485,7 @@ class ClassLayerProvider(QgsVectorDataProvider):
         return feature
 
     def _cache_row(self, row, feature=None):
-        rowid = _row_identity(row)
+        rowid = _row_identity(row, snapshot=bool(self._snapshot_view))
         feature = self._feature(row) if feature is None else feature
         fid = self._fid_by_rowid.get(rowid)
         if fid is None:

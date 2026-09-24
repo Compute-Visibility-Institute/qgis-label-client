@@ -1844,10 +1844,8 @@ class LabelClientPlugin:
     def _open_date_layers(self, moment: str, *, historical: bool) -> None:
         """Stage a complete, typed, read-only view before adding any project layers.
 
-        The current class API has no recorded-time support and lists only active
-        classes. The legacy typed collections retain retired-class labels too.
-        Ground views use the full edit views for reads: current-only collections
-        would omit validity intervals which ended before today.
+        Date-aware servers describe each class at the chosen instant. Older servers
+        retain the typed legacy path, which also includes ended validity intervals.
         """
         if self.dock is None:
             return
@@ -1875,22 +1873,55 @@ class LabelClientPlugin:
             self._fail(str(exc))
             return
 
-        role = "historical" if historical else "editable"
-        candidates = [
-            item.collection_id
+        if any(
+            item.class_layer and item.class_layer.get("temporal_views") is True
             for item in self.collections
-            if item.class_layer is None
-            and classlayers.collection_role(item, self.bulk_capability, self.collection_roles)
-            == role
-        ]
-        routes = routing.build_routes(candidates)
-        families = (routing.POLYGON, routing.LINE, routing.POINT)
-        if set(routes.by_family) != set(families):
-            self._fail(
-                "This backend must expose separate polygon, line and point collections "
-                "for this date view. No layers were added; reconnect after updating the backend."
-            )
+        ):
+            track = self.current_track()
+            if track is None:
+                self._fail("Choose an available Environment before importing date-view layers.")
+                return
+            url = self.settings.api_base_url
+            registry = self.registry
+            serial = self._track_change_serial
+            authcfg = self.settings.authcfg_for(track.name)
+            view = "recorded" if historical else "ground"
+            self.dock.set_status("Loading class layers for the selected date…")
+
+            def work(feedback):
+                return client.fetch_class_layers(
+                    url, authcfg, feedback, track=track.name, view=view, instant=moment
+                )
+
+            def loaded(collections):
+                if (
+                    self.current_track() != track
+                    or self.registry is not registry
+                    or self._track_change_serial != serial
+                    or self._registry_pending
+                ):
+                    return
+                self._add_date_layers(moment, historical=historical, collections=collections)
+
+            self._run_read_task("Discover date-view class layers", work, loaded)
             return
+        self._add_date_layers(moment, historical=historical)
+
+    def _add_date_layers(self, moment, *, historical, collections=None):
+        """Add one complete snapshot; a failed provider leaves the project unchanged."""
+        parsed = recorded.parse_instant(moment)
+        groups = collection_groups.group_by_mode(collections) if collections is not None else ()
+        if collections is not None:
+            specifications = [
+                (item.collection_id, item.display_name, item.class_layer) for item in collections
+            ]
+            if not specifications:
+                self.dock.set_status("No labels exist for the selected date; no layers were added.")
+                return
+        else:
+            specifications = self._legacy_date_specifications(historical)
+            if specifications is None:
+                return
 
         track = self.current_track()
         view_settings = PendingSettings(
@@ -1902,20 +1933,23 @@ class LabelClientPlugin:
             },
         )
         caption = f"known on {moment}" if historical else f"valid on the ground on {parsed.date()}"
-        captions = {routing.POLYGON: "Polygons", routing.LINE: "Lines", routing.POINT: "Points"}
         staged = []
         activity = self.activities.begin()
         try:
-            for family in families:
+            for collection_id, title, metadata in specifications:
+                options = {"class_metadata": metadata} if metadata is not None else {}
                 layer = layer_tools.create_layer(
                     view_settings,
-                    routes.by_family[family],
-                    f"{captions[family]} — {caption} (read only)",
+                    collection_id,
+                    f"{title} — {caption} (read only)",
                     self.registry,
                     track,
                     recorded_at=moment if historical else "",
                     read_only=True,
+                    **options,
                 )
+                if metadata is not None:
+                    layer_tools.configure_class_columns(layer, dict(metadata))
                 layer.setCustomProperty(layer_tools.DATE_VIEW_PROPERTY, True)
                 layer.setCustomProperty(layer_tools.VALID_AT_PROPERTY, "" if historical else moment)
                 layer.setCustomProperty("cvi/read_only_view", True)
@@ -1940,7 +1974,7 @@ class LabelClientPlugin:
         project = QgsProject.instance()
         import_group = layertree.new_import_group(project, track, f"Read-only layers {caption}")
         for layer in staged:
-            layertree.add_collection_layer(project, layer, (), parent=import_group)
+            layertree.add_collection_layer(project, layer, groups, parent=import_group)
             self._warn_on_track_mismatch(layer, track)
             if historical:
                 self._warn_if_writable(layer)
@@ -1954,11 +1988,33 @@ class LabelClientPlugin:
             )
             self._refresh_axes()
         self.dock.set_status(
-            f"Added 3 read-only layers — {caption}. Existing layers are unchanged."
+            f"Added {len(staged)} read-only layers — {caption}. Existing layers are unchanged."
         )
         log(
             f"Added complete date view ({caption}) on track {track.name if track else '(default)'}."
         )
+
+    def _legacy_date_specifications(self, historical):
+        """Older APIs expose three geometry families instead of date-aware classes."""
+        role = "historical" if historical else "editable"
+        candidates = [
+            item.collection_id
+            for item in self.collections
+            if item.class_layer is None
+            and classlayers.collection_role(item, self.bulk_capability, self.collection_roles)
+            == role
+        ]
+        routes = routing.build_routes(candidates)
+        families = (routing.POLYGON, routing.LINE, routing.POINT)
+        if set(routes.by_family) != set(families):
+            self._fail(
+                "This backend must expose separate polygon, line and point collections "
+                "for this date view. No layers were added; reconnect after updating the backend."
+            )
+            return None
+
+        captions = {routing.POLYGON: "Polygons", routing.LINE: "Lines", routing.POINT: "Points"}
+        return [(routes.by_family[family], captions[family], None) for family in families]
 
     def _warn_if_writable(self, layer) -> None:
         """Say so if the server let a pinned request look editable.

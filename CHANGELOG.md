@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and `qgis-plugin-ci` copies the
 most recent entries into `metadata.txt` at release time.
 
+## [0.3.10] - 2026-09-24
+
+### Changed
+
+- Import both ground-valid-date and known-on-date snapshots as separate class
+  layers with individual attribute columns and a single symbol per class,
+  matching current layer imports. Each import has its own top-level group.
+- Keep snapshots read-only and pinned to their selected time, including after
+  reopening a saved project. Date-aware servers include classes and attributes
+  from the selected snapshot; older servers retain the geometry-grouped view.
+
 ## [0.3.9] - 2026-09-24
 
 ### Fixed

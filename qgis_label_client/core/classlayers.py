@@ -70,12 +70,20 @@ def parse_manifest(document: object) -> list[Collection]:
                 raise BackendError("Invalid or duplicate class-layer field definition.")
             field_names.add(field["name"])
         seen.add(identifier)
+        metadata = dict(raw)
+        metadata["temporal_views"] = document.get("temporal_views") is True
+        snapshot_view = document.get("snapshot_view", "")
+        if snapshot_view:
+            if snapshot_view not in ("ground", "recorded") or raw.get("read_only") is not True:
+                raise BackendError("The server did not mark the date-view collection read-only.")
+            metadata["snapshot_view"] = snapshot_view
+            metadata["snapshot_instant"] = document.get("snapshot_instant", "")
         collections.append(
             Collection(
                 collection_id=identifier,
                 title=str(raw.get("title") or raw.get("class_name") or raw["class_id"]),
-                transactional=True,
-                class_layer=dict(raw),
+                transactional=not bool(snapshot_view),
+                class_layer=metadata,
             )
         )
     return sorted(collections, key=lambda item: (item.display_name.casefold(), item.collection_id))

@@ -190,6 +190,8 @@ def landing_url(
     track: Track | None = None,
     recorded_at: str = "",
     collection_id: str = "",
+    snapshot_view: str = "",
+    snapshot_instant: str = "",
 ) -> str:
     """The URL handed to the provider as ``url``, carrying everything a parameter can.
 
@@ -219,6 +221,13 @@ def landing_url(
         params.update(asof.datetime_query(as_of))
     if recorded_at:
         params[recorded.RECORDED_AT_QUERY] = recorded_at
+    if snapshot_view:
+        if snapshot_view not in {"ground", "recorded"} or not snapshot_instant:
+            raise BackendError("A class snapshot needs a supported view and an explicit date.")
+        params.pop("datetime", None)
+        params.pop(recorded.RECORDED_AT_QUERY, None)
+        params["view"] = snapshot_view
+        params["datetime" if snapshot_view == "ground" else "recorded_at"] = snapshot_instant
     if track is not None:
         params["track"] = track.name
     return with_query(base, params) if params else base
@@ -295,6 +304,8 @@ def build_layer_uri(
     track: Track | None = None,
     track_filter: str | None = None,
     recorded_at: str = "",
+    snapshot_view: str = "",
+    snapshot_instant: str = "",
 ) -> str:
     """Data-source URI for one collection, honouring the as-of state, track and instant.
 
@@ -314,7 +325,7 @@ def build_layer_uri(
     """
     as_of = settings.as_of
     cql = None
-    if as_of is not None and settings.as_of_mechanism is AsOfMechanism.CQL2:
+    if not snapshot_view and as_of is not None and settings.as_of_mechanism is AsOfMechanism.CQL2:
         fields = registry.fields if registry else None
         cql = asof.cql2_filter(as_of, fields) if fields else asof.cql2_filter(as_of)
     headers: dict[str, str] = {}
@@ -322,7 +333,9 @@ def build_layer_uri(
         headers[TRACK_HEADER] = track.name
     headers.update(recorded.headers(recorded_at))
     return build_oapif_uri(
-        landing_url=landing_url(settings, track, recorded_at, collection_id),
+        landing_url=landing_url(
+            settings, track, recorded_at, collection_id, snapshot_view, snapshot_instant
+        ),
         collection_id=collection_id,
         authcfg=settings.authcfg_for(track.name if track else "") or None,
         page_size=int(settings.get("page_size")),
@@ -416,9 +429,33 @@ def create_layer(
     ``setDataSource`` rebuilds the provider and recomputes the layer's read-only state from
     the new provider's capabilities.
     """
-    uri = build_layer_uri(settings, collection_id, registry, track, recorded_at=recorded_at)
+    snapshot_view = str((class_metadata or {}).get("snapshot_view") or "")
+    snapshot_instant = str((class_metadata or {}).get("snapshot_instant") or "")
+    if snapshot_view:
+        read_only = True
+        if snapshot_view == "recorded":
+            if recorded_at and recorded.echo_mismatch(recorded_at, snapshot_instant):
+                raise BackendError("The requested and advertised snapshot dates differ.")
+            recorded_at = snapshot_instant
+        elif recorded_at:
+            raise BackendError("A ground-date class snapshot cannot also pin recorded time.")
+    uri = build_layer_uri(
+        settings,
+        collection_id,
+        registry,
+        track,
+        recorded_at=recorded_at,
+        snapshot_view=snapshot_view,
+        snapshot_instant=snapshot_instant,
+    )
     provider = OAPIF_PROVIDER
-    if class_metadata and class_metadata.get("native_add_field") is True and not recorded_at:
+    if snapshot_view and (class_metadata or {}).get("native_add_field") is not True:
+        raise BackendError("This server does not support native read-only class snapshots.")
+    if (
+        class_metadata
+        and class_metadata.get("native_add_field") is True
+        and (not recorded_at or snapshot_view)
+    ):
         from .classprovider import register_provider
 
         register_provider()
@@ -461,13 +498,23 @@ def create_layer(
         layer.setCustomProperty(TRACK_PROPERTY, track.name)
     if recorded_at:
         layer.setCustomProperty(RECORDED_AT_PROPERTY, recorded_at)
+    if class_metadata:
+        layer.setCustomProperty(classlayers.METADATA_PROPERTY, json.dumps(class_metadata))
+    if snapshot_view:
+        layer.setCustomProperty(DATE_VIEW_PROPERTY, True)
+        layer.setCustomProperty(
+            VALID_AT_PROPERTY, snapshot_instant if snapshot_view == "ground" else ""
+        )
+        layer.setCustomProperty("cvi/read_only_view", True)
+        layer.setReadOnly(True)
+        layer.setAutoRefreshMode(Qgis.AutoRefreshMode.Disabled)
     apply_canaries(layer, settings, registry, track, recorded_at)
     # AFTER the re-point, not before: apply_canaries swaps the data source, and the check
     # has to be made against the requests the layer will actually keep making.
     verify_recorded_echo(layer, recorded_at, registry)
     if recorded_at:
         configure_historical_layer(layer, registry, recorded_at)
-    else:
+    elif not snapshot_view:
         # Live layers only. A historical layer is read-only by construction, and putting
         # a creation default on one would propose a valid time for a feature that can
         # never be created -- harmless, but it would appear in the field configuration
@@ -523,6 +570,7 @@ def validate_repoint(layer, settings, registry, track) -> None:
     """Check a detached provider and its historical pin before changing project layers."""
     settings = settings_for_date_view(layer, settings)
     recorded_at = recorded_at_of(layer)
+    metadata = class_layer_metadata(layer)
     uri = build_layer_uri(
         settings,
         collection_of(layer),
@@ -530,6 +578,8 @@ def validate_repoint(layer, settings, registry, track) -> None:
         track,
         track_filter=track_filter_for(layer, track, registry),
         recorded_at=recorded_at,
+        snapshot_view=str(metadata.get("snapshot_view") or ""),
+        snapshot_instant=str(metadata.get("snapshot_instant") or ""),
     )
     candidate = QgsVectorLayer(
         _preserve_class_options(layer, uri), layer.name(), layer.providerType()
@@ -565,6 +615,7 @@ def repoint_for(
     """
     settings = settings_for_date_view(layer, settings)
     recorded_at = recorded_at_of(layer)
+    metadata = class_layer_metadata(layer)
     uri = build_layer_uri(
         settings,
         collection_of(layer),
@@ -572,6 +623,8 @@ def repoint_for(
         track,
         track_filter=track_filter_for(layer, track, registry),
         recorded_at=recorded_at,
+        snapshot_view=str(metadata.get("snapshot_view") or ""),
+        snapshot_instant=str(metadata.get("snapshot_instant") or ""),
     )
     provider = None
     if (
@@ -1472,7 +1525,7 @@ def refresh_class_layer_after_commit(layer: QgsVectorLayer) -> bool:
     so keeping them after Save would make a later delete use the previous revision.
     Called on the next event-loop turn, after QGIS has cleared its commit buffer.
     """
-    if not class_layer_metadata(layer) or layer.isModified():
+    if is_date_view(layer) or not class_layer_metadata(layer) or layer.isModified():
         return False
     if layer.customProperty("cvi/pending_state", ""):
         return False

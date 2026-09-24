@@ -5,6 +5,7 @@ when validation is requested. These tests cover wire and retry boundaries.
 """
 
 from types import FunctionType, SimpleNamespace
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 
@@ -128,6 +129,120 @@ def test_class_provider_reports_specific_uri_failure(provider_constructor, url, 
     assert errors == [instance.last_refresh_error]
     assert diagnostic in instance.last_refresh_error
     assert warnings == ["Could not open CVI class layer: " + instance.last_refresh_error]
+
+
+@pytest.mark.parametrize("view,axis", [("ground", "datetime"), ("recorded", "recorded_at")])
+def test_snapshot_provider_forwards_pin_and_checks_manifest(
+    provider_constructor, monkeypatch, view, axis
+):
+    moment = "2026-09-22T17:40:00Z"
+    instance = provider.ClassLayerProvider(
+        {
+            "url": "https://api.example.org/class-layers?"
+            + urlencode({"track": "dev", "view": view, axis: moment}),
+            "typename": "cl_campus__polygon",
+            "cviReadOnly": "1",
+        }
+    )
+    assert instance.isValid()
+    assert instance._item_query == {"track": "dev", "limit": 1000, "view": view, axis: moment}
+    assert instance._read_only
+    document = {
+        "temporal_views": True,
+        "snapshot_view": view,
+        "snapshot_instant": moment,
+        "collections": [
+            {
+                "id": "cl_campus__polygon",
+                "read_only": True,
+                "native_add_field": True,
+                "fields": [{"name": "recorded_at"}],
+            }
+        ],
+    }
+    requests = []
+
+    def http(_self, method, url):
+        requests.append((method, parse_qs(urlsplit(url).query)))
+        return document
+
+    monkeypatch.setattr(provider.ClassLayerProvider, "_http", http)
+    assert instance._manifest() == document["collections"][0]
+    assert requests == [("GET", {"track": ["dev"], "view": [view], axis: [moment]})]
+    document["snapshot_instant"] = "2026-09-23T17:40:00Z"
+    with pytest.raises(ValueError, match="confirm the requested"):
+        instance._manifest()
+
+
+@pytest.mark.parametrize(
+    "query,readonly",
+    [
+        ({"view": "ground", "datetime": "2026-09-22T00:00:00Z"}, False),
+        ({"view": "recorded"}, True),
+        ({"view": "ground", "recorded_at": "2026-09-22T00:00:00Z"}, True),
+        (
+            {"view": "recorded", "recorded_at": "2026-09-22T00:00:00Z", "datetime": "2026-09-21"},
+            True,
+        ),
+        ({"view": "unknown", "datetime": "2026-09-22T00:00:00Z"}, True),
+    ],
+)
+def test_snapshot_uri_cannot_be_writable_or_ambiguous(provider_constructor, query, readonly):
+    instance = provider.ClassLayerProvider(
+        {
+            "url": "https://api.example.org/class-layers?" + urlencode({"track": "dev", **query}),
+            "typename": "cl_campus__polygon",
+            "cviReadOnly": "1" if readonly else "0",
+        }
+    )
+    assert not instance.isValid()
+    assert not provider_constructor[0]
+
+
+def test_historical_row_ids_are_supported_only_in_snapshots():
+    identity = "a" * 32
+    row = {"id": identity + ".123abc"}
+    assert provider._row_identity(row, snapshot=True) == identity
+    assert provider._row_identity({"id": "12.abc"}, snapshot=True) == "12"
+    with pytest.raises(ValueError):
+        provider._row_identity(row)
+
+
+@pytest.mark.parametrize("lost", ["view", "recorded_at", "track"])
+def test_pagination_cannot_drop_snapshot_pin(lost):
+    query = {"track": "dev", "view": "recorded", "recorded_at": "2026-09-22T17:40:00Z"}
+    next_query = {key: value for key, value in query.items() if key != lost}
+    url = "https://api.example.org/class-layers/collections/cl_campus__polygon"
+    state = SimpleNamespace(
+        _manifest=lambda: {},
+        _collection_url=url,
+        _track="dev",
+        _snapshot_view="recorded",
+        _item_query={**query, "limit": 1000},
+        _http=lambda *_: {
+            "type": "FeatureCollection",
+            "features": [],
+            "links": [{"rel": "next", "href": url + "/items?" + urlencode(next_query)}],
+        },
+    )
+    with pytest.raises(ValueError, match="pagination changed"):
+        provider.ClassLayerProvider._load(state)
+
+
+def test_recorded_rows_are_refused_when_echo_does_not_match():
+    state = SimpleNamespace(
+        _manifest=lambda: {},
+        _collection_url="https://api.example.org/class-layers/collections/cl_campus__polygon",
+        _track="dev",
+        _snapshot_view="recorded",
+        _item_query={"track": "dev", "view": "recorded", "recorded_at": "2026-09-22T17:40:00Z"},
+        _http=lambda *_: {
+            "type": "FeatureCollection",
+            "features": [{"id": "12.abc", "properties": {"recorded_at": "@2026-09-23T00:00:00Z"}}],
+        },
+    )
+    with pytest.raises(ValueError, match="snapshot"):
+        provider.ClassLayerProvider._load(state)
 
 
 def test_physical_row_identity_survives_revision_and_distinguishes_valid_versions():

@@ -45,7 +45,7 @@ from typing import Any
 
 from qgis.core import QgsFeedback
 
-from .core import bulk, classlayers, urls
+from .core import bulk, classlayers, recorded, urls
 from .core.assets import SignedAsset, parse_signed_assets
 from .core.collections import Collection, parse_collections
 from .core.errors import BackendError
@@ -91,20 +91,41 @@ def fetch_tracks(
 
 
 def fetch_class_layers(
-    base_url: str, authcfg: str, feedback=None, track: str = ""
+    base_url: str,
+    authcfg: str,
+    feedback=None,
+    track: str = "",
+    *,
+    view: str = "",
+    instant: str = "",
 ) -> list[Collection]:
     """Discover optional class layers; only an explicit 404 means legacy API."""
+    url = urls.join_path(base_url, classlayers.MANIFEST_PATH)
+    if view:
+        if view not in ("ground", "recorded") or recorded.parse_instant(instant) is None:
+            raise BackendError("A date-view manifest requires a supported view and an instant.")
+        url = urls.with_query(
+            url, {"view": view, "datetime" if view == "ground" else "recorded_at": instant}
+        )
     try:
         document = request_json(
-            urls.join_path(base_url, classlayers.MANIFEST_PATH),
+            url,
             authcfg=authcfg,
             feedback=feedback,
             track=track,
         )
     except BackendError as exc:
-        if exc.status == 404:
+        if exc.status == 404 and not view:
             return []
         raise
+    if view and (
+        not isinstance(document, Mapping)
+        or document.get("enabled") is not True
+        or document.get("snapshot_view") != view
+        or recorded.parse_instant(document.get("snapshot_instant", ""))
+        != recorded.parse_instant(instant)
+    ):
+        raise BackendError("The server did not confirm the requested date-view instant.")
     return classlayers.parse_manifest(document)
 
 

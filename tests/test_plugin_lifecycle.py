@@ -620,3 +620,90 @@ def test_publish_completion_updates_registry_even_when_result_dialog_not_visible
     assert plugin.registry.get("compound").style == {"fill": "#95ff00"}
     assert REGISTRY.get("compound").style != {"fill": "#95ff00"}
     plugin.unload()
+
+
+@pytest.mark.parametrize("historical", [False, True])
+@pytest.mark.parametrize("outcome", ["complete", "failed-provider", "changed-environment"])
+def test_date_views_use_snapshot_classes_columns_and_one_import_group(
+    fake_iface, monkeypatch, historical, outcome
+):
+    from unittest.mock import Mock
+
+    from qgis_label_client import client, layertree
+    from qgis_label_client.core.collections import Collection
+    from qgis_label_client.core.errors import BackendError
+    from qgis_label_client.core.tracks import Track
+
+    plugin = _plugin(fake_iface)
+    track = Track("dev", "dev-id")
+    monkeypatch.setattr(plugin, "current_track", lambda: track)
+    moment = "2026-01-15T00:00:00Z"
+    view = "recorded" if historical else "ground"
+    plugin.collections = [
+        Collection("cl_live__polygon", "Live", class_layer={"temporal_views": True})
+    ]
+    snapshots = [
+        Collection(
+            f"cl_{name}__{family}",
+            name,
+            class_layer={
+                "class_id": name,
+                "family": family,
+                "class_name": name,
+                "snapshot_view": view,
+                "snapshot_instant": moment,
+                "native_add_field": True,
+                "read_only": True,
+            },
+        )
+        for name, family in [("retired", "polygon"), ("cable", "line"), ("unit", "point")]
+    ]
+    fetch = Mock(return_value=snapshots)
+    monkeypatch.setattr(client, "fetch_class_layers", fetch)
+
+    def run(description, work, succeeded):
+        result = work(None)
+        if outcome == "changed-environment":
+            plugin._track_change_serial += 1
+        succeeded(result)
+
+    monkeypatch.setattr(plugin, "_run_read_task", run)
+    configure = Mock()
+    monkeypatch.setattr(layer_tools, "configure_class_columns", configure)
+    monkeypatch.setattr(layer_tools, "apply_registry", Mock())
+    monkeypatch.setattr(plugin, "_warn_on_track_mismatch", Mock())
+    monkeypatch.setattr(plugin, "_warn_if_writable", Mock())
+    group = Mock()
+    make_group = Mock(return_value=group)
+    add = Mock()
+    monkeypatch.setattr(layertree, "new_import_group", make_group)
+    monkeypatch.setattr(layertree, "add_collection_layer", add)
+    created = []
+
+    def create(*args, **kwargs):
+        if outcome == "failed-provider" and created:
+            raise BackendError("Snapshot unavailable")
+        layer = Mock()
+        created.append((layer, args, kwargs))
+        return layer
+
+    monkeypatch.setattr(layer_tools, "create_layer", create)
+    try:
+        plugin._open_date_layers(moment, historical=historical)
+        assert fetch.call_args.kwargs == {"track": "dev", "view": view, "instant": moment}
+        if outcome != "complete":
+            make_group.assert_not_called()
+            add.assert_not_called()
+            return
+        make_group.assert_called_once()
+        assert len(created) == len(snapshots)
+        assert configure.call_count == len(snapshots)
+        assert add.call_count == len(snapshots)
+        for (layer, args, kwargs), spec in zip(created, snapshots, strict=True):
+            assert args[1] == spec.collection_id
+            assert kwargs["class_metadata"] is spec.class_layer
+            assert kwargs["read_only"] is True
+            layer.setReadOnly.assert_called_with(True)
+        assert all(call.kwargs["parent"] is group for call in add.call_args_list)
+    finally:
+        plugin.unload()

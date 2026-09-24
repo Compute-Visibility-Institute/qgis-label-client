@@ -451,6 +451,94 @@ def test_a_live_layer_sends_no_instant_at_all():
     assert "recorded_at=" not in uri
 
 
+@pytest.mark.parametrize("view,axis", [("ground", "datetime"), ("recorded", "recorded_at")])
+def test_class_snapshot_uri_has_only_its_own_time_axis(view, axis):
+    settings = _settings(as_of_enabled=True, as_of_date="2026-02-20")
+    uri = layer_tools.build_layer_uri(
+        settings,
+        "cl_campus__polygon",
+        REGISTRY,
+        TRACK,
+        snapshot_view=view,
+        snapshot_instant=MOMENT,
+    )
+    assert _landing_query(uri) == {"track": TRACK.name, "view": view, axis: MOMENT}
+
+
+@pytest.mark.parametrize("view,axis", [("ground", "datetime"), ("recorded", "recorded_at")])
+def test_saved_class_snapshot_repoint_keeps_pin_and_readonly(monkeypatch, view, axis):
+    import json
+
+    layer = _historical() if view == "recorded" else _FakeLayer("ground date", LABEL_FIELDS)
+    layer.providerType = lambda: layer_tools.CLASS_PROVIDER
+    layer.properties.update(
+        {
+            layer_tools.COLLECTION_PROPERTY: "cl_campus__polygon",
+            layer_tools.DATE_VIEW_PROPERTY: True,
+            layer_tools.VALID_AT_PROPERTY: MOMENT if view == "ground" else "",
+            "cvi/read_only_view": True,
+            "cvi/class_layer": json.dumps(
+                {"snapshot_view": view, "snapshot_instant": MOMENT, "class_id": "campus"}
+            ),
+        }
+    )
+    calls = []
+    monkeypatch.setattr(layer_tools, "repoint_layer", lambda _layer, uri: calls.append(uri))
+    layer_tools.repoint_for(
+        layer, _settings(as_of_enabled=True, as_of_date="2026-03-01"), REGISTRY, TRACK
+    )
+    assert _landing_query(calls[0]) == {"track": TRACK.name, "view": view, axis: MOMENT}
+    assert layer.read_only
+
+
+@pytest.mark.parametrize("view,axis", [("ground", "datetime"), ("recorded", "recorded_at")])
+def test_class_snapshot_uses_readonly_native_provider(monkeypatch, view, axis):
+    from qgis_label_client import classprovider
+
+    layer = _historical() if view == "recorded" else _FakeLayer("ground date", LABEL_FIELDS)
+    layer.providerType = lambda: layer_tools.CLASS_PROVIDER
+    layer.isValid = lambda: True
+    refresh = []
+    layer.setAutoRefreshMode = refresh.append
+    created = []
+    readonly = []
+
+    def construct(uri, name, provider):
+        created.append((uri, name, provider))
+        return layer
+
+    monkeypatch.setattr(layer_tools, "QgsVectorLayer", construct)
+    monkeypatch.setattr(classprovider, "register_provider", lambda: None)
+
+    def configure_uri(uri, **kwargs):
+        readonly.append(kwargs["read_only"])
+        return uri
+
+    monkeypatch.setattr(layer_tools, "class_provider_uri", configure_uri)
+    monkeypatch.setattr(layer_tools, "configure_historical_layer", lambda *args: None)
+    result = layer_tools.create_layer(
+        _settings(),
+        "cl_campus__polygon",
+        "Campus (read only)",
+        REGISTRY,
+        TRACK,
+        class_metadata={
+            "snapshot_view": view,
+            "snapshot_instant": MOMENT,
+            "native_add_field": True,
+            "read_only": True,
+            "class_id": "campus",
+        },
+    )
+    assert result is layer
+    assert created[0][2] == layer_tools.CLASS_PROVIDER
+    assert _landing_query(created[0][0]) == {"track": TRACK.name, "view": view, axis: MOMENT}
+    assert readonly == [True]
+    assert layer.read_only and layer_tools.is_date_view(layer)
+    assert refresh == [layer_tools.Qgis.AutoRefreshMode.Disabled]
+    assert layer_tools.class_layer_metadata(layer)["snapshot_instant"] == MOMENT
+
+
 def test_a_correctly_pinned_layer_passes_the_echo_check():
     layer_tools.verify_recorded_echo(_historical(), MOMENT, REGISTRY)
 
