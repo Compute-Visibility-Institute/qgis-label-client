@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and `qgis-plugin-ci` copies the
 most recent entries into `metadata.txt` at release time.
 
+## [0.3.11] - 2026-09-24
+
+### Fixed
+
+- Pull all remote now refreshes the class registry and class-layer choices before
+  reloading clean layers. Newly created classes appear without reconnecting;
+  unsaved edits and dated snapshot schemas remain protected.
+
 ## [0.3.10] - 2026-09-24
 
 ### Changed

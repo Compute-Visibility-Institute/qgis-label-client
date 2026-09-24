@@ -1423,71 +1423,9 @@ class LabelClientPlugin:
         # because quietly moving somebody to another dataset is the failure this whole
         # feature exists to prevent.
         self.dock.set_tracks(self.tracks, self.settings.track)
-        loaded = {layer_tools.collection_of(layer) for layer in layer_tools.plugin_layers()}
-        # Each mode button loads every member; native tree groups still preserve the
-        # server's class and geometry metadata.
-        groups = collection_groups.group_by_mode(
-            classlayers.visible_collections(
-                self.collections, self.bulk_capability, self.collection_roles
-            )
-        )
-        self.dock.set_collections(groups, checked=loaded)
-        readonly_groups = collection_groups.group_by_mode(
-            classlayers.readonly_collections(
-                self.collections, self.bulk_capability, self.collection_roles
-            )
-        )
-        self.dock.set_readonly_collections(readonly_groups)
-        references = collection_groups.group_by_mode(
-            classlayers.reference_collections(
-                self.collections, self.bulk_capability, self.collection_roles
-            )
-        )
-        self.dock.set_reference_collections(references, checked=loaded)
-        layertree.group_existing_layers(QgsProject.instance(), groups + readonly_groups)
-        self.dock.set_registry(self.registry)
         selected = self.current_track()
         style_track = result.get("registry_track", selected.name if selected else "")
-        class_metadata = {
-            c.collection_id: c.class_layer for c in self.collections if c.class_layer is not None
-        }
-        collection_titles = {c.collection_id: c.display_name for c in self.collections}
-        for layer in layer_tools.plugin_layers():
-            if not layer_tools.belongs_to_backend(layer, self.settings.api_base_url):
-                continue
-            layer_tools.refresh_plugin_layer_title(
-                layer, collection_titles.get(layer_tools.collection_of(layer), "")
-            )
-            track_authcfg = stored.get(layer_tools.track_of(layer))
-            if track_authcfg:
-                try:
-                    layer_tools.repair_track_auth(layer, track_authcfg, self.settings.api_base_url)
-                except LabelClientError as exc:
-                    self._message(str(exc), Qgis.MessageLevel.Warning)
-            if layer_tools.track_of(layer) != style_track:
-                continue
-            metadata = class_metadata.get(layer_tools.collection_of(layer))
-            if metadata and metadata != layer_tools.class_layer_metadata(layer):
-                if (
-                    layer.isEditable()
-                    or layer.isModified()
-                    or layer.customProperty("cvi/pending_state", "")
-                ):
-                    self._message(
-                        f"Save or recover edits in {layer.name()} and Connect again to load new attributes.",
-                        Qgis.MessageLevel.Warning,
-                    )
-                else:
-                    if layer.providerType() != layer_tools.CLASS_PROVIDER:
-                        layer_tools.repoint_for(
-                            layer, self.settings, self.registry, selected, class_metadata=metadata
-                        )
-                    # Class providers append newly discovered columns during the
-                    # normal connection refresh without pruning existing ones.
-                    layer_tools.configure_class_columns(layer, dict(metadata))
-            refreshed = layer_tools.refresh_generated_style(layer, self.registry)
-            if layer_tools.refresh_generated_captions(layer, self.registry) or refreshed:
-                self.iface.layerTreeView().refreshLayerSymbology(layer.id())
+        self._apply_current_catalog(stored, style_track)
         self.dock.set_connected(True)
         self._refresh_track_banner()
         self._refresh_recorded_bounds()
@@ -1514,6 +1452,81 @@ class LabelClientPlugin:
         else:
             self.startup.refresh_layers()
 
+    def _apply_current_catalog(self, stored: dict[str, str], style_track: str) -> None:
+        """Refresh class choices and clean loaded layers from current discovery."""
+        loaded = {layer_tools.collection_of(layer) for layer in layer_tools.plugin_layers()}
+        # Each mode button loads every member; native tree groups still preserve the
+        # server's class and geometry metadata.
+        groups = collection_groups.group_by_mode(
+            classlayers.visible_collections(
+                self.collections, self.bulk_capability, self.collection_roles
+            )
+        )
+        self.dock.set_collections(groups, checked=loaded)
+        readonly_groups = collection_groups.group_by_mode(
+            classlayers.readonly_collections(
+                self.collections, self.bulk_capability, self.collection_roles
+            )
+        )
+        self.dock.set_readonly_collections(readonly_groups)
+        references = collection_groups.group_by_mode(
+            classlayers.reference_collections(
+                self.collections, self.bulk_capability, self.collection_roles
+            )
+        )
+        self.dock.set_reference_collections(references, checked=loaded)
+        layertree.group_existing_layers(QgsProject.instance(), groups + readonly_groups)
+        self.dock.set_registry(self.registry)
+        selected = self.current_track()
+        class_metadata = {
+            c.collection_id: c.class_layer for c in self.collections if c.class_layer is not None
+        }
+        collection_titles = {c.collection_id: c.display_name for c in self.collections}
+        for layer in layer_tools.plugin_layers():
+            if not layer_tools.belongs_to_backend(layer, self.settings.api_base_url):
+                continue
+            layer_tools.refresh_plugin_layer_title(
+                layer, collection_titles.get(layer_tools.collection_of(layer), "")
+            )
+            track_authcfg = stored.get(layer_tools.track_of(layer))
+            if track_authcfg:
+                try:
+                    layer_tools.repair_track_auth(layer, track_authcfg, self.settings.api_base_url)
+                except LabelClientError as exc:
+                    self._message(str(exc), Qgis.MessageLevel.Warning)
+            if layer_tools.track_of(layer) != style_track:
+                continue
+            # A dated snapshot has its own schema, inferred at that date. Its
+            # collection ID is also used by the live class layer, so the live
+            # manifest must not replace the snapshot's saved field definitions.
+            metadata = (
+                None
+                if layer_tools.is_date_view(layer)
+                else class_metadata.get(layer_tools.collection_of(layer))
+            )
+            if metadata and metadata != layer_tools.class_layer_metadata(layer):
+                if (
+                    layer.isEditable()
+                    or layer.isModified()
+                    or layer.customProperty("cvi/pending_state", "")
+                ):
+                    self._message(
+                        f"Save or recover edits in {layer.name()}, then Pull all remote or "
+                        "Connect again to load new attributes.",
+                        Qgis.MessageLevel.Warning,
+                    )
+                else:
+                    if layer.providerType() != layer_tools.CLASS_PROVIDER:
+                        layer_tools.repoint_for(
+                            layer, self.settings, self.registry, selected, class_metadata=metadata
+                        )
+                    # Class providers append newly discovered columns during the
+                    # normal connection refresh without pruning existing ones.
+                    layer_tools.configure_class_columns(layer, dict(metadata))
+            refreshed = layer_tools.refresh_generated_style(layer, self.registry)
+            if layer_tools.refresh_generated_captions(layer, self.registry) or refreshed:
+                self.iface.layerTreeView().refreshLayerSymbology(layer.id())
+
     # -------------------------------------------------------------------- layers
 
     def push_all_local(self) -> None:
@@ -1533,7 +1546,7 @@ class LabelClientPlugin:
         self.push_local.push_all()
 
     def pull_all_remote(self) -> None:
-        """Refresh loaded live label layers without invoking Connect's upload path."""
+        """Refresh class discovery and loaded labels without Connect's upload path."""
         if self.dock is None:
             return
         # Renewal resumes queued actions before its task releases the activity.
@@ -1551,6 +1564,36 @@ class LabelClientPlugin:
             return
         if self._defer_until_fresh(self.pull_all_remote):
             return
+        url = self.settings.api_base_url
+        registry_path = str(self.settings.get("class_registry_path"))
+        authcfg = self.settings.authcfg_for(track.name)
+        serial = self._track_change_serial
+        self._registry_pending = True
+        self.dock.set_status("Refreshing classes and remote labels…")
+
+        def work(feedback):
+            return (
+                client.fetch_collections(url, authcfg, feedback, track=track.name)
+                + client.fetch_class_layers(url, authcfg, feedback, track=track.name),
+                client.fetch_registry(url, registry_path, authcfg, feedback, track=track.name),
+            )
+
+        def failed(_message):
+            if serial == self._track_change_serial:
+                self._registry_pending = False
+
+        def ready(result):
+            if serial != self._track_change_serial or self.current_track() != track:
+                return
+            self._registry_pending = False
+            self.collections, self.registry = result
+            self._apply_current_catalog(self.settings.authcfg_by_track, track.name)
+            self._finish_pull_all_remote(track)
+
+        self._run_read_task("Refresh classes and remote labels", work, ready, failed)
+
+    def _finish_pull_all_remote(self, track: Track) -> None:
+        """Reload clean live providers after class discovery has updated the panel."""
         collection_ids = {
             collection.collection_id
             for collection in self.collections
@@ -1565,14 +1608,17 @@ class LabelClientPlugin:
             )
         finally:
             activity.close()
-        summary = f"Refreshed {len(result.refreshed)} loaded label layer(s) in {track.name}."
+        summary = (
+            f"Updated {len(self.registry)} classes; refreshed "
+            f"{len(result.refreshed)} loaded label layer(s) in {track.name}."
+        )
         if result.editing:
             summary += f" Kept {len(result.editing)} layer(s) with unpushed local edits unchanged."
         if result.failed:
             summary += f" {len(result.failed)} layer(s) could not refresh."
         if not (result.refreshed or result.editing or result.failed):
             summary = (
-                "No loaded label layers in this environment. "
+                f"Updated {len(self.registry)} classes. No loaded label layers in this environment. "
                 "Add read only or editable layers first."
             )
         details = []

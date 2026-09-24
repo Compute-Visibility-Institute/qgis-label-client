@@ -34,8 +34,9 @@ retained. Turn the option off before adding layers to include all discovered
 attributes. It does not remove columns from an active editing session or prune a
 newly added local field when refreshing.
 
-New classes and fields are discovered on Connect. Save or recover pending edits before
-reconnecting to load a changed field schema; existing dirty layers are never replaced.
+New classes and fields are discovered on Connect and **Pull all remote**. Save or
+recover pending edits before refreshing a changed field schema; existing dirty
+layers are never replaced.
 Local uploads continue through the established bulk API, preserving all source data.
 Servers without the new capability keep the existing geometry-layer interface. An
 authentication, network or malformed-capability error is reported rather than silently
@@ -276,9 +277,10 @@ project before upgrading; recovery journals do not replace saving local source f
 ### Pull remote labels
 
 **Pull all remote**, available under **Label layers** and in **Plugins → CVI Label
-Client**, refreshes all loaded live label layers for the connected server and
-selected environment. It is available to read-only users too. Add read-only or
-editable layers first if none are loaded.
+Client**, refreshes the class list and all loaded live label layers for the
+connected server and selected environment. New classes become available under
+**Add editable layers** and **Add read only layers**. It is available to read-only
+users too. Add layers after pulling if none are loaded.
 
 Pull preserves each layer's existing filters, skips layers with unpushed local
 edits, and reports any skipped or failed layers. Historical snapshots and other

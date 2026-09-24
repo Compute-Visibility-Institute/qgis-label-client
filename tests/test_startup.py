@@ -198,7 +198,7 @@ def test_pull_is_available_to_readers_and_never_invokes_connect_upload_path(
 ):
     plugin = LabelClientPlugin(fake_iface)
     plugin.dock = Mock()
-    plugin.registry = object()
+    plugin.registry = [object()]
     plugin.settings.set("track", "dev")
     plugin.settings.set_authcfg_by_track({"dev": "auth001"})
     plugin.tracks = [Track("dev")]
@@ -221,17 +221,40 @@ def test_pull_is_available_to_readers_and_never_invokes_connect_upload_path(
     plugin.pending = SimpleNamespace(on_connected=Mock())
     monkeypatch.setattr(plugin, "_current_write_access", lambda: False)
     monkeypatch.setattr(plugin, "_defer_until_fresh", lambda callback: False)
+    refreshed_registry = [object(), object()]
+    refreshed_collections = [
+        Collection("cl_new__line", "New line", class_layer={"class_id": "new"})
+    ]
+    fetch_collections = Mock(return_value=[])
+    fetch_class_layers = Mock(return_value=refreshed_collections)
+    fetch_registry = Mock(return_value=refreshed_registry)
+    monkeypatch.setattr("qgis_label_client.plugin.client.fetch_collections", fetch_collections)
+    monkeypatch.setattr("qgis_label_client.plugin.client.fetch_class_layers", fetch_class_layers)
+    monkeypatch.setattr("qgis_label_client.plugin.client.fetch_registry", fetch_registry)
+    apply_catalog = Mock()
+    monkeypatch.setattr(plugin, "_apply_current_catalog", apply_catalog)
+    monkeypatch.setattr(
+        plugin, "_run_read_task", lambda description, work, ready, failed: ready(work(None))
+    )
     refresh = Mock(return_value=startup.RefreshResult(refreshed=["labels"]))
     monkeypatch.setattr("qgis_label_client.plugin.refresh_connected_layers", refresh)
     plugin.pull_all_remote()
     if allowed:
+        fetch_collections.assert_called_once()
+        fetch_class_layers.assert_called_once()
+        fetch_registry.assert_called_once()
+        assert plugin.collections == refreshed_collections
+        assert plugin.registry is refreshed_registry
+        apply_catalog.assert_called_once_with(plugin.settings.authcfg_by_track, "dev")
         refresh.assert_called_once_with(
             plugin.settings.api_base_url,
             track="dev",
-            collection_ids={"label_polygon", "label_current_polygon", "cl_alpha__point"},
+            collection_ids={"cl_new__line"},
         )
         closed.assert_called_once_with()
     else:
+        fetch_collections.assert_not_called()
+        apply_catalog.assert_not_called()
         refresh.assert_not_called()
         closed.assert_not_called()
     plugin.connect_backend.assert_not_called()
