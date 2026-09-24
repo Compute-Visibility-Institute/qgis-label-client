@@ -183,14 +183,18 @@ class ClassLayerProvider(QgsVectorDataProvider):
             self._item_query = {"track": self._track, "limit": 1000}
             if "datetime" in landing_query:
                 self._item_query["datetime"] = landing_query["datetime"][0]
-            if (
-                parsed.scheme not in {"https", "http"}
-                or not parsed.netloc
-                or not parsed.path.rstrip("/").endswith("/class-layers")
-                or not self._track.strip()
-            ):
+            if parsed.scheme not in {"https", "http"} or not parsed.netloc:
                 raise ValueError(
-                    "Native attribute editing requires a class layer with an explicit environment"
+                    "The class layer has no valid HTTP(S) API URL; reconnect and add it again"
+                )
+            if not parsed.path.rstrip("/").endswith("/class-layers"):
+                raise ValueError(
+                    "The layer URL does not point to the class-layer API; reconnect and add it again"
+                )
+            if not self._track.strip():
+                raise ValueError(
+                    "No environment was included in the class-layer URL. "
+                    "Select an available Environment in the panel and add the layer again."
                 )
             # The server authorizes the selected track. Production uses `default`;
             # track names are discovered, not restricted to the preview's `dev`.

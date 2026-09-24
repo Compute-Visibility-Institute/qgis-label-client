@@ -101,22 +101,32 @@ def test_class_provider_accepts_explicit_environments(provider_constructor, trac
 
 
 @pytest.mark.parametrize(
-    "query", ["", "?track=", "?track=%20", "?track=default&recorded_at=2026-01-01"]
+    "url,diagnostic",
+    [
+        ("https://api.example.org/class-layers", "No environment"),
+        ("https://api.example.org/class-layers?track=", "No environment"),
+        ("https://api.example.org/class-layers?track=%20", "No environment"),
+        (
+            "https://api.example.org/class-layers?track=default&recorded_at=2026-01-01",
+            "Historical snapshots",
+        ),
+        ("/class-layers?track=dev", "HTTP(S) API URL"),
+        ("file:///class-layers?track=dev", "HTTP(S) API URL"),
+        ("https://api.example.org/collections?track=dev", "class-layer API"),
+    ],
 )
-def test_class_provider_refuses_missing_track_or_history_with_diagnostics(
-    provider_constructor, query
-):
+def test_class_provider_reports_specific_uri_failure(provider_constructor, url, diagnostic):
     loaded, errors, warnings = provider_constructor
     instance = provider.ClassLayerProvider(
         {
-            "url": "https://api.example.org/class-layers" + query,
+            "url": url,
             "typename": "cl_unclassified__polygon",
         }
     )
     assert not instance.isValid()
     assert not loaded
     assert errors == [instance.last_refresh_error]
-    assert instance.last_refresh_error
+    assert diagnostic in instance.last_refresh_error
     assert warnings == ["Could not open CVI class layer: " + instance.last_refresh_error]
 
 

@@ -147,6 +147,57 @@ def test_another_connection_or_track_does_not_block_loading_current_mode(loading
     assert other.edit_buffer == ["an existing local edit"]
 
 
+@pytest.mark.parametrize("read_only", [False, True])
+def test_unavailable_saved_environment_refuses_import_until_explicitly_selected(
+    loading, monkeypatch, read_only
+):
+    plugin, project_layers = loading
+    plugin.settings.set("track", "default")
+    original = Layer("Existing production edits", track="default")
+    project_layers.append(original)
+    original_properties = dict(original.properties)
+    errors = []
+    created = []
+    groups = []
+    monkeypatch.setattr(plugin, "_fail", errors.append)
+
+    def create(settings, cid, title, registry, track, **kwargs):
+        created.append(track.name)
+        return Layer(title, cid, track.name)
+
+    monkeypatch.setattr(layers, "create_layer", create)
+    monkeypatch.setattr(
+        layertree,
+        "new_import_group",
+        lambda project, track, caption: groups.append(caption) or object(),
+    )
+
+    plugin.load_collections(["cl_alpha__polygon"], read_only=read_only)
+
+    assert len(errors) == 1
+    assert "default" in errors[0]
+    assert "Environment" in errors[0]
+    assert not created
+    assert not groups
+    assert plugin.settings.track == "default"
+    assert project_layers == [original]
+    assert original.properties == original_properties
+    assert original.edit_buffer == ["an existing local edit"]
+
+    # Model the user's explicit choice, never an automatic fallback during import.
+    plugin.settings.set("track", "dev")
+    plugin.load_collections(["cl_alpha__polygon"], read_only=read_only)
+
+    assert created == ["dev"]
+    assert len(groups) == 1
+    assert len(errors) == 1
+    assert len(project_layers) == 2
+    assert project_layers[1].readonly is read_only
+    assert project_layers[1].properties[layers.TRACK_PROPERTY] == "dev"
+    assert original.properties == original_properties
+    assert original.edit_buffer == ["an existing local edit"]
+
+
 def test_old_current_collection_stays_readonly_even_without_new_mode_flag(loading):
     plugin, project_layers = loading
     plugin.collections = [

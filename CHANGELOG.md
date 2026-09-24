@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and `qgis-plugin-ci` copies the
 most recent entries into `metadata.txt` at release time.
 
+## [0.3.8] - 2026-09-24
+
+### Fixed
+
+- Stop class-layer imports before constructing a provider when the saved environment
+  is unavailable on the connected API. Explain how to select an available environment
+  or reconnect to the correct API without silently changing the selected dataset.
+- Distinguish missing environment, invalid URL and incorrect class-layer endpoint
+  errors instead of reporting them all as an environment error.
+
 ## [0.3.7] - 2026-09-24
 
 ### Changed

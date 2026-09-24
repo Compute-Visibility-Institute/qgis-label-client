@@ -1648,6 +1648,14 @@ class LabelClientPlugin:
         # track from the deployment default, which is the right thing for somebody looking
         # around. Writes are the ones that refuse -- see _require_track.
         track = self.current_track()
+        if track is None and any(cid in class_metadata for cid in collection_ids):
+            requested = self.settings.track or "the deployment default"
+            self._fail(
+                f"Cannot import class layers: environment {requested!r} is not available "
+                "on the connected API. Choose an available Environment at the bottom "
+                "of the panel, or change the API URL and Connect again."
+            )
+            return
         existing = {
             (
                 layer_tools.collection_of(layer),
