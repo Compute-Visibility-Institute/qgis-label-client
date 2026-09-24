@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and `qgis-plugin-ci` copies the
 most recent entries into `metadata.txt` at release time.
 
+## [0.3.6] - 2026-09-24
+
+### Fixed
+
+- Open editable and read-only class layers in Production as well as Development.
+  Remove the plugin provider's leftover dev-only restriction while preserving
+  explicit environment selection and server-side authorization.
+- Include provider errors when a layer cannot open and record initialization
+  failures in the CVI Label Client tab of QGIS Log Messages.
+
 ## [0.3.5] - 2026-09-22
 
 ### Fixed

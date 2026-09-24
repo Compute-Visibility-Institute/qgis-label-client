@@ -425,9 +425,15 @@ def create_layer(
     title = plugin_layer_title(display_name)
     layer = QgsVectorLayer(uri, title, provider)
     if not layer.isValid():
+        reason = layer.error().summary()
+        data_provider = layer.dataProvider()
+        if not reason and data_provider is not None:
+            reason = " ".join(data_provider.errors())
+        if not reason and provider == CLASS_PROVIDER:
+            reason = "See the CVI Label Client tab in QGIS Log Messages for the provider error."
         raise BackendError(
             f"QGIS could not open collection {collection_id!r}. "
-            f"{layer.error().summary() or 'The provider gave no reason.'}"
+            f"{reason or 'The provider gave no reason.'}"
         )
     fields = registry.fields if registry else DEFAULT_FIELDS
     if mixes_geometry(layer, registry):

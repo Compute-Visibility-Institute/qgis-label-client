@@ -12,6 +12,80 @@ from qgis_label_client import classprovider as provider
 from qgis_label_client.core.errors import BackendError
 
 
+@pytest.fixture
+def provider_constructor(monkeypatch):
+    """Exercise the real URI gate without network requests or a QGIS application."""
+    loaded = []
+    errors = []
+    warnings = []
+    monkeypatch.setattr(
+        provider,
+        "QgsDataSourceUri",
+        lambda params: SimpleNamespace(
+            param=lambda key: params.get(key, ""), authConfigId=lambda: "test-auth"
+        ),
+    )
+    monkeypatch.setattr(
+        provider, "QgsVectorLayer", lambda *args: SimpleNamespace(dataProvider=lambda: None)
+    )
+
+    def load(instance):
+        loaded.append((instance._track, instance._collection_url, instance._read_only))
+        instance._valid = True
+
+    monkeypatch.setattr(provider.ClassLayerProvider, "_load", load)
+    monkeypatch.setattr(
+        provider.ClassLayerProvider,
+        "pushError",
+        lambda self, text: errors.append(text),
+        raising=False,
+    )
+    monkeypatch.setattr(provider, "log_warning", warnings.append)
+    return loaded, errors, warnings
+
+
+@pytest.mark.parametrize("track", ["default", "dev", "another-track"])
+@pytest.mark.parametrize("read_only", [False, True])
+def test_class_provider_accepts_explicit_environments(provider_constructor, track, read_only):
+    loaded, errors, _ = provider_constructor
+    instance = provider.ClassLayerProvider(
+        {
+            "url": "https://api.example.org/class-layers?track=" + track,
+            "typename": "cl_unclassified__polygon",
+            "cviReadOnly": "1" if read_only else "0",
+        }
+    )
+    assert instance.isValid()
+    assert loaded == [
+        (
+            track,
+            "https://api.example.org/class-layers/collections/cl_unclassified__polygon",
+            read_only,
+        )
+    ]
+    assert not errors
+
+
+@pytest.mark.parametrize(
+    "query", ["", "?track=", "?track=%20", "?track=default&recorded_at=2026-01-01"]
+)
+def test_class_provider_refuses_missing_track_or_history_with_diagnostics(
+    provider_constructor, query
+):
+    loaded, errors, warnings = provider_constructor
+    instance = provider.ClassLayerProvider(
+        {
+            "url": "https://api.example.org/class-layers" + query,
+            "typename": "cl_unclassified__polygon",
+        }
+    )
+    assert not instance.isValid()
+    assert not loaded
+    assert errors == [instance.last_refresh_error]
+    assert instance.last_refresh_error
+    assert warnings == ["Could not open CVI class layer: " + instance.last_refresh_error]
+
+
 def test_physical_row_identity_survives_revision_and_distinguishes_valid_versions():
     first = {"id": "12.aabb", "properties": {"label_id": "same-label"}}
     next_revision = {"id": "12.ccdd", "properties": {"label_id": "same-label"}}

@@ -33,6 +33,7 @@ from qgis.PyQt.QtCore import QByteArray, QDate, QDateTime, Qt, QVariant
 
 from . import network
 from .core.errors import BackendError
+from .log import log_warning
 
 PROVIDER_KEY = "cvi_class"
 CORE_FIELDS = {
@@ -186,9 +187,13 @@ class ClassLayerProvider(QgsVectorDataProvider):
                 parsed.scheme not in {"https", "http"}
                 or not parsed.netloc
                 or not parsed.path.rstrip("/").endswith("/class-layers")
-                or self._track != "dev"
+                or not self._track.strip()
             ):
-                raise ValueError("Native attribute editing requires a development class layer")
+                raise ValueError(
+                    "Native attribute editing requires a class layer with an explicit environment"
+                )
+            # The server authorizes the selected track. Production uses `default`;
+            # track names are discovered, not restricted to the preview's `dev`.
             self._root = urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
             self._collection = self._uri.param("typename")
             if not self._collection.startswith("cl_"):
@@ -197,7 +202,9 @@ class ClassLayerProvider(QgsVectorDataProvider):
             self._local_fields = json.loads(self._uri.param("localFields") or "[]")
             self._load()
         except Exception as exc:  # noqa: BLE001 - Never propagate through Qt's provider factory.
-            self.pushError(str(exc))
+            self.last_refresh_error = str(exc)
+            self.pushError(self.last_refresh_error)
+            log_warning("Could not open CVI class layer: " + self.last_refresh_error)
 
     def name(self):
         return PROVIDER_KEY
