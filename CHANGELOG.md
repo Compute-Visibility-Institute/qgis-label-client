@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and `qgis-plugin-ci` copies the
 most recent entries into `metadata.txt` at release time.
 
+## [0.3.7] - 2026-09-24
+
+### Changed
+
+- Place each newly imported set of layers in its own top-level group, including
+  ground-date and historical snapshots. Group names identify the import environment
+  and view type; existing layers and duplicate-import handling are preserved.
+- Stop adding redundant automatic subset filters to native class layers, whose
+  requests already select their environment, class and geometry on the server.
+
+### Fixed
+
+- Refresh the registered class-provider factory after a plugin upgrade so new
+  layers use the installed code without retaining the old dev-only restriction.
+  Existing provider instances and unsaved edit buffers remain intact.
+
 ## [0.3.6] - 2026-09-24
 
 ### Fixed

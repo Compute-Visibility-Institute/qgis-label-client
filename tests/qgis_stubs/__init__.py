@@ -570,6 +570,40 @@ def _make_module(name: str, explicit: dict[str, Any] | None = None) -> types.Mod
     return module
 
 
+class QgsProviderMetadata(Stub):
+    def __init__(self, key, description):
+        super().__init__(key, description)
+        self._key = key
+
+    def key(self):
+        return self._key
+
+
+class QgsProviderRegistry(Stub):
+    """Retain registered Python factories across plugin reloads, like QGIS."""
+
+    _instance = None
+
+    def __init__(self):
+        super().__init__()
+        self._metadata = {}
+
+    @classmethod
+    def instance(cls):
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def providerMetadata(self, key):  # noqa: N802
+        return self._metadata.get(key)
+
+    def registerProvider(self, metadata):  # noqa: N802
+        if metadata.key() in self._metadata:
+            return False
+        self._metadata[metadata.key()] = metadata
+        return True
+
+
 _CORE_EXPLICIT = {
     "QgsAuthMethodConfig": QgsAuthMethodConfig,
     "QgsSettings": QgsSettings,
@@ -579,6 +613,8 @@ _CORE_EXPLICIT = {
     "QgsApplication": QgsApplication,
     "QgsProject": QgsProject,
     "QgsVariantUtils": QgsVariantUtils,
+    "QgsProviderMetadata": QgsProviderMetadata,
+    "QgsProviderRegistry": QgsProviderRegistry,
 }
 
 _QTCORE_EXPLICIT = {
@@ -665,6 +701,7 @@ def reset() -> None:
     _TASK_MANAGER.tasks.clear()
     _AUTH_MANAGER.reset()
     QgsProject._instance = None
+    QgsProviderRegistry._instance = None
     if QgsApplication._profile is not None:
         QgsApplication._profile.cleanup()
         QgsApplication._profile = None

@@ -280,6 +280,7 @@ def test_date_views_add_all_geometry_families_atomically_without_repointing_live
 
     from qgis.core import Qgis, QgsProject
 
+    from qgis_label_client import layertree
     from qgis_label_client.core.collections import Collection
     from qgis_label_client.core.errors import BackendError
     from qgis_label_client.core.tracks import Track
@@ -302,6 +303,9 @@ def test_date_views_add_all_geometry_families_atomically_without_repointing_live
     project._layers["existing"] = existing
     add_layer = Mock()
     monkeypatch.setattr(project, "addMapLayer", add_layer)
+    import_group = Mock()
+    new_import_group = Mock(return_value=import_group)
+    monkeypatch.setattr(layertree, "new_import_group", new_import_group)
     created = []
     calls = []
 
@@ -329,12 +333,14 @@ def test_date_views_add_all_geometry_families_atomically_without_repointing_live
         if fail_second:
             assert len(calls) == 2
             add_layer.assert_not_called()
+            new_import_group.assert_not_called()
             assert any(
                 "No date-view layers were added" in text for _, text, _ in fake_iface.messages
             )
         else:
             assert [call[0] for call in calls] == [prefix + family for family in families]
             assert [call.args[0] for call in add_layer.call_args_list] == created
+            assert [call.args[0] for call in import_group.addLayer.call_args_list] == created
             for layer, (_, valid_date, selected_track, options) in zip(created, calls, strict=True):
                 assert valid_date == (None if historical else date(2026, 1, 15))
                 assert selected_track is track

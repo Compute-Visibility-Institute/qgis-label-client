@@ -13,10 +13,25 @@ from qgis.core import QgsDataSourceUri, QgsLayerTreeGroup, QgsLayerTreeLayer
 
 from . import layers
 from .core.collections import CollectionGroup
+from .core.tracks import Track
 
 GROUP_PROPERTY = "cvi/collection_group"
 CONTEXT_PROPERTY = "cvi/collection_group_context"
 PLACED_PROPERTY = "cvi/collection_group_placed"
+
+
+def new_import_group(project, track: Track | None, caption: str):
+    """Create a fresh root group for one import, never reuse a previous import."""
+    environment = "Deployment default"
+    if track is not None:
+        environment = {
+            "default": "Production",
+            "dev": "Development",
+        }.get(track.name, track.display_name)
+    title = layers.plugin_layer_title(f"Imported from {environment} — {caption}")
+    group = project.layerTreeRoot().insertGroup(0, title)
+    group.setExpanded(True)
+    return group
 
 
 def _context(layer) -> str:
@@ -90,14 +105,19 @@ def _ensure_group(
     return group
 
 
-def add_collection_layer(project, layer, groups: Sequence[CollectionGroup]) -> None:
-    """Register a new layer under its mode group; ordinary collections stay flat."""
+def add_collection_layer(project, layer, groups: Sequence[CollectionGroup], *, parent=None) -> None:
+    """Register a layer in its import group, retaining geometry subgroups."""
     metadata = _collection_group(layer, groups)
     if metadata is None:
-        project.addMapLayer(layer)
+        if parent is None:
+            project.addMapLayer(layer)
+        else:
+            project.addMapLayer(layer, False)
+            node = parent.addLayer(layer)
+            node.setCustomProperty(PLACED_PROPERTY, True)
         return
     group = _ensure_group(
-        project.layerTreeRoot(),
+        parent if parent is not None else project.layerTreeRoot(),
         metadata,
         _context(layer),
         read_only=bool(layer.customProperty("cvi/read_only_view", False)),

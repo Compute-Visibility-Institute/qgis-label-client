@@ -69,6 +69,9 @@ class _FakeLayer:
     def name(self) -> str:
         return self._name
 
+    def providerType(self):  # noqa: N802
+        return "OAPIF"
+
     def setName(self, name: str) -> None:  # noqa: N802
         self._name = name
 

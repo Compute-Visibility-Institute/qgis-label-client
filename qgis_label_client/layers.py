@@ -226,7 +226,7 @@ def landing_url(
 def track_filter_for(
     layer: QgsVectorLayer | None, track: Track | None, registry: ClassRegistry | None
 ) -> str | None:
-    """The canary clause for this layer, or ``None`` if it cannot carry one.
+    """The legacy OAPIF canary clause, or ``None`` for native class layers.
 
     Only layers that actually expose ``track_id`` get it. Several collections are shared
     between tracks by design -- the class registry describes both datasets, and one
@@ -236,6 +236,11 @@ def track_filter_for(
     collection id.
     """
     if layer is None or track is None:
+        return None
+    if layer.providerType() == CLASS_PROVIDER:
+        # Class collections already select class/geometry on the server, and
+        # this provider explicitly sends its environment on every request. The
+        # legacy OAPIF transport canary would add a redundant QGIS subset filter.
         return None
     fields = registry.fields if registry else None
     name = fields.track_id if fields else "track_id"
@@ -499,20 +504,6 @@ def apply_canaries(
     track_clause = track_filter_for(layer, track, registry)
     if not track_clause:
         return False
-    if layer.providerType() == CLASS_PROVIDER:
-        uri = build_layer_uri(
-            settings,
-            collection_of(layer),
-            registry,
-            track,
-            track_filter=track_clause,
-            recorded_at=recorded_at,
-        )
-        # The complete class cache is already loaded. Apply the canary locally
-        # instead of downloading it a second time to rebuild the provider.
-        if not layer.setSubsetString(QgsDataSourceUri(uri).param("filter")):
-            raise BackendError("Could not apply the class layer's track filter.")
-        return True
     repoint_layer(
         layer,
         build_layer_uri(

@@ -4,7 +4,7 @@ qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 supportsQt6=True
 description=Connect QGIS to an OGC API - Features labeling backend with Google sign-in, editable class layers and original attribute columns on supported servers, local edit recovery, and historical views.
-version=0.3.6
+version=0.3.7
 author=Compute Visibility Institute
 email=opensource@example.org
 

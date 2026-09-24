@@ -81,8 +81,13 @@ def loading(fake_iface, monkeypatch):
     )
     monkeypatch.setattr(
         layertree,
+        "new_import_group",
+        lambda project, track, caption: object(),
+    )
+    monkeypatch.setattr(
+        layertree,
         "add_collection_layer",
-        lambda project, layer, groups: project_layers.append(layer),
+        lambda project, layer, groups, **kwargs: project_layers.append(layer),
     )
     return plugin, project_layers
 

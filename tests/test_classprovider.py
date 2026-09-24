@@ -4,12 +4,46 @@ Native field/dialog/edit-buffer behavior still needs the existing QGIS harness
 when validation is requested. These tests cover wire and retry boundaries.
 """
 
-from types import SimpleNamespace
+from types import FunctionType, SimpleNamespace
 
 import pytest
 
 from qgis_label_client import classprovider as provider
 from qgis_label_client.core.errors import BackendError
+
+
+def test_reregister_rebinds_retained_factory_without_replacing_live_providers(monkeypatch):
+    class OldProvider:
+        def __init__(self, *args):
+            self.pending_edits = ["unsaved polygon"]
+
+    old_globals = {"__name__": provider.__name__, "ClassLayerProvider": OldProvider}
+    factory = FunctionType(provider.ClassProviderMetadata.createProvider.__code__, old_globals)
+    metadata_type = type("RetainedMetadata", (), {"createProvider": factory})
+    metadata = metadata_type()
+    original = metadata.createProvider("saved-uri", None, None)
+    registrations = []
+    registry = SimpleNamespace(
+        providerMetadata=lambda key: metadata,
+        registerProvider=lambda value: registrations.append(value),
+    )
+    monkeypatch.setattr(provider, "QgsProviderRegistry", SimpleNamespace(instance=lambda: registry))
+    # Model successive plugin reloads with distinct constructor objects.
+    for generation in range(3):
+
+        def constructor(*args, generation=generation):
+            return generation, args
+
+        monkeypatch.setattr(provider, "ClassLayerProvider", constructor)
+        provider.register_provider()
+        assert metadata.createProvider("new-uri", None, None) == (
+            generation,
+            ("new-uri", None, None),
+        )
+        assert provider._METADATA is metadata
+        assert original.pending_edits == ["unsaved polygon"]
+        assert isinstance(original, OldProvider)
+    assert not registrations
 
 
 @pytest.fixture

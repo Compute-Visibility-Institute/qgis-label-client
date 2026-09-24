@@ -700,10 +700,26 @@ class ClassProviderMetadata(QgsProviderMetadata):
 
 
 def register_provider():
-    """Register once; retain metadata while QGIS projects hold provider instances."""
+    """Refresh the factory without unregistering providers used by open layers.
+
+    QGIS retains this Python metadata object across plugin unload/reinstall. Its
+    factory can therefore still hold the previous module's globals even after
+    QGIS imports the upgraded plugin. Rebind only the constructor for NEW layers;
+    existing providers, caches and edit buffers must remain untouched.
+    """
     global _METADATA
     registry = QgsProviderRegistry.instance()
-    if registry.providerMetadata(PROVIDER_KEY) is None:
-        _METADATA = ClassProviderMetadata()
-        if not registry.registerProvider(_METADATA):
-            raise RuntimeError("Could not register the CVI class-layer provider")
+    existing = registry.providerMetadata(PROVIDER_KEY)
+    if existing is not None:
+        namespace = getattr(existing.createProvider, "__globals__", None)
+        if not isinstance(namespace, dict) or namespace.get("__name__") != __name__:
+            raise RuntimeError(
+                "The registered CVI provider factory cannot be refreshed safely. "
+                "Save your project and restart QGIS."
+            )
+        namespace["ClassLayerProvider"] = ClassLayerProvider
+        _METADATA = existing
+        return
+    _METADATA = ClassProviderMetadata()
+    if not registry.registerProvider(_METADATA):
+        raise RuntimeError("Could not register the CVI class-layer provider")

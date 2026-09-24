@@ -1660,6 +1660,7 @@ class LabelClientPlugin:
         }
 
         added = 0
+        import_group = None
         activity = self.activities.begin()
         try:
             for collection_id in collection_ids:
@@ -1692,7 +1693,14 @@ class LabelClientPlugin:
                 if view_only:
                     layer.setCustomProperty("cvi/read_only_view", True)
                     layer.setReadOnly(True)
-                layertree.add_collection_layer(project, layer, groups)
+                if import_group is None:
+                    caption = (
+                        "Read-only layers"
+                        if read_only or all(cid in readonly_ids for cid in collection_ids)
+                        else "Editable layers"
+                    )
+                    import_group = layertree.new_import_group(project, track, caption)
+                layertree.add_collection_layer(project, layer, groups, parent=import_group)
                 existing.add(identity)
                 added += 1
                 self._warn_on_track_mismatch(layer, track)
@@ -1838,9 +1846,7 @@ class LabelClientPlugin:
         if self._registry_pending or not self.registry:
             self._fail("Connect first: the class registry drives layer configuration.")
             return
-        if self._defer_until_fresh(
-            lambda: self._open_date_layers(moment, historical=historical)
-        ):
+        if self._defer_until_fresh(lambda: self._open_date_layers(moment, historical=historical)):
             return
         parsed = recorded.parse_instant(moment)
         if parsed is None:
@@ -1924,8 +1930,9 @@ class LabelClientPlugin:
             activity.close()
 
         project = QgsProject.instance()
+        import_group = layertree.new_import_group(project, track, f"Read-only layers {caption}")
         for layer in staged:
-            project.addMapLayer(layer)
+            layertree.add_collection_layer(project, layer, (), parent=import_group)
             self._warn_on_track_mismatch(layer, track)
             if historical:
                 self._warn_if_writable(layer)
@@ -1938,8 +1945,12 @@ class LabelClientPlugin:
                 "· Current knowledge · Read only"
             )
             self._refresh_axes()
-        self.dock.set_status(f"Added 3 read-only layers — {caption}. Existing layers are unchanged.")
-        log(f"Added complete date view ({caption}) on track {track.name if track else '(default)'}.")
+        self.dock.set_status(
+            f"Added 3 read-only layers — {caption}. Existing layers are unchanged."
+        )
+        log(
+            f"Added complete date view ({caption}) on track {track.name if track else '(default)'}."
+        )
 
     def _warn_if_writable(self, layer) -> None:
         """Say so if the server let a pinned request look editable.
