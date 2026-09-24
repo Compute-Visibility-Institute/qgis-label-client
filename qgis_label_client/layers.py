@@ -70,6 +70,7 @@ from qgis.core import (
     QgsReadWriteContext,
     QgsRendererCategory,
     QgsSimpleMarkerSymbolLayerBase,
+    QgsSingleSymbolRenderer,
     QgsSymbolLayer,
     QgsUnitTypes,
     QgsVectorDataProvider,
@@ -1527,10 +1528,11 @@ def configure_class_columns(layer: QgsVectorLayer, metadata: dict) -> None:
 def _apply_class_renderer(
     layer: QgsVectorLayer, registry: ClassRegistry, historical: bool = False
 ) -> None:
-    """Categorize on ``class_id`` using each class's own style block.
+    """Use one symbol for a class layer; categorize mixed-class collections.
 
-    All classes live in one table with a ``class_id`` column, so one layer carries them
-    all and a categorized renderer is the natural expression of that. Retired classes are
+    Class collections already select a single class on the server, so a categorized
+    renderer would add a redundant legend row and visibility checkbox. Legacy and
+    historical geometry collections still carry several classes. Retired classes are
     included: historical labels still reference them, and dropping their category would
     render those features invisible rather than merely uneditable.
 
@@ -1580,7 +1582,10 @@ def _apply_class_renderer(
         # will ask about -- which is the outcome the old unfiltered legend was reaching for.
         catch_all = _symbol_for(registry.unclassified_or_first(), historical, geom_type)
         categories.append(QgsRendererCategory("", catch_all, "Other class (unexpected here)", True))
-    layer.setRenderer(QgsCategorizedSymbolRenderer(registry.fields.class_id, categories))
+    if class_id:
+        layer.setRenderer(QgsSingleSymbolRenderer(categories[0].symbol().clone()))
+    else:
+        layer.setRenderer(QgsCategorizedSymbolRenderer(registry.fields.class_id, categories))
     layer.setCustomProperty(GENERATED_RENDERER_PROPERTY, renderer_fingerprint(layer))
     layer.triggerRepaint()
 

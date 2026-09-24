@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and `qgis-plugin-ci` copies the
 most recent entries into `metadata.txt` at release time.
 
+## [0.3.9] - 2026-09-24
+
+### Fixed
+
+- Use a single-symbol renderer for each class layer, removing the redundant
+  class-name legend entry and category visibility checkbox while preserving
+  the class style. Collections containing multiple classes retain their categories.
+
 ## [0.3.8] - 2026-09-24
 
 ### Fixed
