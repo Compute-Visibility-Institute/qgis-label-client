@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and `qgis-plugin-ci` copies the
 most recent entries into `metadata.txt` at release time.
 
+## [0.3.12] - 2026-10-04
+
+### Changed
+
+- Editing no longer opens warning dialogs. Recovery copies are still saved in the
+  background, and QGIS's own edit markers show which layers have unsaved edits.
+- Connect asks once, "Upload local changes?", before uploading edits that were never
+  sent, including reviewed local layers with new edits. Yes uploads silently; No keeps
+  them local and the next Connect asks again. Connect no longer opens the local-layer
+  upload review.
+- Discarding edits in QGIS now deletes their never-submitted recovery copy. Copies of
+  attempted saves, and copies recovered from an earlier session, are kept for review.
+- Unpushed edits… describes each recovery copy in plain language and can delete
+  several at once. The message shown after Connect has a Review… button.
+- Copies kept by earlier versions are reported after Connect until they are deleted;
+  the update guide explains how to clean them up.
+
+### Removed
+
+- The "Warn about unpushed edits" setting. A save the server did not confirm always
+  shows a warning.
+
 ## [0.3.11] - 2026-09-24
 
 ### Fixed

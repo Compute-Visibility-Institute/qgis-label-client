@@ -65,7 +65,6 @@ DEFAULTS: dict[str, Any] = {
     # allows the same account to reconnect native layers without replacing providers.
     "signed_out_connection": "",
     "show_startup_connection": True,
-    "show_unpushed_warnings": True,
     # Hide all-NULL optional attributes when importing server labels into QGIS.
     # This only changes the local layer's columns, never stored server attributes.
     "remove_unused_fields_on_import": True,

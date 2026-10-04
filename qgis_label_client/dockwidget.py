@@ -185,7 +185,6 @@ class LabelClientDock(QDockWidget):
     pullAllRemoteRequested = pyqtSignal()
     removeUnusedFieldsChanged = pyqtSignal(bool)
     startupPromptChanged = pyqtSignal(bool)
-    unpushedWarningsChanged = pyqtSignal(bool)
     asOfApplied = pyqtSignal()
     #: Add a separate read-only snapshot at this UTC ground-validity instant.
     groundViewRequested = pyqtSignal(str)
@@ -437,15 +436,6 @@ class LabelClientDock(QDockWidget):
         )
         self.remove_unused_fields_checkbox.toggled.connect(self.removeUnusedFieldsChanged)
         layout.addWidget(self.remove_unused_fields_checkbox)
-
-        self.unpushed_warnings_checkbox = QCheckBox("Warn about unpushed edits", group)
-        self.unpushed_warnings_checkbox.setChecked(True)
-        self.unpushed_warnings_checkbox.setToolTip(
-            "Show a warning when edits have not reached the server. "
-            "Local recovery copies are kept even when these warnings are turned off."
-        )
-        self.unpushed_warnings_checkbox.toggled.connect(self.unpushedWarningsChanged)
-        layout.addWidget(self.unpushed_warnings_checkbox)
         return group
 
     def _build_reference_group(self, parent: QWidget) -> QWidget:
@@ -763,13 +753,6 @@ class LabelClientDock(QDockWidget):
             self.startup_prompt_checkbox.setChecked(enabled)
         finally:
             self.startup_prompt_checkbox.blockSignals(blocked)
-
-    def set_unpushed_warnings(self, enabled: bool) -> None:
-        blocked = self.unpushed_warnings_checkbox.blockSignals(True)
-        try:
-            self.unpushed_warnings_checkbox.setChecked(enabled)
-        finally:
-            self.unpushed_warnings_checkbox.blockSignals(blocked)
 
     def as_of(self) -> date | None:
         if not self._as_of_active:

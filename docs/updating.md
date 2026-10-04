@@ -69,6 +69,54 @@ map or attribute table requests them, subject to the layer's filters and history
 track. If a clean layer still shows old data, use QGIS's layer refresh/reload action.
 Save outstanding edits before reloading a layer.
 
+## Upgrading to 0.3.12: unpushed edits
+
+Follow steps 1–3 above as usual. Version 0.3.12 changes how unsaved work is handled:
+
+- **No popups while editing.** QGIS's own edit markers show which layers have unsaved
+  edits. The plugin still keeps a recovery copy in the background.
+- **Connect asks once.** If you have edits that were never uploaded, Connect asks
+  **Upload local changes?** **Yes** uploads them. **No** keeps them on your computer,
+  and the next Connect asks again.
+- **Discard means discard.** Discarding edits in QGIS now deletes them. Earlier
+  versions kept a copy.
+- The **Warn about unpushed edits** checkbox is gone.
+
+### "Some local edits were not uploaded"
+
+After upgrading, you may see this message after every Connect, naming one or more
+layers. Those layers may also be named **[Unpushed: needs review]**. These are copies
+that earlier versions kept, usually of edits you discarded. They never upload by
+themselves. Clean them up once:
+
+1. Save or discard any open edits on the named layers. A copy of edits that are
+   still open cannot be deleted.
+2. Click **Review…** on the message, or open **Plugins → CVI Label Client →
+   Unpushed edits…**.
+3. Read each copy's description:
+   - *You discarded these edits in QGIS* — safe to delete.
+   - *A save was attempted but the server did not confirm it* — some of it may
+     already be on the server. Check the layer on the map. If the work is there,
+     delete the copy; if something is missing, redraw it or restore the copy (below).
+   - *Not uploaded yet* — work you never saved. Keep it and choose **Yes** at the
+     next Connect, unless you no longer want it.
+   - Anything else, such as *A feature changed on the server since your edit* —
+     someone else edited the same feature. Restore the copy to compare, or delete it
+     if you have already redone the work.
+4. Tick the copies you no longer need (or **Select all**), click **Delete
+   selected…**, and confirm.
+
+The message stops once the copies are gone, and the layer names return to normal.
+
+### Keeping a copy's edits instead
+
+Open the original project, sign in as the account that made the edits, and Connect.
+Then click **Restore locally for review** on that copy. Its edits appear in the layer
+as unsaved changes: compare them with what is on the server, then **Save Layer Edits**.
+
+If you are unsure about a copy, keep it and ask your lead. Hovering over a copy shows
+where its file is stored.
+
 ## If the server address changes
 
 A deployment move is a separate operation. A plugin upgrade does not rewrite a

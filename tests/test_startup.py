@@ -115,13 +115,11 @@ def test_startup_prompt_setting_persists_and_manual_prompt_remains_available(
     plugin.startup.show_if_enabled()
     assert calls == ["show"]
     plugin.dock.startupPromptChanged.emit(False)
-    plugin.dock.unpushedWarningsChanged.emit(False)
     plugin.startup.show_if_enabled()
     assert calls == ["show"]
     plugin.unload()
     reopened = LabelClientPlugin(fake_iface)
     assert reopened.settings.get("show_startup_connection") is False
-    assert reopened.settings.get("show_unpushed_warnings") is False
 
 
 def test_connection_buttons_delegate_to_existing_plugin_actions(fake_iface, monkeypatch):
@@ -278,3 +276,52 @@ def test_panel_push_and_pull_signals_delegate_to_their_distinct_actions(fake_ifa
         push.assert_called_once_with()
     finally:
         plugin.unload()
+
+
+def _upload_doubles(plugin, calls, native, local):
+    plugin.pending = SimpleNamespace(
+        uploadable=lambda: native,
+        on_connected=lambda finished: (calls.append("native"), finished()),
+        report_attention=lambda skip=(): calls.append(("report", set(skip))),
+    )
+    plugin.push_local = SimpleNamespace(
+        changed_layers=lambda: local,
+        on_connected=lambda callback: (calls.append("local"), callback()),
+    )
+
+
+@pytest.mark.parametrize("answer", ["Yes", "No"])
+def test_connect_asks_once_before_uploading_local_changes(fake_iface, monkeypatch, answer):
+    from qgis_label_client import plugin as plugin_module
+
+    plugin = LabelClientPlugin(fake_iface)
+    calls, questions = [], []
+    native = SimpleNamespace(id=lambda: "native", name=lambda: "CVI Building [Unpushed: 1]")
+    local = SimpleNamespace(id=lambda: "local", name=lambda: "[Unpushed] Local buildings")
+    _upload_doubles(plugin, calls, [native], [local])
+    button = plugin_module.QMessageBox.StandardButton
+    monkeypatch.setattr(
+        plugin_module.QMessageBox,
+        "question",
+        lambda _parent, _title, text, *_args: questions.append(text) or getattr(button, answer),
+    )
+    plugin._offer_upload(lambda: calls.append("refresh"))
+    assert questions == ["Upload local changes?\n\nCVI Building\nLocal buildings"]
+    if answer == "Yes":
+        assert calls == ["native", "local", "refresh"]
+    else:
+        # Declined edits stay local without a follow-up warning about them.
+        assert calls == [("report", {"native"}), "refresh"]
+
+
+def test_connect_without_local_changes_asks_nothing(fake_iface, monkeypatch):
+    from qgis_label_client import plugin as plugin_module
+
+    plugin = LabelClientPlugin(fake_iface)
+    calls = []
+    _upload_doubles(plugin, calls, [], [])
+    monkeypatch.setattr(
+        plugin_module.QMessageBox, "question", lambda *_args: pytest.fail("nothing to upload")
+    )
+    plugin._offer_upload(lambda: calls.append("refresh"))
+    assert calls == [("report", set()), "refresh"]

@@ -24,7 +24,16 @@ from qgis.core import (
     QgsVariantUtils,
 )
 from qgis.PyQt.QtCore import QDate, QDateTime, Qt, QTime, QTimer, QVariant
-from qgis.PyQt.QtWidgets import QAction, QDialog, QLabel, QMessageBox, QPushButton, QVBoxLayout
+from qgis.PyQt.QtWidgets import (
+    QAction,
+    QCheckBox,
+    QDialog,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+)
 
 from . import client, layers
 from .core.errors import LabelClientError
@@ -35,6 +44,8 @@ from .core.urls import normalise_base_url
 JOURNAL_PROPERTY = "cvi/pending_journal"
 STATE_PROPERTY = "cvi/pending_state"
 NAME_PROPERTY = "cvi/pending_original_name"
+# Versions 0.2.0-0.3.11 kept a copy of discarded edits with this note.
+CANCELLED_NOTE = "Editing was cancelled in QGIS."
 
 
 def _encode_field(field):
@@ -132,7 +143,6 @@ class PendingEdits:
 
     def install(self, menu):
         self.menu = menu
-        self.plugin.dock.unpushedWarningsChanged.connect(self._toggle_warnings)
         self.review_action = QAction("Unpushed edits…", self.plugin.iface.mainWindow())
         self.review_action.triggered.connect(self.review)
         self.plugin.iface.addPluginToMenu(menu, self.review_action)
@@ -154,11 +164,6 @@ class PendingEdits:
             "pending project read", lambda: project.readProject.disconnect(self._project_read)
         )
         self.watch_layers(layers.plugin_layers())
-
-    def _toggle_warnings(self, enabled):
-        self.plugin.settings.set("show_unpushed_warnings", enabled)
-        if not enabled and self.warning is not None:
-            self.warning.close()
 
     def _project_read(self, *_args):
         self.watch_layers(layers.plugin_layers())
@@ -308,12 +313,9 @@ class PendingEdits:
             if layer.id() not in self.watches:
                 return
             self.scheduled.discard(layer.id())
-            document = self.snapshot(layer)
-            if document:
-                self._warn(
-                    f"{layer.name()}: edits are unpushed. A local recovery copy is saved. "
-                    "Save Layer Edits to push now, or Connect to upload pending work."
-                )
+            # Journaling is a silent safety net, like autosave. QGIS already shows
+            # that the layer has unsaved edits; only a failure to protect them speaks.
+            self.snapshot(layer)
         except (JournalError, ValueError, TypeError, RuntimeError) as exc:
             self._error(
                 f"Could not protect your unpushed edits: {exc}. Keep QGIS open and export the edited layer."
@@ -527,40 +529,67 @@ class PendingEdits:
     def rolled_back(self, layer):
         if layer.providerType() == layers.CLASS_PROVIDER:
             layer.dataProvider().reset_write_session()
+        bound = layer.id() in self.bound_buffers
         self.bound_buffers.discard(layer.id())
         document = self.documents.get(layer.id())
-        if document:
-            if (
-                document["state"] == "pending"
-                and document.get("added_fields")
-                and not document["operations"]
-            ):
-                self.saved(layer)
-                return
-            document["state"] = "conflict"
-            document["note"] = (
-                "Editing was cancelled in QGIS. The recovery copy is held for review, not automatic upload."
-            )
-            try:
-                self._persist(layer, document)
-                self._warn(
-                    "A local recovery copy remains under CVI Label Client → Unpushed edits. "
-                    "Restore or discard it there; cancelled edits will not upload automatically."
+        # Discard means discard: QGIS has already asked. A copy recovered from an
+        # earlier session was never in this buffer, and an attempted (uncertain) or
+        # conflicting save may be partly on the server, so those copies stay.
+        if document and bound and document["state"] == "pending":
+            self.saved(layer)
+
+    def _snapshot_live(self):
+        self.watch_layers(layers.plugin_layers())
+        for layer in layers.live_layers():
+            if layer.id() in self.watches and layer.isModified():
+                self.snapshot(layer)
+
+    def _can_upload(self, layer):
+        document = self.documents.get(layer.id())
+        return bool(
+            document
+            and document["state"] == "pending"
+            and self._matches_layer(document, layer)
+            and document["email"] == self.plugin.settings.oauth_email.casefold()
+            and self.plugin._current_write_access() is True
+            and self.plugin.settings.authcfg_by_track.get(document["track"], "")
+        )
+
+    def uploadable(self):
+        """Layers whose never-submitted edits this account may upload after Connect."""
+        self._snapshot_live()
+        return [layer for layer in layers.live_layers() if self._can_upload(layer)]
+
+    def report_attention(self, skip=()):
+        """One message-bar line for recovery copies that were not uploaded."""
+        names = sorted(
+            {
+                str(
+                    self.watches[layer_id][0].customProperty(NAME_PROPERTY, "")
+                    or document.get("layer_name", document["collection"])
                 )
-            except JournalError as exc:
-                self._error(str(exc))
+                for layer_id, document in self.documents.items()
+                if layer_id in self.watches and layer_id not in skip
+            }
+        )
+        if names:
+            bar = self.plugin.iface.messageBar()
+            item = bar.createMessage(
+                "CVI Label Client", f"{', '.join(names)}: some local edits were not uploaded."
+            )
+            button = QPushButton("Review…", item)
+            button.clicked.connect(lambda _checked=False: self.review())
+            item.layout().addWidget(button)
+            bar.pushWidget(item, Qgis.MessageLevel.Warning, -1)
 
     def on_connected(self, finished):
         if self.syncing or self.closed:
             return
-        self.watch_layers(layers.plugin_layers())
-        for layer in layers.live_layers():
-            if layer.id() in self.watches and layer.isModified():
-                try:
-                    self.snapshot(layer)
-                except (JournalError, ValueError, TypeError) as exc:
-                    self._error(str(exc))
-                    return
+        try:
+            self._snapshot_live()
+        except (JournalError, ValueError, TypeError) as exc:
+            self._error(str(exc))
+            return
         candidates = list(layers.live_layers())
         self.syncing = True
 
@@ -574,21 +603,13 @@ class PendingEdits:
                 if not document:
                     continue
                 self._mark(layer, document)
-                if (
-                    document["state"] != "pending"
-                    or not self._matches_layer(document, layer)
-                    or document["email"] != self.plugin.settings.oauth_email.casefold()
-                    or self.plugin._current_write_access() is not True
-                ):
+                if not self._can_upload(layer):
                     continue
                 self._check_and_push(layer, document, advance)
                 return
             self.syncing = False
             finished()
-            if self.documents:
-                self._warn(
-                    "Some edits remain unpushed. Open CVI Label Client → Unpushed edits for their status."
-                )
+            self.report_attention()
 
         advance()
 
@@ -811,55 +832,166 @@ class PendingEdits:
         layer.triggerRepaint()
         self.bound_buffers.add(layer.id())
 
+    def _target(self, document):
+        return next(
+            (
+                item
+                for item in layers.live_layers()
+                if item.customProperty(JOURNAL_PROPERTY, "") == document["id"]
+                or (
+                    item.id() == document.get("layer_id")
+                    and document["project"] == QgsProject.instance().fileName()
+                )
+            ),
+            None,
+        )
+
+    def _holds_open_edits(self, target, document):
+        """A copy of edits still open in QGIS would be recreated by the next edit."""
+        return (
+            target is not None
+            and target.isModified()
+            and self.documents.get(target.id(), {}).get("id") == document["id"]
+        )
+
+    def _describe(self, document):
+        """Plain-language title and details of one recovery copy."""
+        name = document.get("layer_name", document["collection"]).split(" [Unpushed:", 1)[0]
+        fields = len(document.get("added_fields", []))
+        title = f"{name}: {len(document['operations'])} edit(s)" + (
+            f", {fields} new field(s)" if fields else ""
+        )
+        note = document.get("note", "")
+        if document["state"] == "pending":
+            status = "Not uploaded yet. Connect offers to upload it."
+        elif document["state"] == "uncertain":
+            status = (
+                "A save was attempted but the server did not confirm it. Some features may "
+                "already be on the server; check the layer before redoing this work."
+            )
+        elif note.startswith(CANCELLED_NOTE):
+            status = "You discarded these edits in QGIS; an earlier plugin version kept a copy."
+        else:
+            status = note or "Needs review before it can be uploaded."
+        saved = ""
+        with suppress(OSError):
+            stamp = (self.store.directory / (document["id"] + ".json")).stat().st_mtime
+            saved = f" · saved {datetime.fromtimestamp(stamp):%Y-%m-%d %H:%M}"
+        return title, f"{status}\n{document['email']} · {document['track']}{saved}"
+
     def review(self):
         if self.review_dialog is not None:
             self.review_dialog.close()
-        dialog = QDialog(self.plugin.iface.mainWindow())
-        self.review_dialog = dialog
-        dialog.setWindowTitle("Unpushed edits")
-        layout = QVBoxLayout(dialog)
         try:
             documents = self.store.list()
         except JournalError as exc:
             self._error(str(exc))
             return
-        if not documents:
-            layout.addWidget(QLabel("No saved unpushed edits.", dialog))
+        dialog = QDialog(self.plugin.iface.mainWindow())
+        self.review_dialog = dialog
+        dialog.setWindowTitle("Unpushed edits")
+        layout = QVBoxLayout(dialog)
+        intro = QLabel(
+            "Copies of edits the server has not confirmed. Tick the ones you no longer "
+            "need, then Delete selected."
+            if documents
+            else "No saved unpushed edits.",
+            dialog,
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        rows = []
         for document in documents:
-            text = (
-                f"{document.get('layer_name', document['collection'])}: {len(document['operations'])} edit(s) — "
-                f"{document['state']}\n{document['email']} · {document['track']}\n"
-                f"{len(document.get('added_fields', []))} added field(s)\n"
-                f"{document.get('note', 'Will upload after reconnect and server checks.')}\n"
-                f"Recovery file: {self.store.directory / (document['id'] + '.json')}"
-            )
-            label = QLabel(text, dialog)
+            target = self._target(document)
+            title, details = self._describe(document)
+            box = QCheckBox(title, dialog)
+            box.setToolTip(f"Recovery file: {self.store.directory / (document['id'] + '.json')}")
+            if self._holds_open_edits(target, document):
+                box.setEnabled(False)
+                box.setToolTip("Save or discard this layer's open edits first.")
+            layout.addWidget(box)
+            label = QLabel(details, dialog)
             label.setWordWrap(True)
             layout.addWidget(label)
-            target = next(
-                (
-                    item
-                    for item in layers.live_layers()
-                    if item.customProperty(JOURNAL_PROPERTY, "") == document["id"]
-                    or (
-                        item.id() == document.get("layer_id")
-                        and document["project"] == QgsProject.instance().fileName()
-                    )
-                ),
-                None,
-            )
             restore = QPushButton("Restore locally for review", dialog)
             restore.setEnabled(target is not None and document["email"] == self._owner())
             restore.clicked.connect(
                 lambda _checked=False, row=document, item=target: self._review_restore(item, row)
             )
             layout.addWidget(restore)
-            discard = QPushButton("Discard recovery copy…", dialog)
-            discard.clicked.connect(
-                lambda _checked=False, row=document, item=target: self._discard(item, row)
+            rows.append((box, document["id"]))
+
+        def select_all(_checked=False):
+            for box, _key in rows:
+                if box.isEnabled():
+                    box.setChecked(True)
+
+        buttons = QHBoxLayout()
+        select = QPushButton("Select all", dialog)
+        select.clicked.connect(select_all)
+        delete = QPushButton("Delete selected…", dialog)
+        delete.clicked.connect(
+            lambda _checked=False: self._delete_selected(
+                [key for box, key in rows if box.isChecked()]
             )
-            layout.addWidget(discard)
+        )
+        close = QPushButton("Close", dialog)
+        close.clicked.connect(lambda _checked=False: dialog.close())
+        for button in (select, delete, close):
+            buttons.addWidget(button)
+        select.setEnabled(bool(rows))
+        delete.setEnabled(bool(rows))
+        layout.addLayout(buttons)
         dialog.show()
+
+    def _delete_selected(self, ids):
+        if not ids:
+            self.plugin._message("Tick the copies to delete first.")
+            return
+        count = f"{len(ids)} recovery cop{'y' if len(ids) == 1 else 'ies'}"
+        answer = QMessageBox.question(
+            self.review_dialog,
+            "Delete unpushed edits?",
+            f"Delete {count}? Their edits will not be uploaded. This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.delete_copies(ids)
+        self.review()
+
+    def delete_copies(self, ids):
+        """Delete recovery copies by ID. Returns the IDs kept because their edits are open."""
+        try:
+            documents = {row["id"]: row for row in self.store.list()}
+        except JournalError as exc:
+            self._error(str(exc))
+            return list(ids)
+        kept = []
+        for key in ids:
+            document = documents.get(key)
+            if document is None:
+                continue
+            target = self._target(document)
+            if self._holds_open_edits(target, document):
+                kept.append(key)
+                continue
+            try:
+                if target is not None and self.documents.get(target.id(), {}).get("id") == key:
+                    self.saved(target)
+                else:
+                    self.store.delete(key)
+            except JournalError as exc:
+                self._error(str(exc))
+                kept.append(key)
+        if kept:
+            count = f"{len(kept)} recovery cop{'y was' if len(kept) == 1 else 'ies were'} kept"
+            self.plugin._message(
+                f"{count}: save or discard the open edits in their layers first.",
+                Qgis.MessageLevel.Warning,
+            )
+        return kept
 
     def _review_restore(self, layer, document):
         try:
@@ -876,33 +1008,8 @@ class PendingEdits:
         except (JournalError, ValueError, TypeError, RuntimeError) as exc:
             self._error(str(exc))
 
-    def _discard(self, layer, document):
-        if layer is not None and layer.isModified():
-            self._error(
-                "Finish or discard the layer's active editing buffer first. "
-                "Its recovery state cannot be reset while those edits remain open."
-            )
-            return
-        answer = QMessageBox.question(
-            self.plugin.iface.mainWindow(),
-            "Discard recovery copy?",
-            "Delete this local recovery copy? Any edits still open in QGIS remain in its edit buffer.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        try:
-            if layer is not None and self.documents.get(layer.id(), {}).get("id") == document["id"]:
-                self.saved(layer)
-            else:
-                self.store.delete(document["id"])
-            self.review()
-        except JournalError as exc:
-            self._error(str(exc))
-
     def _warn(self, text):
-        if self.closed or not self.plugin.settings.get("show_unpushed_warnings"):
+        if self.closed:
             return
         if self.warning is None:
             self.warning = QMessageBox(self.plugin.iface.mainWindow())

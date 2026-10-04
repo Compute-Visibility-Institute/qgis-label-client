@@ -330,7 +330,6 @@ class LabelClientPlugin:
         self.dock.set_api_url(self.settings.api_base_url)
         self.dock.set_remove_unused_fields(self.settings.get("remove_unused_fields_on_import"))
         self.dock.set_startup_prompt(self.settings.get("show_startup_connection"))
-        self.dock.set_unpushed_warnings(self.settings.get("show_unpushed_warnings"))
         self.dock.set_as_of(self.settings.as_of)
         self.dock.set_as_of_mechanism(self.settings.as_of_mechanism.value)
         # A remembered picker value does not imply a historical layer was loaded.
@@ -1441,16 +1440,52 @@ class LabelClientPlugin:
             f"{len(self.registry)} classes from {self.registry.source_url}, "
             f"{len(self.tracks)} tracks"
         )
+        self._offer_upload(self.startup.refresh_layers)
+
+    def _offer_upload(self, then: Callable[[], None]) -> None:
+        """Connect's only question. Uploading is silent unless something needs attention."""
+        native: list = []
         if self.pending is not None:
-            self.pending.on_connected(
-                lambda: (
-                    self.push_local.on_connected(self.startup.refresh_layers)
-                    if self.push_local is not None
-                    else self.startup.refresh_layers()
-                )
-            )
+            try:
+                native = self.pending.uploadable()
+            except (LabelClientError, ValueError, TypeError) as exc:
+                self._message(str(exc), Qgis.MessageLevel.Critical)
+                return
+        local = self.push_local.changed_layers() if self.push_local is not None else []
+        if not native and not local:
+            if self.pending is not None:
+                self.pending.report_attention()
+            then()
+            return
+        names = sorted(
+            {layer.name().split(" [Unpushed:", 1)[0] for layer in native}
+            | {layer.name().removeprefix("[Unpushed] ") for layer in local}
+        )
+        answer = QMessageBox.question(
+            self.iface.mainWindow(),
+            "CVI Label Client",
+            "Upload local changes?\n\n" + "\n".join(names),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            if self.pending is not None:
+                self.pending.report_attention(skip={layer.id() for layer in native})
+            then()
+            return
+
+        def upload_local() -> None:
+            if local and self.push_local is not None:
+                self.push_local.on_connected(then)
+            else:
+                then()
+
+        if native:
+            self.pending.on_connected(upload_local)
         else:
-            self.startup.refresh_layers()
+            if self.pending is not None:
+                self.pending.report_attention()
+            upload_local()
 
     def _apply_current_catalog(self, stored: dict[str, str], style_track: str) -> None:
         """Refresh class choices and clean loaded layers from current discovery."""

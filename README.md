@@ -215,31 +215,38 @@ a provider while editing so unsaved changes are not discarded.
 ### Unpushed edits and recovery
 
 Editable CVI layers are marked **[Unpushed: count]** while their changes exist only
-locally. Each edit saves a private recovery journal in the QGIS profile's
-`cvi-unpushed` directory. The journal keeps attributes (including Chinese text and
+locally. Each edit silently saves a private recovery journal in the QGIS profile's
+`cvi-unpushed` directory, like autosave: editing itself shows no plugin dialogs. The journal keeps attributes (including Chinese text and
 typed dates), geometry, and its original account, server, track and collection;
 it contains no login tokens. Save the QGIS project too so its layers can be reopened.
 
-**Connect** uploads never-submitted pending edits for the same signed-in account
-after checking write access and the original server versions, then refreshes clean
-layers. Edits whose server versions changed stay **Unpushed: needs review**. These
+When there are local changes to upload, **Connect** asks once: **Upload local
+changes?** with the affected layers listed. **Yes** uploads never-submitted pending
+edits for the same signed-in account after checking write access and the original
+server versions, then refreshes clean layers; success is silent. **No** keeps them
+local, and the next Connect asks again. Edits that were not uploaded for any other
+reason are reported in one message-bar line. Edits whose server versions changed stay **Unpushed: needs review**. These
 are checks before a normal native QGIS save, not a new atomic server locking protocol.
 A failed or interrupted save also needs review: native feature creation has no
 idempotency key, so replaying an uncertain save could create duplicate features.
 
-Use **Plugins → CVI Label Client → Unpushed edits…** to see saved recovery copies,
-restore them locally for review, or explicitly discard them. Cancelling edits in
-QGIS stops their automatic upload but retains a recovery copy for deliberate review.
+Use **Plugins → CVI Label Client → Unpushed edits…**, or **Review…** on the
+message after Connect, to see saved recovery copies in plain language, restore one
+locally for review, or tick copies and **Delete selected…** to clean up. A copy of
+edits still open in QGIS cannot be deleted until they are saved or discarded. See
+[upgrading to 0.3.12](docs/updating.md#upgrading-to-0312-unpushed-edits) for copies
+kept by earlier versions. Discarding edits in
+QGIS deletes their never-submitted recovery copy. A copy recovered from an earlier
+session, or one whose save was already attempted, is kept for review.
 An already-open edited buffer is never replaced by recovery. New edits made before
 old recovery is restored are kept separately and require review. Missing original
 layers must be reopened before recovery can be applied; the journal itself remains
 available if the project is unavailable.
 
-**Warn about unpushed edits**, in the panel's **Label layers** section, toggles the
-edit-warning popups independently of the
-startup connection prompt. Turning popups off does not turn off journaling or the
-layer markers. Recovery write errors always remain visible in the QGIS message bar;
-keep QGIS open and export the edited layer if its local recovery copy cannot be saved.
+A save whose outcome the server did not confirm always opens a warning, because
+retrying it could create duplicates. Recovery write errors always remain visible in
+the QGIS message bar; keep QGIS open and export the edited layer if its local
+recovery copy cannot be saved.
 Field/schema edits require explicit saving or export rather than automatic recovery.
 
 ### Push all local features
@@ -247,9 +254,10 @@ Field/schema edits require explicit saving or export rather than automatic recov
 **Push all local**, available under **Label layers** and in **Plugins → CVI Label
 Client**, saves eligible native pending edits,
 then checks local point, line and polygon layers (including multipart geometries).
-Connect also performs this check. New or invalid class mappings open the existing
-upload review; previously reviewed mappings and exclusions are remembered for that
-account, server and track. Remote database/WFS layers and unsupported geometries are
+New or invalid class mappings open the existing upload review; previously reviewed
+mappings and exclusions are remembered for that account, server and track. Connect
+includes only reviewed layers with new edits in its **Upload local changes?**
+question and never opens the review; layers needing review are left to this action. Remote database/WFS layers and unsupported geometries are
 not imported automatically.
 
 Before creating features, the plugin reads the destination collections and compares
@@ -267,8 +275,7 @@ local provider/source and feature ID; replacing files, changing IDs or independe
 redrawing a feature can make its prior identity impossible to infer. Separate machines
 do not share this journal, and simultaneous imports need coordination.
 
-Reviewed local source layers show **[Unpushed]** after edits and use the same warning
-toggle. Save local source files and the QGIS project before closing; export memory
+Reviewed local source layers show **[Unpushed]** after edits. Save local source files and the QGIS project before closing; export memory
 layers to a file. The upload journal does not preserve their unsaved feature payloads.
 
 These workflows are included in version 0.2.0. Save remote edits and your QGIS

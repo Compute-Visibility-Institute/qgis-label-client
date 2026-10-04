@@ -20,7 +20,7 @@ class Settings:
         self.oauth_email = "analyst@example.org"
         self.authcfg_by_track = {"default": "auth001"}
         self.track = "default"
-        self.values = {"signed_out_connection": "", "show_unpushed_warnings": False}
+        self.values = {"signed_out_connection": ""}
 
     def get(self, key):
         return self.values.get(key)
@@ -202,6 +202,149 @@ def test_new_edit_invalidates_check_before_deferred_journal_flush(controller):
     assert layer.buffer.added[-2]["name"] == "edit made while check was in flight"
 
 
+def test_editing_is_journaled_silently(controller):
+    shown = []
+    controller._warn = shown.append
+    layer = Layer()
+    controller.watch_layers([layer])
+    for fid in (-2, -3):
+        layer.buffer.added[fid] = Feature("another edit")
+        controller.changed(layer, fid)
+    for callback in controller.test_timers:
+        callback()
+    # QGIS already shows unsaved edits; the journal is a safety net, not news.
+    assert shown == []
+    assert controller.plugin.iface.messages == []
+    assert len(controller.store.list()[0]["operations"]) == 3
+
+
+def test_discarding_edits_deletes_their_never_submitted_copy_silently(controller):
+    shown = []
+    controller._warn = shown.append
+    layer = Layer()
+    controller.watch_layers([layer])
+    controller.snapshot(layer)
+    layer.buffer.added.clear()
+    layer.afterRollBack.emit()
+    assert controller.store.list() == []
+    assert layer.name() == "Labels"
+    assert shown == []
+
+
+def test_discarding_new_edits_keeps_a_copy_recovered_from_an_earlier_session(controller):
+    layer = Layer()
+    controller.watch_layers([layer])
+    document = controller.snapshot(layer)
+    # Reopened project: the copy is attached to the layer, but not to its new buffer.
+    controller.bound_buffers.discard(layer.id())
+    layer.afterRollBack.emit()
+    assert [row["id"] for row in controller.store.list()] == [document["id"]]
+
+
+def test_discarding_after_an_attempted_save_keeps_the_uncertain_copy(controller):
+    layer = Layer()
+    controller.watch_layers([layer])
+    document = controller.snapshot(layer)
+    document["state"] = "uncertain"
+    controller._persist(layer, document)
+    layer.afterRollBack.emit()
+    assert controller.store.load(document["id"])["state"] == "uncertain"
+
+
+def test_connect_uploads_only_pending_edits_for_this_account(controller, monkeypatch):
+    layer, other = Layer(), Layer("layer-other")
+    monkeypatch.setattr(pending.layers, "plugin_layers", lambda: [layer, other])
+    monkeypatch.setattr(pending.layers, "live_layers", lambda: [layer, other])
+    controller.watch_layers([layer, other])
+    controller.snapshot(layer)
+    held = controller.snapshot(other)
+    held["state"] = "conflict"
+    controller._persist(other, held)
+    assert controller.uploadable() == [layer]
+    controller.plugin._current_write_access = lambda: False
+    assert controller.uploadable() == []
+
+
+def test_copies_left_after_connect_are_reported_once_in_the_message_bar(controller):
+    shown = []
+    controller._warn = shown.append
+    layer = Layer()
+    controller.watch_layers([layer])
+    controller.snapshot(layer)
+    controller.report_attention(skip={layer.id()})
+    assert controller.plugin.iface.messages == []
+    controller.report_attention()
+    assert [text for _title, text, _level in controller.plugin.iface.messages] == [
+        "Labels: some local edits were not uploaded."
+    ]
+    # The line carries a Review… button that opens the cleanup dialog.
+    assert len(controller.plugin.iface.message_items[0].widgets) == 1
+    assert shown == []
+
+
+def test_cleanup_deletes_selected_copies_and_clears_layer_markers(controller, monkeypatch):
+    layer, gone = Layer(), Layer("layer-removed")
+    controller.watch_layers([layer, gone])
+    attached = controller.snapshot(layer)
+    orphan = controller.snapshot(gone)
+    layer.buffer.added.clear()
+    monkeypatch.setattr(pending.layers, "live_layers", lambda: [layer])
+    assert "[Unpushed:" in layer.name()
+    assert controller.delete_copies([attached["id"], orphan["id"]]) == []
+    assert controller.store.list() == []
+    assert layer.name() == "Labels"
+
+
+def test_cleanup_keeps_a_copy_of_edits_still_open_in_qgis(controller, monkeypatch):
+    layer = Layer()
+    controller.watch_layers([layer])
+    document = controller.snapshot(layer)
+    monkeypatch.setattr(pending.layers, "live_layers", lambda: [layer])
+    assert controller.delete_copies([document["id"]]) == [document["id"]]
+    assert controller.store.load(document["id"])["operations"] == document["operations"]
+    assert "save or discard the open edits" in controller.plugin.iface.messages[-1]
+
+
+def test_cleanup_dialog_confirms_once_then_deletes_and_refreshes(controller, monkeypatch):
+    layer = Layer()
+    controller.watch_layers([layer])
+    document = controller.snapshot(layer)
+    layer.buffer.added.clear()
+    monkeypatch.setattr(pending.layers, "live_layers", lambda: [layer])
+    controller.review()
+    first = controller.review_dialog
+    questions = []
+    monkeypatch.setattr(
+        pending.QMessageBox,
+        "question",
+        lambda _parent, _title, text, *_args: (
+            questions.append(text) or pending.QMessageBox.StandardButton.Yes
+        ),
+    )
+    controller._delete_selected([document["id"]])
+    assert questions == [
+        "Delete 1 recovery copy? Their edits will not be uploaded. This cannot be undone."
+    ]
+    assert controller.store.list() == []
+    assert controller.review_dialog is not first
+
+
+def test_cleanup_explains_copies_kept_by_earlier_discards(controller):
+    layer = Layer()
+    controller.watch_layers([layer])
+    document = controller.snapshot(layer)
+    document.update(
+        state="conflict",
+        note="Editing was cancelled in QGIS. The recovery copy is held for review, "
+        "not automatic upload.",
+    )
+    title, details = controller._describe(document)
+    assert title == "Labels: 1 edit(s)"
+    assert details.startswith("You discarded these edits in QGIS")
+    document["state"] = "uncertain"
+    assert "save was attempted" in controller._describe(document)[1]
+
+
 def test_successful_native_commit_queues_class_revision_refresh_after_buffer_clear(
     controller, monkeypatch
 ):
@@ -258,11 +401,8 @@ def test_discarding_recovery_never_reclassifies_uncertain_buffer_as_pending(
     document = controller.snapshot(layer)
     document["state"] = "uncertain"
     controller._persist(layer, document)
-    monkeypatch.setattr(
-        pending.QMessageBox, "question", lambda *_args: pending.QMessageBox.StandardButton.Yes
-    )
-    monkeypatch.setattr(controller, "review", lambda: None)
-    controller._discard(layer, document)
+    monkeypatch.setattr(pending.layers, "live_layers", lambda: [layer])
+    assert controller.delete_copies([document["id"]]) == [document["id"]]
     assert layer.buffer.added[-1]["name"] == "original edit"
     assert controller.store.load(document["id"])["state"] != "pending"
     assert controller.documents[layer.id()]["state"] != "pending"

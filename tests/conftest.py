@@ -30,6 +30,19 @@ def repo_root() -> Path:
     return REPO_ROOT
 
 
+class FakeMessageItem:
+    """A message-bar item: its text, plus the widgets (buttons) added to its layout."""
+
+    def __init__(self, title: str, text: str) -> None:
+        self.title, self.text, self.widgets = title, text, []
+
+    def layout(self):
+        return self
+
+    def addWidget(self, widget):  # noqa: N802
+        self.widgets.append(widget)
+
+
 class FakeInterface:
     """Records every attach and detach ``QgisInterface`` offers a plugin.
 
@@ -42,6 +55,7 @@ class FakeInterface:
         self.plugin_menu: list[tuple[str, object]] = []
         self.docks: list[object] = []
         self.messages: list[tuple[str, str, object]] = []
+        self.message_items: list[FakeMessageItem] = []
 
     # --- attach -----------------------------------------------------------
     def addToolBarIcon(self, action):  # noqa: N802 - Qt naming
@@ -77,6 +91,13 @@ class FakeInterface:
 
     def pushMessage(self, title, text, level=None, duration=0, showMore=""):  # noqa: N802, N803
         self.messages.append((title, text, level))
+
+    def createMessage(self, title, text):  # noqa: N802
+        return FakeMessageItem(title, text)
+
+    def pushWidget(self, item, level=None, duration=0):  # noqa: N802
+        self.messages.append((item.title, item.text, level))
+        self.message_items.append(item)
 
     def mapCanvas(self):  # noqa: N802
         return None

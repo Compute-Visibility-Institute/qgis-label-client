@@ -227,13 +227,41 @@ class PushAllLocal:
         original = layer.customProperty(LOCAL_NAME_PROPERTY, "") or layer.name()
         layer.setCustomProperty(LOCAL_NAME_PROPERTY, original)
         layer.setName(f"[Unpushed] {original}")
-        if self.plugin.pending is not None:
-            self.plugin.pending._warn(
-                f"{original}: local changes have not been pushed. Push all local adds missing "
-                "features; changes to existing server labels and local deletions require review. "
-                "Save the source file and QGIS project before closing; memory layers need "
-                "to be exported to a file."
-            )
+
+    def _context(self):
+        track = self.plugin.current_track()
+        if track is None or not self.plugin.settings.oauth_email:
+            return None
+        return (
+            self.plugin.settings.api_base_url,
+            self.plugin.settings.oauth_email.casefold(),
+            track.name,
+        )
+
+    def changed_layers(self):
+        """Reviewed local layers with new edits for this account, server and track.
+
+        Layers needing review (local deletions, held features) are left to the explicit
+        Push all local, so Connect does not ask about them again and again.
+        """
+        context = self._context()
+        if context is None:
+            return []
+        changed = []
+        for layer in publish.local_vector_layers():
+            if layer.customProperty(LOCAL_STATE_PROPERTY, "") != "unpushed":
+                continue
+            try:
+                saved = json.loads(layer.customProperty(MAPPING_PROPERTY, ""))
+            except (ValueError, TypeError):
+                continue
+            if (
+                isinstance(saved, dict)
+                and saved.get("publish")
+                and saved.get("context") == list(context)
+            ):
+                changed.append(layer)
+        return changed
 
     def cancel(self):
         if self.active is not None:
@@ -293,12 +321,12 @@ class PushAllLocal:
             complete()
             return
         track = plugin.current_track()
-        if track is None or not plugin.settings.oauth_email:
+        context = self._context()
+        if context is None:
             complete()
             return
         if plugin._defer_until_fresh(lambda: self.push(automatic=automatic, callback=callback)):
             return
-        context = (plugin.settings.api_base_url, plugin.settings.oauth_email.casefold(), track.name)
         generation = plugin._session.generation
 
         def same_context():
@@ -327,6 +355,10 @@ class PushAllLocal:
             and geometry_family(publish.geometry_type_name(layer))
             in {"Point", "LineString", "Polygon"}
         ]
+        if automatic:
+            # Connect uploads only what its question listed; it never opens the import review.
+            changed = {layer.id() for layer in self.changed_layers()}
+            local = [layer for layer in local if layer.id() in changed]
         if not local:
             if not automatic:
                 plugin._message(
@@ -360,7 +392,10 @@ class PushAllLocal:
             for item in plan
             if item.source.layer_id not in choices or item.problems()
         }
-        if review_ids:
+        if review_ids and automatic:
+            sources = [source for source in sources if source.layer_id not in review_ids]
+            plan = build_plan(sources, plugin.registry, choices=choices, track=track, routes=routes)
+        elif review_ids:
             dialog = PublishDialog(
                 [source for source in sources if source.layer_id in review_ids],
                 plugin.registry,
@@ -494,9 +529,19 @@ class PushAllLocal:
                             layer.setName(original)
                             layer.removeCustomProperty(LOCAL_NAME_PROPERTY)
                         layer.removeCustomProperty(LOCAL_STATE_PROPERTY)
-            if automatic and report.clean:
+            if automatic:
                 plugin.dock.set_publish_status(report.summary())
-                plugin._message(report.summary())
+                if not report.clean:
+                    for item in selected:
+                        layer = QgsProject.instance().mapLayer(item.source.layer_id)
+                        if layer is not None and layer.customProperty(LOCAL_STATE_PROPERTY, ""):
+                            layer.setCustomProperty(LOCAL_STATE_PROPERTY, "review")
+                    plugin._message(
+                        "Some local changes were not uploaded: "
+                        + report.summary()
+                        + " Use Push all local to review them.",
+                        Qgis.MessageLevel.Warning,
+                    )
             else:
                 plugin._on_published(selected, routes.untyped, report, track.name, context[0])
             complete()

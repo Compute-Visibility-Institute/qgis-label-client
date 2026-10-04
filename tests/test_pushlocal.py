@@ -1,5 +1,6 @@
 """Incremental uploads must distinguish existing, new, and uncertain source features."""
 
+import json
 from copy import deepcopy
 from threading import Event
 from types import SimpleNamespace
@@ -9,7 +10,7 @@ import pytest
 from qgis_label_client.core.errors import ConfigurationError
 from qgis_label_client.core.fields import DEFAULT_FIELDS
 from qgis_label_client.core.pushlocal import UploadLedger, fingerprint, geometry_key
-from qgis_label_client.pushlocal import ExistingFeatures
+from qgis_label_client.pushlocal import ExistingFeatures, PushAllLocal
 
 
 def feature(geometry=None, attrs=None):
@@ -211,3 +212,54 @@ def test_bulk_publisher_journals_before_network_and_keeps_uncertain_results(
     monkeypatch.setattr(publish, "_post_chunk", send)
     publish._send_chunk(guard.request, "labels", chunk, outcome, run, None)
     assert guard.ledger.state("labels", key) == expected
+
+
+def _local_layer(layer_id, properties):
+    title = ["Local buildings"]
+    return SimpleNamespace(
+        id=lambda: layer_id,
+        name=lambda: title[0],
+        setName=lambda value: title.__setitem__(0, value),
+        customProperty=lambda key, default="": properties.get(key, default),
+        setCustomProperty=properties.__setitem__,
+    )
+
+
+def test_local_edits_are_marked_without_dialogs():
+    shown = []
+    plugin = SimpleNamespace(pending=SimpleNamespace(_warn=shown.append))
+    layer = _local_layer("local-1", {})
+    pusher = PushAllLocal(plugin)
+    for change in ("featureAdded", "geometryChanged", "attributeValueChanged"):
+        pusher.source_changed(layer, change)
+    assert shown == []
+    assert layer.name() == "[Unpushed] Local buildings"
+
+
+def test_connect_offers_only_reviewed_local_layers_with_new_edits(monkeypatch):
+    from qgis_label_client import pushlocal
+
+    context = ["https://api.example.org", "analyst@example.org", "dev"]
+
+    def mapped(state, publish=True, where=context):
+        return {
+            pushlocal.LOCAL_STATE_PROPERTY: state,
+            pushlocal.MAPPING_PROPERTY: json.dumps({"context": where, "publish": publish}),
+        }
+
+    candidates = [
+        _local_layer("edited", mapped("unpushed")),
+        _local_layer("clean", mapped("")),
+        _local_layer("held", mapped("review")),
+        _local_layer("excluded", mapped("unpushed", publish=False)),
+        _local_layer("other-track", mapped("unpushed", where=[*context[:2], "prod"])),
+        _local_layer("never-reviewed", {pushlocal.LOCAL_STATE_PROPERTY: "unpushed"}),
+    ]
+    monkeypatch.setattr(pushlocal.publish, "local_vector_layers", lambda: candidates)
+    plugin = SimpleNamespace(
+        current_track=lambda: SimpleNamespace(name="dev"),
+        settings=SimpleNamespace(
+            api_base_url="https://api.example.org", oauth_email="Analyst@example.org"
+        ),
+    )
+    assert [layer.id() for layer in PushAllLocal(plugin).changed_layers()] == ["edited"]
