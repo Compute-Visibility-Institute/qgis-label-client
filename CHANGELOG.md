@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and `qgis-plugin-ci` copies the
 most recent entries into `metadata.txt` at release time.
 
+## [0.3.13] - 2026-10-04
+
+### Changed
+
+- No change to the plugin's behaviour. Test-suite formatting now passes the
+  repository's format check.
+
 ## [0.3.12] - 2026-10-04
 
 ### Changed

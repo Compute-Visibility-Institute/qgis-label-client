@@ -223,7 +223,9 @@ def test_failed_connection_recovery_preserves_unsaved_edits(plugin, monkeypatch)
     plugin.settings.set("track", "default")
     plugin.tracks = [Track("dev", is_default=True)]
     monkeypatch.setattr(layers, "dirty_layers", lambda: [SimpleNamespace(name=lambda: "Edited")])
-    monkeypatch.setattr(plugin, "connect_backend", lambda: pytest.fail("must preserve edit context"))
+    monkeypatch.setattr(
+        plugin, "connect_backend", lambda: pytest.fail("must preserve edit context")
+    )
 
     plugin.set_track("dev")
 

@@ -64,7 +64,9 @@ def test_a_bare_array_is_accepted_too():
 
 
 @pytest.mark.parametrize("include_database_default", [False, True])
-def test_effective_deployment_default_overrides_the_shared_database_default(include_database_default):
+def test_effective_deployment_default_overrides_the_shared_database_default(
+    include_database_default,
+):
     rows = [{"name": "dev", "is_default": False}]
     if include_database_default:
         rows.append({"name": "default", "is_default": True})
