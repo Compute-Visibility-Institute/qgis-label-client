@@ -485,8 +485,11 @@ class PendingEdits:
             if document:
                 # Only a copy that was "not saved yet" when this Save began may go back to
                 # that. One already held -- an earlier attempt reached the server in part,
-                # or never answered -- stays held whatever this attempt is told.
-                self.attempted_from_pending[layer.id()] = document["state"] == "pending"
+                # or never answered -- stays held whatever this attempt is told. Recorded
+                # once per Save: the upload on Connect calls this itself and then again
+                # through commitChanges, when the copy is already marked uncertain.
+                if layer.id() not in self.saving:
+                    self.attempted_from_pending[layer.id()] = document["state"] == "pending"
                 if document["operations"]:
                     document["state"] = "uncertain"
                     document["note"] = (

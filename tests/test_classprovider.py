@@ -439,3 +439,44 @@ def test_a_deletion_kept_from_an_earlier_attempt_is_not_unwritten():
     assert state._wrote is False
     assert provider.ClassLayerProvider.save_refusal(state) is None
     assert provider.ClassLayerProvider.last_refusal(state).status == 409
+
+
+def test_an_update_written_before_a_refusal_in_the_same_save_keeps_it_held():
+    """The first update is written and the second refused, in one Save: the server has
+    the first, so this is not a refusal of the whole Save."""
+    rows = {
+        1: {"id": "11.aa", "properties": {}, "geometry": None},
+        2: {"id": "12.bb", "properties": {}, "geometry": None},
+    }
+    answers = [{"id": "11.ab"}, BackendError("refused", status=422)]
+
+    def http(method, url, payload):
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    state = SimpleNamespace(
+        _require_writable=lambda: None,
+        _uncertain_create=False,
+        _created={},
+        _deleted=set(),
+        _rows=rows,
+        _refusal=None,
+        _failure=None,
+        _wrote=False,
+        _definitions={},
+        _wire_by_name={},
+        fields=lambda: [],
+        _collection_url="https://api.example/class-layers/collections/cl_test__point",
+        _http=http,
+        _cache_row=lambda row: row,
+        pushError=lambda _text: None,
+    )
+    state._note_failure = lambda exc: provider.ClassLayerProvider._note_failure(state, exc)
+    geometry = SimpleNamespace(asJson=lambda: '{"type":"Point","coordinates":[1,2]}')
+
+    assert provider.ClassLayerProvider._change(state, {}, {1: geometry, 2: geometry}) is False
+    assert state._wrote is True
+    assert provider.ClassLayerProvider.save_refusal(state) is None
+    assert provider.ClassLayerProvider.last_refusal(state).status == 422

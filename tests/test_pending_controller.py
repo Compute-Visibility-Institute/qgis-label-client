@@ -373,6 +373,41 @@ def test_a_copy_already_held_is_not_released_by_a_later_clean_refusal(controller
     assert controller.plugin.iface.messages == []
 
 
+class RefusingClassLayer(ClassLayer):
+    """QGIS's commit as the class provider makes it when the server refuses: the
+    native signal fires, nothing is acknowledged, and the commit returns False."""
+
+    def commitChanges(self, stop_editing=True):  # noqa: N802
+        self.commits += 1
+        self.beforeCommitChanges.emit(stop_editing)
+        return False
+
+
+def test_a_first_upload_on_connect_that_is_refused_goes_back_to_unsaved(controller, monkeypatch):
+    """The upload calls before_commit itself and again through commitChanges. The
+    second call sees the copy already marked uncertain; it must not decide where the
+    copy started, or a first refusal reads as a held earlier attempt."""
+    monkeypatch.setattr(
+        pending.QThread, "currentThread", lambda: SimpleNamespace(loopLevel=lambda: 1)
+    )
+    shown = []
+    controller._warn = shown.append
+    layer = RefusingClassLayer(BackendError("HTTP 422", status=422, payload=SELF_INTERSECTION))
+    controller.watch_layers([layer])
+    document = controller.snapshot(layer)
+    controller._check_and_push(layer, document, lambda: None)
+    controller.plugin.tasks.calls[-1].done("")
+    for callback in list(controller.test_timers):
+        callback()
+    assert layer.commits == 1
+    assert shown == []
+    assert controller.store.list()[0]["state"] == "pending"
+    assert controller.plugin.iface.messages[-1].startswith(
+        "Labels was not saved. The server refused a shape"
+    )
+    assert layer.name() == "Labels [Unpushed: 1]"
+
+
 def test_a_refused_sign_in_says_to_sign_in_again(controller, monkeypatch):
     refusal = BackendError(
         "HTTP 401 from https://api.example.org The API rejected the credential.",
