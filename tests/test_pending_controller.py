@@ -11,6 +11,7 @@ import pytest
 from qgis_stubs import Signal
 
 from qgis_label_client import pending
+from qgis_label_client.core.errors import BackendError
 from qgis_label_client.core.pending import JournalError, JournalStore
 
 
@@ -238,7 +239,78 @@ def test_save_outcome_is_judged_only_after_the_native_commit_returns(controller,
     # The commit returned without afterCommitChanges: QGIS could not save.
     run_timers()
     assert len(shown) == 1
-    assert shown[0].startswith("Labels: the server has not confirmed the save.")
+    assert shown[0].startswith("Labels: the server did not confirm the save.")
+
+
+SELF_INTERSECTION = {
+    "code": "GeometryInvalid",
+    "description": "the feature is not a valid geometry: Self-intersection at "
+    "POINT(12.34567891234567 45.67890123456). This is the same check app.label_check() makes.",
+}
+
+
+class ClassLayer(Layer):
+    """A class layer whose provider reports what the server said to this Save."""
+
+    def __init__(self, refusal, *, wrote=False):
+        super().__init__()
+        self.provider = SimpleNamespace(
+            reset_write_session=lambda: None,
+            last_refresh_error="",
+            begin_save=lambda: None,
+            save_refusal=lambda: None if wrote else refusal,
+            last_refusal=lambda: refusal,
+        )
+
+    def providerType(self):  # noqa: N802
+        return pending.layers.CLASS_PROVIDER
+
+    def dataProvider(self):  # noqa: N802
+        return self.provider
+
+
+def _refused_save(controller, monkeypatch, layer):
+    shown = []
+    controller._warn = shown.append
+    monkeypatch.setattr(
+        pending.QThread, "currentThread", lambda: SimpleNamespace(loopLevel=lambda: 1)
+    )
+    controller.watch_layers([layer])
+    layer.beforeCommitChanges.emit(True)
+    # The commit returned without afterCommitChanges: the server refused it.
+    for callback in list(controller.test_timers):
+        callback()
+    return shown
+
+
+def test_a_refused_save_says_why_and_keeps_the_edits_ready_to_save(controller, monkeypatch):
+    refusal = BackendError("HTTP 422", status=422, payload=SELF_INTERSECTION)
+    layer = ClassLayer(refusal)
+    shown = _refused_save(controller, monkeypatch, layer)
+    # Nothing was written, so nothing is in doubt: no duplicate-risk dialog.
+    assert shown == []
+    assert controller.plugin.iface.messages[-1] == (
+        "Labels was not saved. The server refused a shape because its outline crosses "
+        "itself near 45.678901° N, 12.345679° E. Find it with Vector ▸ Geometry Tools ▸ "
+        "Check Validity, fix it (or run Fix Geometries), then Save again. Your edits are "
+        "still in the layer."
+    )
+    [copy] = controller.store.list()
+    assert copy["state"] == "pending"
+    assert copy["note"].startswith("Not saved: The server refused a shape")
+    assert layer.name() == "Labels [Unpushed: 1]"
+
+
+def test_a_refusal_after_part_of_the_save_was_written_stays_held(controller, monkeypatch):
+    refusal = BackendError("HTTP 422", status=422, payload=SELF_INTERSECTION)
+    layer = ClassLayer(refusal, wrote=True)
+    shown = _refused_save(controller, monkeypatch, layer)
+    assert len(shown) == 1
+    assert shown[0].startswith(
+        "Labels: only part of this save reached the server before it refused the rest. "
+        "The server refused a shape because its outline crosses itself"
+    )
+    assert controller.store.list()[0]["state"] == "uncertain"
 
 
 def test_editing_is_journaled_silently(controller):
@@ -314,7 +386,7 @@ def test_copies_left_after_connect_are_reported_once_in_the_message_bar(controll
     assert controller.plugin.iface.messages == []
     controller.report_attention()
     assert [text for _title, text, _level in controller.plugin.iface.messages] == [
-        "Labels: some local edits were not uploaded."
+        "Labels: edits kept on this computer are not saved on the server yet."
     ]
     # The line carries a Review… button that opens the cleanup dialog, and the trace copy.
     assert len(controller.plugin.iface.message_items[0].widgets) == 2

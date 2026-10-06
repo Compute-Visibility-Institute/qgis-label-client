@@ -32,7 +32,7 @@ from qgis.core import (
 from qgis.PyQt.QtCore import QByteArray, QDate, QDateTime, Qt, QVariant
 
 from . import network
-from .core import recorded
+from .core import recorded, refusals
 from .core.errors import BackendError
 from .log import log_warning
 
@@ -170,6 +170,10 @@ class ClassLayerProvider(QgsVectorDataProvider):
         self._created = {}
         self._created_payloads = {}
         self._deleted = set()
+        # What the current Save learned: the server's refusal, if it refused, and
+        # whether any request of this Save was written before that.
+        self._refusal = None
+        self._wrote = False
         self._local_fields = []
         self._subset = self._uri.param("filter")
         self._track = ""
@@ -509,6 +513,32 @@ class ClassLayerProvider(QgsVectorDataProvider):
         self._created.clear()
         self._created_payloads.clear()
         self._deleted.clear()
+        self.begin_save()
+
+    def begin_save(self):
+        """A new Save starts: forget what the previous one learned."""
+        self._refusal = None
+        self._wrote = False
+
+    def save_refusal(self):
+        """The server's refusal of this Save, when it is the WHOLE story.
+
+        Only when nothing of this Save reached the server: no create with an unknown
+        outcome, no earlier create kept for a retry, no write before the refusal. Then
+        sending the same edits again after fixing them cannot duplicate anything. In
+        every other case the answer is ``None`` and the Save stays unconfirmed.
+        """
+        if self._refusal is None or self._wrote or self._created or self._uncertain_create:
+            return None
+        return self._refusal
+
+    def last_refusal(self):
+        """The server's refusal in this Save, whatever else happened, for the message."""
+        return self._refusal
+
+    def _note_failure(self, exc):
+        if isinstance(exc, BackendError) and refusals.is_refusal(exc.status):
+            self._refusal = exc
 
     def _mark_uncertain_create(self):
         self._uncertain_create = True
@@ -616,8 +646,10 @@ class ClassLayerProvider(QgsVectorDataProvider):
             self._require_writable()
             if self._uncertain_create:
                 raise ValueError(
-                    "A previous create has an unknown save outcome. Inspect the server "
-                    "and recover the pending edits before retrying; automatic creates are blocked."
+                    "An earlier save of new features got no answer from the server, so they "
+                    "may already be saved there. New features are not sent again "
+                    "automatically, because that could create duplicates. Check the layer "
+                    "against the server, then use Unpushed edits… to keep or discard them."
                 )
             for position, feature in enumerate(features):
                 payload = {
@@ -641,6 +673,7 @@ class ClassLayerProvider(QgsVectorDataProvider):
                         )
                         self._created[retry_key] = previous
                         self._created_payloads[retry_key] = copy.deepcopy(payload)
+                        self._wrote = True
                         self._cache_row(previous)
                     completed.append(self._feature(previous))
                     completed[-1].setId(self._fid_by_rowid[_row_identity(previous)])
@@ -660,6 +693,7 @@ class ClassLayerProvider(QgsVectorDataProvider):
                     if not known_rejection:
                         self._mark_uncertain_create()
                     raise
+                self._wrote = True
                 self._created[retry_key] = saved
                 self._created_payloads[retry_key] = copy.deepcopy(payload)
                 completed.append(self._cache_row(saved))
@@ -667,6 +701,7 @@ class ClassLayerProvider(QgsVectorDataProvider):
             self._created_payloads.clear()
             return True, completed
         except Exception as exc:  # noqa: BLE001 - Qt virtual callback reports provider errors.
+            self._note_failure(exc)
             self.pushError(str(exc))
             return False, completed
 
@@ -698,9 +733,11 @@ class ClassLayerProvider(QgsVectorDataProvider):
                     self._collection_url + "/items/" + quote(str(before["id"]), safe=""),
                     payload,
                 )
+                self._wrote = True
                 self._cache_row(saved)
             return True
         except Exception as exc:  # noqa: BLE001 - Qt virtual callback reports provider errors.
+            self._note_failure(exc)
             self.pushError(str(exc))
             return False
 
@@ -724,6 +761,7 @@ class ClassLayerProvider(QgsVectorDataProvider):
                     "DELETE",
                     self._collection_url + "/items/" + quote(str(row["id"]), safe=""),
                 )
+                self._wrote = True
                 self._memory.deleteFeatures([fid])
                 self._fid_by_rowid.pop(_row_identity(row), None)
                 self._rows.pop(fid, None)
@@ -731,6 +769,7 @@ class ClassLayerProvider(QgsVectorDataProvider):
             self._deleted.clear()
             return True
         except Exception as exc:  # noqa: BLE001 - Qt virtual callback reports provider errors.
+            self._note_failure(exc)
             self.pushError(str(exc))
             return False
 

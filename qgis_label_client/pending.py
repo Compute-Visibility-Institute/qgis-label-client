@@ -36,6 +36,7 @@ from qgis.PyQt.QtWidgets import (
 )
 
 from . import client, diagnostics, layers
+from .core import refusals
 from .core.errors import LabelClientError
 from .core.fields import DEFAULT_FIELDS
 from .core.pending import JournalError, JournalStore, decode_value, encode_value
@@ -320,7 +321,8 @@ class PendingEdits:
             self.snapshot(layer)
         except (JournalError, ValueError, TypeError, RuntimeError) as exc:
             self._error(
-                f"Could not protect your unpushed edits: {exc}. Keep QGIS open and export the edited layer."
+                f"Could not keep a local copy of your unsaved edits: {exc}. Keep QGIS open "
+                "and export the edited layer, so the edits are not lost."
             )
 
     def snapshot(self, layer):
@@ -460,6 +462,12 @@ class PendingEdits:
         if not layer.isModified():
             return True
         try:
+            if layer.providerType() == layers.CLASS_PROVIDER:
+                # A provider created by an older plugin version, still alive after an
+                # in-session upgrade, does not have this. Saving must still work.
+                begin = getattr(layer.dataProvider(), "begin_save", None)
+                if begin is not None:
+                    begin()
             document = self.snapshot(layer)
             if document:
                 if document["operations"]:
@@ -492,12 +500,61 @@ class PendingEdits:
 
     def _warn_failed_save(self, layer):
         document = self.documents.get(layer.id())
-        if not self.closed and document and document["state"] == "uncertain":
-            name = layer.customProperty(NAME_PROPERTY, "") or layer.name()
+        if self.closed or not document or document["state"] != "uncertain":
+            return
+        name = layer.customProperty(NAME_PROPERTY, "") or layer.name()
+        provider = layer.dataProvider() if layer.providerType() == layers.CLASS_PROVIDER else None
+        # Absent on a provider from an older plugin version: then nothing is known.
+        refusal = getattr(provider, "save_refusal", lambda: None)()
+        if refusal is not None:
+            # The server refused before anything was written, so nothing is in doubt:
+            # these edits are simply not saved yet, and saving them again once fixed
+            # cannot create a duplicate. Say why, and do not hold them for review.
+            reason = refusals.describe(refusal.payload, refusal.status) or str(refusal)
+            if self._release_refused(layer, document, f"Not saved: {reason}"):
+                self.plugin._message(
+                    f"{name} was not saved. {reason} Your edits are still in the layer.",
+                    Qgis.MessageLevel.Critical,
+                )
+                return
+        seen = getattr(provider, "last_refusal", lambda: None)()
+        if seen is not None:
+            reason = refusals.describe(seen.payload, seen.status) or str(seen)
             self._warn(
-                f"{name}: the server has not confirmed the save. "
-                "Your local recovery copy remains; automatic retry is paused to prevent duplicates."
+                f"{name}: only part of this save reached the server before it refused the "
+                f"rest. {reason} Because some edits may already be saved, QGIS will not send "
+                "them again automatically: that could create duplicates. Your edits are kept "
+                "here. Check the layer against the server, then use Unpushed edits… to keep "
+                "or discard the local copy."
             )
+            return
+        self._warn(
+            f"{name}: the server did not confirm the save. The connection failed or timed "
+            "out before it answered, so the edits may or may not be saved. QGIS will not "
+            "send them again automatically, because that could create duplicates. Your "
+            "edits are kept here. Check the layer against the server, then use Unpushed "
+            "edits… to keep or discard the local copy."
+        )
+
+    def _release_refused(self, layer, document, note):
+        """Return a refused save's copy to pending, if it is still the one this Save wrote."""
+        try:
+            stored = self.store.load(document["id"])
+        except JournalError:
+            return False
+        if stored.get("state") != "uncertain" or stored.get("operations") != document["operations"]:
+            return False
+        key = document["id"]
+        held = key in self.claimed
+        self.claimed.add(key)
+        try:
+            self._persist(layer, dict(document, state="pending", note=note))
+        except JournalError:
+            return False
+        finally:
+            if not held:
+                self.claimed.discard(key)
+        return True
 
     def saved(self, layer):
         document = self.documents.get(layer.id())
@@ -589,7 +646,17 @@ class PendingEdits:
         )
         if names:
             bar = self.plugin.iface.messageBar()
-            text = f"{', '.join(names)}: some local edits were not uploaded."
+            notes = {
+                str(document.get("note") or "")
+                for layer_id, document in self.documents.items()
+                if layer_id in self.watches and layer_id not in skip
+            } - {""}
+            # One shared reason is worth the line; several would not fit in it.
+            reason = f" {notes.pop()}" if len(notes) == 1 else ""
+            text = (
+                f"{', '.join(names)}: edits kept on this computer are not saved on the "
+                f"server yet.{reason}"
+            )
             item = bar.createMessage("CVI Label Client", text)
             button = QPushButton("Review…", item)
             button.clicked.connect(lambda _checked=False: self.review())
@@ -718,7 +785,7 @@ class PendingEdits:
                     finally:
                         self.claimed.discard(frozen["id"])
             except (LabelClientError, ValueError, TypeError, RuntimeError) as exc:
-                self._error(f"Unpushed edits were kept for review: {exc}")
+                self._error(f"Your local edits were not sent and are kept for review: {exc}")
             finally:
                 self.saving.discard(layer_id)
                 if stop:
@@ -728,7 +795,8 @@ class PendingEdits:
 
         def failed(message):
             self._error(
-                f"Unpushed edits remain saved locally. Reconnect could not check the server: {message}"
+                "Your unsaved edits are kept on this computer, but they could not be sent: "
+                f"checking the server before sending them failed. {message}"
             )
             finished(stop=True)
 
@@ -1030,7 +1098,7 @@ class PendingEdits:
         self.warning_trace = diagnostics.trace_for(text, context_of=self.plugin._trace_context)
         if self.warning is None:
             self.warning = QMessageBox(self.plugin.iface.mainWindow())
-            self.warning.setWindowTitle("Unpushed edits")
+            self.warning.setWindowTitle("Save not confirmed")
             self.warning.setIcon(QMessageBox.Icon.Warning)
             self.warning.setStandardButtons(QMessageBox.StandardButton.Ok)
             self.warning.setModal(False)

@@ -335,19 +335,66 @@ def test_unknown_create_outcome_blocks_repeat_post(status, uncertain):
         _uncertain_create=False,
         _created={},
         _created_payloads={},
+        _refusal=None,
+        _wrote=False,
         _properties=lambda feature: {},
         _collection_url="https://api.example/class-layers/collections/cl_test__point",
         _http=http,
         pushError=errors.append,
     )
     state._mark_uncertain_create = lambda: setattr(state, "_uncertain_create", True)
+    state._note_failure = lambda exc: provider.ClassLayerProvider._note_failure(state, exc)
     feature = SimpleNamespace(
         id=lambda: -1,
         geometry=lambda: SimpleNamespace(asJson=lambda: '{"type":"Point","coordinates":[1,2]}'),
     )
     assert provider.ClassLayerProvider.addFeatures(state, [feature]) == (False, [])
     assert state._uncertain_create is uncertain
+    # Only an answered refusal, with nothing written, lets the edits go back unsaved.
+    refusal = provider.ClassLayerProvider.save_refusal(state)
+    assert (refusal is not None) is (not uncertain)
     if uncertain:
         assert provider.ClassLayerProvider.addFeatures(state, [feature]) == (False, [])
         assert len(calls) == 1
-        assert "unknown save outcome" in errors[-1]
+        assert "got no answer from the server" in errors[-1]
+
+
+def test_a_refusal_after_a_successful_create_is_not_the_whole_story():
+    responses = [
+        {"type": "Feature", "id": "12.ab", "properties": {}},
+        BackendError("no", status=422),
+    ]
+
+    def http(*_args):
+        answer = responses.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    state = SimpleNamespace(
+        _require_writable=lambda: None,
+        _uncertain_create=False,
+        _created={},
+        _created_payloads={},
+        _refusal=None,
+        _wrote=False,
+        _properties=lambda feature: {},
+        _collection_url="https://api.example/class-layers/collections/cl_test__point",
+        _http=http,
+        _cache_row=lambda row: row,
+        pushError=lambda _text: None,
+    )
+    state._mark_uncertain_create = lambda: setattr(state, "_uncertain_create", True)
+    state._note_failure = lambda exc: provider.ClassLayerProvider._note_failure(state, exc)
+    features = [
+        SimpleNamespace(
+            id=lambda fid=fid: fid,
+            geometry=lambda: SimpleNamespace(asJson=lambda: '{"type":"Point","coordinates":[1,2]}'),
+        )
+        for fid in (-1, -2)
+    ]
+    ok, _completed = provider.ClassLayerProvider.addFeatures(state, features)
+    assert ok is False
+    # The first feature is on the server: re-sending everything could duplicate it.
+    assert provider.ClassLayerProvider.save_refusal(state) is None
+    assert provider.ClassLayerProvider.last_refusal(state).status == 422

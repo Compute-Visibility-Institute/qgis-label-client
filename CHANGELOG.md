@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and `qgis-plugin-ci` copies the
 most recent entries into `metadata.txt` at release time.
 
+## [Unreleased]
+
+### Fixed
+
+- A save the server refuses outright, with nothing written, is no longer reported as
+  "the server has not confirmed the save" with automatic retry paused. The edits stay in
+  the layer, ready to save again, and the message bar says what was wrong and how to fix
+  it. For example, a polygon whose outline crosses itself is named with the place and the
+  QGIS tools that find and repair it. Only a save whose outcome is genuinely unknown, or
+  one the server refused after part of it was already written, is still held for review.
+- Server refusals in QGIS's own commit errors read as a sentence, not raw JSON cut off
+  mid-word.
+- Clearer wording, without "unpushed", for the messages about local copies of unsaved
+  edits.
+
 ## [0.3.14] - 2026-10-06
 
 ### Added
