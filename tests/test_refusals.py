@@ -18,7 +18,7 @@ PRODUCTION_SELF_INTERSECTION = {
 
 
 def test_a_self_intersection_names_the_problem_the_place_and_the_fix():
-    message = describe(PRODUCTION_SELF_INTERSECTION, 422)
+    message = describe(PRODUCTION_SELF_INTERSECTION)
     assert message == (
         "The server refused a shape because its outline crosses itself near "
         "45.678901° N, 12.345679° E. Find it with Vector ▸ Geometry Tools ▸ Check "
@@ -45,6 +45,30 @@ def test_an_unknown_geometry_reason_is_passed_through_and_a_missing_place_is_omi
     payload = {"code": "GeometryInvalid", "description": "x is not a valid geometry: Spike."}
     assert describe(payload).startswith("The server refused a shape because Spike. Find it")
     assert "near" not in describe(payload)
+
+
+def test_a_structural_refusal_under_the_same_code_keeps_its_own_sentence():
+    payload = {
+        "code": "GeometryInvalid",
+        "description": (
+            "the feature: the ring at coordinates[0] has 3 position(s). A closed ring needs "
+            "at least four — three corners and a repeat of the first."
+        ),
+    }
+    message = describe(payload)
+    assert message.startswith("the feature: the ring at coordinates[0] has 3 position(s).")
+    assert "because it is invalid" not in message
+    assert message.endswith("then Save again.")
+
+
+def test_a_validation_list_is_said_as_its_messages():
+    payload = {
+        "detail": [
+            {"loc": ["body", "reason"], "msg": "Field required", "type": "missing"},
+            {"loc": ["body", "item"], "msg": "Input should be an object"},
+        ]
+    }
+    assert describe(payload) == "Field required; Input should be an object"
 
 
 def test_other_refusals_keep_whole_sentences_and_gain_their_fix():

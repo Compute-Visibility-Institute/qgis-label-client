@@ -75,7 +75,20 @@ def _first_sentences(text: str, limit: int = 400) -> str:
     return text[: cut + 1] if cut > 0 else text[:limit].rsplit(" ", 1)[0] + "…"
 
 
-def describe(payload: object, status: int | None = None) -> str | None:
+def _text(payload: Mapping[str, Any]) -> str:
+    """The document's prose. FastAPI's validation ``detail`` is a list of problems,
+    each with a ``msg``; it is said as those messages, never as a Python repr."""
+    value = payload.get("description") or payload.get("detail") or ""
+    if isinstance(value, list):
+        messages = [
+            str(item.get("msg") or "").strip() if isinstance(item, Mapping) else str(item)
+            for item in value
+        ]
+        return "; ".join(message for message in messages if message)
+    return str(value).strip()
+
+
+def describe(payload: object) -> str | None:
     """One readable sentence saying what was refused and what to do, or ``None``.
 
     ``None`` means the error document says nothing usable, and the caller keeps its
@@ -84,15 +97,19 @@ def describe(payload: object, status: int | None = None) -> str | None:
     if not isinstance(payload, Mapping):
         return None
     code = str(payload.get("code") or "")
-    text = str(payload.get("description") or payload.get("detail") or "").strip()
+    text = _text(payload)
     if code == "GeometryInvalid":
+        # The GEOS phrasing only for a GEOS verdict. The API uses the same code for the
+        # structural refusals it decides itself -- an empty polygon, a ring that is
+        # short or not closed, a short line -- and their own sentence is the message.
         match = _INVALID.search(text)
         raw = str(payload.get("reason") or (match.group("reason") if match else "")).strip()
-        reason = _GEOS_REASONS.get(raw.casefold().rstrip("."), raw.rstrip(".") or "it is invalid")
-        return (
-            f"The server refused a shape because {reason}{_location(payload, match)}. "
-            + _ACTIONS[code]
-        )
+        if raw:
+            reason = _GEOS_REASONS.get(raw.casefold().rstrip("."), raw.rstrip("."))
+            return (
+                f"The server refused a shape because {reason}{_location(payload, match)}. "
+                + _ACTIONS[code]
+            )
     if not text:
         return None
     sentence = _first_sentences(text)

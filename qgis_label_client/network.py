@@ -159,7 +159,7 @@ def _describe_status(status: int, url: str, body: bytes) -> str:
     # The API's own refusals are a JSON document with a code and a description. Said
     # as a sentence, it is the message; dumped raw, it was 300 characters of JSON cut
     # off mid-word, after the URL, in front of the analyst who had to fix the data.
-    described = refusals.describe(_json_object(body), status)
+    described = refusals.describe(_json_object(body))
     if described:
         parts.append(described)
     else:

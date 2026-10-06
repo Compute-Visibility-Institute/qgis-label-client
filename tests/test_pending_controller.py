@@ -239,7 +239,9 @@ def test_save_outcome_is_judged_only_after_the_native_commit_returns(controller,
     # The commit returned without afterCommitChanges: QGIS could not save.
     run_timers()
     assert len(shown) == 1
-    assert shown[0].startswith("Labels: the server did not confirm the save.")
+    assert shown[0].startswith(
+        "Labels: the save did not complete, and it is not known which edits reached the server."
+    )
 
 
 SELF_INTERSECTION = {
@@ -252,7 +254,7 @@ SELF_INTERSECTION = {
 class ClassLayer(Layer):
     """A class layer whose provider reports what the server said to this Save."""
 
-    def __init__(self, refusal, *, wrote=False):
+    def __init__(self, refusal, *, wrote=False, failure=None):
         super().__init__()
         self.provider = SimpleNamespace(
             reset_write_session=lambda: None,
@@ -260,6 +262,7 @@ class ClassLayer(Layer):
             begin_save=lambda: None,
             save_refusal=lambda: None if wrote else refusal,
             last_refusal=lambda: refusal,
+            last_failure=lambda: failure or refusal,
         )
 
     def providerType(self):  # noqa: N802
@@ -307,10 +310,48 @@ def test_a_refusal_after_part_of_the_save_was_written_stays_held(controller, mon
     shown = _refused_save(controller, monkeypatch, layer)
     assert len(shown) == 1
     assert shown[0].startswith(
-        "Labels: only part of this save reached the server before it refused the rest. "
+        "Labels: part of this save reached the server before it refused the rest. "
         "The server refused a shape because its outline crosses itself"
     )
     assert controller.store.list()[0]["state"] == "uncertain"
+
+
+def test_an_unclassified_failure_is_quoted_not_explained(controller, monkeypatch):
+    failure = ValueError("This class layer is not editable")
+    shown = _refused_save(controller, monkeypatch, ClassLayer(None, failure=failure))
+    assert len(shown) == 1
+    assert "It stopped with: This class layer is not editable." in shown[0]
+    assert "connection" not in shown[0] and "timed out" not in shown[0]
+
+
+def test_a_refusal_whose_copy_cannot_be_released_says_so(controller, monkeypatch):
+    shown = []
+    controller._warn = shown.append
+    monkeypatch.setattr(
+        pending.QThread, "currentThread", lambda: SimpleNamespace(loopLevel=lambda: 1)
+    )
+    layer = ClassLayer(BackendError("HTTP 422", status=422, payload=SELF_INTERSECTION))
+    controller.watch_layers([layer])
+    layer.beforeCommitChanges.emit(True)
+    # Another session changed the copy on disk before this one judged the Save.
+    load = controller.store.load
+    monkeypatch.setattr(controller.store, "load", lambda key: dict(load(key), state="conflict"))
+    for callback in list(controller.test_timers):
+        callback()
+    assert len(shown) == 1
+    assert shown[0].startswith("Labels was not saved. The server refused a shape")
+    assert "could not be updated" in shown[0]
+    assert "part of this save" not in shown[0]
+
+
+def test_a_not_saved_note_goes_once_the_edits_change(controller, monkeypatch):
+    refusal = BackendError("HTTP 422", status=422, payload=SELF_INTERSECTION)
+    layer = ClassLayer(refusal)
+    _refused_save(controller, monkeypatch, layer)
+    assert controller.store.list()[0]["note"].startswith("Not saved:")
+    layer.buffer.added[-2] = Feature("the fixed shape")
+    controller.snapshot(layer)
+    assert "note" not in controller.store.list()[0]
 
 
 def test_editing_is_journaled_silently(controller):

@@ -417,6 +417,17 @@ class PendingEdits:
             raise ValueError(
                 "Sign in and connect this layer's track before editing; its owner cannot be identified"
             )
+        if (
+            document.get("state") == "pending"
+            and previous
+            and (
+                previous["operations"] != operations
+                or previous.get("added_fields", []) != added_fields
+            )
+        ):
+            # A "Not saved: ..." note is about the edits that were refused. Once they
+            # change, it may describe a problem already fixed, so it goes.
+            document.pop("note", None)
         document["operations"] = operations
         document["added_fields"] = added_fields
         self._persist(layer, document)
@@ -506,34 +517,46 @@ class PendingEdits:
         provider = layer.dataProvider() if layer.providerType() == layers.CLASS_PROVIDER else None
         # Absent on a provider from an older plugin version: then nothing is known.
         refusal = getattr(provider, "save_refusal", lambda: None)()
+        held = (
+            "QGIS will not send these edits again automatically, because that could "
+            "create duplicates. Your edits are kept here. Check the layer against the "
+            "server, then use Unpushed edits… to keep or discard the local copy."
+        )
         if refusal is not None:
             # The server refused before anything was written, so nothing is in doubt:
             # these edits are simply not saved yet, and saving them again once fixed
             # cannot create a duplicate. Say why, and do not hold them for review.
-            reason = refusals.describe(refusal.payload, refusal.status) or str(refusal)
+            reason = refusals.describe(refusal.payload) or str(refusal)
             if self._release_refused(layer, document, f"Not saved: {reason}"):
                 self.plugin._message(
                     f"{name} was not saved. {reason} Your edits are still in the layer.",
                     Qgis.MessageLevel.Critical,
                 )
                 return
-        seen = getattr(provider, "last_refusal", lambda: None)()
-        if seen is not None:
-            reason = refusals.describe(seen.payload, seen.status) or str(seen)
+            # Refused, but the local copy could not be returned to "not saved yet" --
+            # it changed on disk, or could not be read. Say exactly that.
             self._warn(
-                f"{name}: only part of this save reached the server before it refused the "
-                f"rest. {reason} Because some edits may already be saved, QGIS will not send "
-                "them again automatically: that could create duplicates. Your edits are kept "
-                "here. Check the layer against the server, then use Unpushed edits… to keep "
-                "or discard the local copy."
+                f"{name} was not saved. {reason} Its local copy could not be updated to "
+                "match, so it is kept for review: use Unpushed edits… to keep or discard it."
             )
             return
+        seen = getattr(provider, "last_refusal", lambda: None)()
+        if seen is not None:
+            reason = refusals.describe(seen.payload) or str(seen)
+            self._warn(
+                f"{name}: part of this save reached the server before it refused the rest. "
+                f"{reason} {held}"
+            )
+            return
+        # Nothing here was classified, so claim no cause: say what stopped the save,
+        # when it is known, and that what reached the server is unknown.
+        failure = getattr(provider, "last_failure", lambda: None)()
+        stopped = f" It stopped with: {failure}" if failure is not None else ""
+        if stopped and not stopped.endswith((".", "!", "?")):
+            stopped += "."
         self._warn(
-            f"{name}: the server did not confirm the save. The connection failed or timed "
-            "out before it answered, so the edits may or may not be saved. QGIS will not "
-            "send them again automatically, because that could create duplicates. Your "
-            "edits are kept here. Check the layer against the server, then use Unpushed "
-            "edits… to keep or discard the local copy."
+            f"{name}: the save did not complete, and it is not known which edits reached "
+            f"the server.{stopped} {held}"
         )
 
     def _release_refused(self, layer, document, note):

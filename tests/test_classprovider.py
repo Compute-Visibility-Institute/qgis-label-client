@@ -336,6 +336,7 @@ def test_unknown_create_outcome_blocks_repeat_post(status, uncertain):
         _created={},
         _created_payloads={},
         _deleted=set(),
+        _updated=set(),
         _refusal=None,
         _wrote=False,
         _properties=lambda feature: {},
@@ -378,6 +379,7 @@ def test_a_refusal_after_a_successful_create_is_not_the_whole_story():
         _created={},
         _created_payloads={},
         _deleted=set(),
+        _updated=set(),
         _refusal=None,
         _wrote=False,
         _properties=lambda feature: {},
@@ -419,6 +421,7 @@ def test_a_deletion_kept_from_an_earlier_attempt_is_not_unwritten():
         _uncertain_create=False,
         _created={},
         _deleted=set(),
+        _updated=set(),
         _rows=dict(rows),
         _fid_by_rowid={"11": 1, "12": 2},
         _memory=SimpleNamespace(deleteFeatures=lambda _fids: True),
@@ -439,3 +442,52 @@ def test_a_deletion_kept_from_an_earlier_attempt_is_not_unwritten():
     assert state._wrote is False
     assert provider.ClassLayerProvider.save_refusal(state) is None
     assert provider.ClassLayerProvider.last_refusal(state).status == 409
+
+
+def test_an_update_kept_from_an_earlier_attempt_is_not_unwritten():
+    """A's update is written and B's refused; the next Save is refused at its first
+    request (an expired credential, say). The server still has A's update, so the
+    recovery copy must not be released as unsaved."""
+    rows = {
+        1: {"id": "11.aa", "properties": {}, "geometry": None},
+        2: {"id": "12.bb", "properties": {}, "geometry": None},
+    }
+    answers = []
+
+    def http(method, url, payload):
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    state = SimpleNamespace(
+        _require_writable=lambda: None,
+        _uncertain_create=False,
+        _created={},
+        _deleted=set(),
+        _updated=set(),
+        _rows=dict(rows),
+        _refusal=None,
+        _failure=None,
+        _wrote=False,
+        _definitions={},
+        _wire_by_name={},
+        fields=lambda: [],
+        _collection_url="https://api.example/class-layers/collections/cl_test__point",
+        _http=http,
+        _cache_row=lambda row: row,
+        pushError=lambda _text: None,
+    )
+    state._note_failure = lambda exc: provider.ClassLayerProvider._note_failure(state, exc)
+    geometry = SimpleNamespace(asJson=lambda: '{"type":"Point","coordinates":[1,2]}')
+
+    answers[:] = [{"id": "11.ab"}, BackendError("refused", status=422)]
+    assert provider.ClassLayerProvider._change(state, {}, {1: geometry, 2: geometry}) is False
+    assert provider.ClassLayerProvider.save_refusal(state) is None
+
+    provider.ClassLayerProvider.begin_save(state)
+    answers[:] = [BackendError("expired", status=401)]
+    assert provider.ClassLayerProvider._change(state, {}, {1: geometry, 2: geometry}) is False
+    assert state._wrote is False
+    assert provider.ClassLayerProvider.save_refusal(state) is None
+    assert provider.ClassLayerProvider.last_failure(state).status == 401

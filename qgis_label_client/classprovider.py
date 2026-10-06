@@ -170,9 +170,14 @@ class ClassLayerProvider(QgsVectorDataProvider):
         self._created = {}
         self._created_payloads = {}
         self._deleted = set()
-        # What the current Save learned: the server's refusal, if it refused, and
-        # whether any request of this Save was written before that.
+        # Feature updates written by an attempt whose Save did not complete. QGIS keeps
+        # them buffered and sends them again; until then the server already has them.
+        self._updated = set()
+        # What the current Save learned: the server's refusal, if it refused, whether
+        # any request of this Save was written before that, and the last failure of
+        # any kind -- which is all a message may claim about one it cannot classify.
         self._refusal = None
+        self._failure = None
         self._wrote = False
         self._local_fields = []
         self._subset = self._uri.param("filter")
@@ -513,19 +518,21 @@ class ClassLayerProvider(QgsVectorDataProvider):
         self._created.clear()
         self._created_payloads.clear()
         self._deleted.clear()
+        self._updated.clear()
         self.begin_save()
 
     def begin_save(self):
         """A new Save starts: forget what the previous one learned."""
         self._refusal = None
+        self._failure = None
         self._wrote = False
 
     def save_refusal(self):
         """The server's refusal of this Save, when it is the WHOLE story.
 
         Only when nothing of this Save reached the server: no create with an unknown
-        outcome, no create or deletion kept from an earlier attempt for its retry, no
-        write before the refusal. Then sending the same edits again after fixing them
+        outcome, no create, update or deletion kept from an earlier attempt for its
+        retry, no write before the refusal. Then sending the same edits again after fixing them
         cannot duplicate anything, and nothing the recovery copy describes has already
         happened. In every other case the answer is ``None`` and the Save stays
         unconfirmed.
@@ -534,6 +541,7 @@ class ClassLayerProvider(QgsVectorDataProvider):
             self._refusal is None
             or self._wrote
             or self._created
+            or self._updated
             or self._deleted
             or self._uncertain_create
         ):
@@ -544,7 +552,12 @@ class ClassLayerProvider(QgsVectorDataProvider):
         """The server's refusal in this Save, whatever else happened, for the message."""
         return self._refusal
 
+    def last_failure(self):
+        """Why this Save stopped, as raised -- a refusal, no answer, or a local check."""
+        return self._failure
+
     def _note_failure(self, exc):
+        self._failure = exc
         if isinstance(exc, BackendError) and refusals.is_refusal(exc.status):
             self._refusal = exc
 
@@ -692,13 +705,7 @@ class ClassLayerProvider(QgsVectorDataProvider):
                         raise ValueError("Create returned no feature identity")
                     _row_identity(saved)
                 except Exception as exc:
-                    known_rejection = (
-                        isinstance(exc, BackendError)
-                        and exc.status is not None
-                        and 400 <= exc.status < 500
-                        and exc.status != 408
-                    )
-                    if not known_rejection:
+                    if not (isinstance(exc, BackendError) and refusals.is_refusal(exc.status)):
                         self._mark_uncertain_create()
                     raise
                 self._wrote = True
@@ -742,6 +749,7 @@ class ClassLayerProvider(QgsVectorDataProvider):
                     payload,
                 )
                 self._wrote = True
+                self._updated.add(fid)
                 self._cache_row(saved)
             return True
         except Exception as exc:  # noqa: BLE001 - Qt virtual callback reports provider errors.
