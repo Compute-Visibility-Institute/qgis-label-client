@@ -524,11 +524,19 @@ class ClassLayerProvider(QgsVectorDataProvider):
         """The server's refusal of this Save, when it is the WHOLE story.
 
         Only when nothing of this Save reached the server: no create with an unknown
-        outcome, no earlier create kept for a retry, no write before the refusal. Then
-        sending the same edits again after fixing them cannot duplicate anything. In
-        every other case the answer is ``None`` and the Save stays unconfirmed.
+        outcome, no create or deletion kept from an earlier attempt for its retry, no
+        write before the refusal. Then sending the same edits again after fixing them
+        cannot duplicate anything, and nothing the recovery copy describes has already
+        happened. In every other case the answer is ``None`` and the Save stays
+        unconfirmed.
         """
-        if self._refusal is None or self._wrote or self._created or self._uncertain_create:
+        if (
+            self._refusal is None
+            or self._wrote
+            or self._created
+            or self._deleted
+            or self._uncertain_create
+        ):
             return None
         return self._refusal
 

@@ -335,6 +335,7 @@ def test_unknown_create_outcome_blocks_repeat_post(status, uncertain):
         _uncertain_create=False,
         _created={},
         _created_payloads={},
+        _deleted=set(),
         _refusal=None,
         _wrote=False,
         _properties=lambda feature: {},
@@ -376,6 +377,7 @@ def test_a_refusal_after_a_successful_create_is_not_the_whole_story():
         _uncertain_create=False,
         _created={},
         _created_payloads={},
+        _deleted=set(),
         _refusal=None,
         _wrote=False,
         _properties=lambda feature: {},
@@ -398,3 +400,42 @@ def test_a_refusal_after_a_successful_create_is_not_the_whole_story():
     # The first feature is on the server: re-sending everything could duplicate it.
     assert provider.ClassLayerProvider.save_refusal(state) is None
     assert provider.ClassLayerProvider.last_refusal(state).status == 422
+
+
+def test_a_deletion_kept_from_an_earlier_attempt_is_not_unwritten():
+    """Deleting A succeeds and B is refused; the retry skips A and B is refused again.
+
+    The retry wrote nothing itself, but A is gone from the server, so the recovery copy
+    still describes something that happened and must not be released as unsaved.
+    """
+    rows = {1: {"id": "11.aa"}, 2: {"id": "12.bb"}}
+
+    def http(method, url):
+        if url.endswith("12.bb"):
+            raise BackendError("refused", status=409)
+
+    state = SimpleNamespace(
+        _require_writable=lambda: None,
+        _uncertain_create=False,
+        _created={},
+        _deleted=set(),
+        _rows=dict(rows),
+        _fid_by_rowid={"11": 1, "12": 2},
+        _memory=SimpleNamespace(deleteFeatures=lambda _fids: True),
+        _refusal=None,
+        _wrote=False,
+        _collection_url="https://api.example/class-layers/collections/cl_test__point",
+        _http=http,
+        pushError=lambda _text: None,
+    )
+    state._note_failure = lambda exc: provider.ClassLayerProvider._note_failure(state, exc)
+
+    assert provider.ClassLayerProvider.deleteFeatures(state, [1, 2]) is False
+    assert provider.ClassLayerProvider.save_refusal(state) is None
+    # The next Save starts clean but keeps the deletion that already happened.
+    provider.ClassLayerProvider.begin_save(state)
+    state._rows[1] = rows[1]
+    assert provider.ClassLayerProvider.deleteFeatures(state, [1, 2]) is False
+    assert state._wrote is False
+    assert provider.ClassLayerProvider.save_refusal(state) is None
+    assert provider.ClassLayerProvider.last_refusal(state).status == 409
