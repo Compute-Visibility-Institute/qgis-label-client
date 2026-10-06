@@ -134,6 +134,8 @@ class PendingEdits:
         self.revisions = {}
         self.bound_buffers = set()
         self.commits = {}
+        # layer id -> was its copy "pending" when the current Save began?
+        self.attempted_from_pending = {}
         self.claimed = set()
         self.scheduled = set()
         self.saving = set()
@@ -481,6 +483,10 @@ class PendingEdits:
                     begin()
             document = self.snapshot(layer)
             if document:
+                # Only a copy that was "not saved yet" when this Save began may go back to
+                # that. One already held -- an earlier attempt reached the server in part,
+                # or never answered -- stays held whatever this attempt is told.
+                self.attempted_from_pending[layer.id()] = document["state"] == "pending"
                 if document["operations"]:
                     document["state"] = "uncertain"
                     document["note"] = (
@@ -515,6 +521,7 @@ class PendingEdits:
             return
         name = layer.customProperty(NAME_PROPERTY, "") or layer.name()
         provider = layer.dataProvider() if layer.providerType() == layers.CLASS_PROVIDER else None
+        fresh = self.attempted_from_pending.pop(layer.id(), False)
         # Absent on a provider from an older plugin version: then nothing is known.
         refusal = getattr(provider, "save_refusal", lambda: None)()
         held = (
@@ -522,11 +529,20 @@ class PendingEdits:
             "create duplicates. Your edits are kept here. Check the layer against the "
             "server, then use Unpushed edits… to keep or discard the local copy."
         )
+        if refusal is not None and not fresh:
+            # Refused before writing anything -- but the copy was already held, because
+            # an earlier attempt may have reached the server. This answer changes nothing.
+            reason = refusals.explain(refusal.status, refusal.payload, str(refusal))
+            self._warn(
+                f"{name} was not saved. {reason} An earlier save of these edits may "
+                f"already have reached the server, so the copy stays held. {held}"
+            )
+            return
         if refusal is not None:
             # The server refused before anything was written, so nothing is in doubt:
             # these edits are simply not saved yet, and saving them again once fixed
             # cannot create a duplicate. Say why, and do not hold them for review.
-            reason = refusals.describe(refusal.payload) or str(refusal)
+            reason = refusals.explain(refusal.status, refusal.payload, str(refusal))
             if self._release_refused(layer, document, f"Not saved: {reason}"):
                 self.plugin._message(
                     f"{name} was not saved. {reason} Your edits are still in the layer.",
@@ -542,7 +558,7 @@ class PendingEdits:
             return
         seen = getattr(provider, "last_refusal", lambda: None)()
         if seen is not None:
-            reason = refusals.describe(seen.payload) or str(seen)
+            reason = refusals.explain(seen.status, seen.payload, str(seen))
             self._warn(
                 f"{name}: part of this save reached the server before it refused the rest. "
                 f"{reason} {held}"
@@ -606,6 +622,7 @@ class PendingEdits:
             layer.dataProvider().reset_write_session()
         # An empty Save or a different recovery copy is not acknowledgement of this journal.
         journal_id = self.commits.pop(layer.id(), None)
+        self.attempted_from_pending.pop(layer.id(), None)
         if journal_id and self.documents.get(layer.id(), {}).get("id") == journal_id:
             self.saved(layer)
         QTimer.singleShot(0, lambda: self._refresh_committed_class_layer(layer))
@@ -674,8 +691,9 @@ class PendingEdits:
                 for layer_id, document in self.documents.items()
                 if layer_id in self.watches and layer_id not in skip
             } - {""}
-            # One shared reason is worth the line; several would not fit in it.
-            reason = f" {notes.pop()}" if len(notes) == 1 else ""
+            # A reason only when one layer is listed: beside several it would read as
+            # the reason for all of them.
+            reason = f" {notes.pop()}" if len(names) == 1 and len(notes) == 1 else ""
             text = (
                 f"{', '.join(names)}: edits kept on this computer are not saved on the "
                 f"server yet.{reason}"

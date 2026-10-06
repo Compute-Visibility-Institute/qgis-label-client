@@ -38,16 +38,27 @@ _INVALID = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-#: What to do, per refusal code. A code missing here falls back to the description.
+#: What to do, per refusal code, and a word that shows the server's own sentence
+#: already said it. A code missing here falls back to the description alone.
 _ACTIONS = {
     "GeometryInvalid": (
-        "Find it with Vector ▸ Geometry Tools ▸ Check Validity, fix it (or run Fix "
-        "Geometries), then Save again."
+        "Find it with Vector ▸ Geometry Tools ▸ Check Validity, fix it (or run the Fix "
+        "geometries tool), then Save again.",
+        None,
     ),
-    "GeometryWrongCrs": "Reproject the layer to EPSG:4326, then Save again.",
+    "GeometryWrongCrs": ("Reproject the layer to EPSG:4326, then Save again.", "4326"),
     "GeometryHasZ": (
-        "Drop the Z values (Vector ▸ Geometry Tools ▸ Drop M/Z Values), then Save again."
+        "In QGIS: Processing Toolbox ▸ Vector geometry ▸ Drop M/Z values, then Save again.",
+        None,
     ),
+}
+
+#: Refusals about who is asking, not about the data: their advice is the message.
+_ACCESS = {
+    401: "The server did not accept your sign-in. Sign in again from the CVI panel, "
+    "then Save again.",
+    403: "Your account may not make this change. Ask an administrator for access.",
+    429: "The server is busy. Wait a moment, then Save again.",
 }
 
 
@@ -67,12 +78,13 @@ def _location(payload: Mapping[str, Any], match: re.Match[str] | None) -> str:
 
 
 def _first_sentences(text: str, limit: int = 400) -> str:
-    """Whole sentences up to ``limit`` characters: never a cut-off word."""
+    """Whole sentences up to ``limit`` characters: never a cut-off word, and always
+    ending as a sentence, so whatever follows does not run on."""
     text = " ".join(text.split())
-    if len(text) <= limit:
-        return text
-    cut = text.rfind(". ", 0, limit)
-    return text[: cut + 1] if cut > 0 else text[:limit].rsplit(" ", 1)[0] + "…"
+    if len(text) > limit:
+        cut = text.rfind(". ", 0, limit)
+        text = text[: cut + 1] if cut > 0 else text[:limit].rsplit(" ", 1)[0] + "…"
+    return text if text.endswith((".", "!", "?", "…")) else text + "."
 
 
 def _text(payload: Mapping[str, Any]) -> str:
@@ -108,13 +120,27 @@ def describe(payload: object) -> str | None:
             reason = _GEOS_REASONS.get(raw.casefold().rstrip("."), raw.rstrip("."))
             return (
                 f"The server refused a shape because {reason}{_location(payload, match)}. "
-                + _ACTIONS[code]
+                + _ACTIONS[code][0]
             )
     if not text:
         return None
     sentence = _first_sentences(text)
-    action = _ACTIONS.get(code)
-    return f"{sentence} {action}" if action and action not in sentence else sentence
+    action, covered_by = _ACTIONS.get(code, (None, None))
+    if action is None:
+        return sentence
+    if covered_by is not None and covered_by in sentence:
+        return f"{sentence} Then Save again."
+    return f"{sentence} {action}"
+
+
+def explain(status: int | None, payload: object, fallback: str) -> str:
+    """The sentence for a refused Save: access advice for a refusal about who is
+    asking (with the server's own words for a 403, which say what it saw), otherwise
+    what was wrong with the data, otherwise ``fallback``."""
+    if status in _ACCESS:
+        detail = _text(payload) if isinstance(payload, Mapping) and status == 403 else ""
+        return f"{_first_sentences(detail)} {_ACCESS[status]}" if detail else _ACCESS[status]
+    return describe(payload) or _first_sentences(fallback)
 
 
 def is_refusal(status: int | None) -> bool:

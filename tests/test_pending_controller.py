@@ -295,7 +295,7 @@ def test_a_refused_save_says_why_and_keeps_the_edits_ready_to_save(controller, m
     assert controller.plugin.iface.messages[-1] == (
         "Labels was not saved. The server refused a shape because its outline crosses "
         "itself near 45.678901° N, 12.345679° E. Find it with Vector ▸ Geometry Tools ▸ "
-        "Check Validity, fix it (or run Fix Geometries), then Save again. Your edits are "
+        "Check Validity, fix it (or run the Fix geometries tool), then Save again. Your edits are "
         "still in the layer."
     )
     [copy] = controller.store.list()
@@ -352,6 +352,51 @@ def test_a_not_saved_note_goes_once_the_edits_change(controller, monkeypatch):
     layer.buffer.added[-2] = Feature("the fixed shape")
     controller.snapshot(layer)
     assert "note" not in controller.store.list()[0]
+
+
+def test_a_copy_already_held_is_not_released_by_a_later_clean_refusal(controller, monkeypatch):
+    """A partly written Save holds the copy. The next Save is refused before sending
+    anything -- but the earlier attempt may already have created or updated rows, so
+    releasing the copy now would let a later upload create them a second time."""
+    refusal = BackendError("HTTP 422", status=422, payload=SELF_INTERSECTION)
+    layer = ClassLayer(refusal, wrote=True)
+    _refused_save(controller, monkeypatch, layer)
+    assert controller.store.list()[0]["state"] == "uncertain"
+
+    layer.provider.save_refusal = lambda: refusal  # this attempt wrote nothing
+    controller.test_timers.clear()
+    shown = _refused_save(controller, monkeypatch, layer)
+    assert controller.store.list()[0]["state"] == "uncertain"
+    assert len(shown) == 1
+    assert shown[0].startswith("Labels was not saved. The server refused a shape")
+    assert "so the copy stays held" in shown[0]
+    assert controller.plugin.iface.messages == []
+
+
+def test_a_refused_sign_in_says_to_sign_in_again(controller, monkeypatch):
+    refusal = BackendError(
+        "HTTP 401 from https://api.example.org The API rejected the credential.",
+        status=401,
+        payload={"detail": "ID token could not be verified"},
+    )
+    _refused_save(controller, monkeypatch, ClassLayer(refusal))
+    assert controller.plugin.iface.messages[-1] == (
+        "Labels was not saved. The server did not accept your sign-in. Sign in again from "
+        "the CVI panel, then Save again. Your edits are still in the layer."
+    )
+
+
+def test_one_layers_note_is_not_given_as_the_reason_for_several(controller):
+    first, second = Layer(), Layer("layer-second")
+    second.title = "Second"
+    controller.watch_layers([first, second])
+    noted = controller.snapshot(first)
+    noted["note"] = "Not saved: something about the first layer only."
+    controller._persist(first, noted)
+    controller.snapshot(second)
+    controller.report_attention()
+    [(_title, text, _level)] = controller.plugin.iface.messages
+    assert text == "Labels, Second: edits kept on this computer are not saved on the server yet."
 
 
 def test_editing_is_journaled_silently(controller):

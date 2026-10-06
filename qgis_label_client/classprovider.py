@@ -170,9 +170,6 @@ class ClassLayerProvider(QgsVectorDataProvider):
         self._created = {}
         self._created_payloads = {}
         self._deleted = set()
-        # Feature updates written by an attempt whose Save did not complete. QGIS keeps
-        # them buffered and sends them again; until then the server already has them.
-        self._updated = set()
         # What the current Save learned: the server's refusal, if it refused, whether
         # any request of this Save was written before that, and the last failure of
         # any kind -- which is all a message may claim about one it cannot classify.
@@ -518,7 +515,6 @@ class ClassLayerProvider(QgsVectorDataProvider):
         self._created.clear()
         self._created_payloads.clear()
         self._deleted.clear()
-        self._updated.clear()
         self.begin_save()
 
     def begin_save(self):
@@ -531,8 +527,9 @@ class ClassLayerProvider(QgsVectorDataProvider):
         """The server's refusal of this Save, when it is the WHOLE story.
 
         Only when nothing of this Save reached the server: no create with an unknown
-        outcome, no create, update or deletion kept from an earlier attempt for its
-        retry, no write before the refusal. Then sending the same edits again after fixing them
+        outcome, no create or deletion kept from an earlier attempt for its retry, no
+        write before the refusal. (A copy an earlier attempt left held is never released
+        by a later refusal at all; :mod:`.pending` decides that.) Then sending the same edits again after fixing them
         cannot duplicate anything, and nothing the recovery copy describes has already
         happened. In every other case the answer is ``None`` and the Save stays
         unconfirmed.
@@ -541,7 +538,6 @@ class ClassLayerProvider(QgsVectorDataProvider):
             self._refusal is None
             or self._wrote
             or self._created
-            or self._updated
             or self._deleted
             or self._uncertain_create
         ):
@@ -749,7 +745,6 @@ class ClassLayerProvider(QgsVectorDataProvider):
                     payload,
                 )
                 self._wrote = True
-                self._updated.add(fid)
                 self._cache_row(saved)
             return True
         except Exception as exc:  # noqa: BLE001 - Qt virtual callback reports provider errors.
