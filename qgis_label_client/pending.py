@@ -23,7 +23,7 @@ from qgis.core import (
     QgsProject,
     QgsVariantUtils,
 )
-from qgis.PyQt.QtCore import QDate, QDateTime, Qt, QTime, QTimer, QVariant
+from qgis.PyQt.QtCore import QDate, QDateTime, Qt, QThread, QTime, QTimer, QVariant
 from qgis.PyQt.QtWidgets import (
     QAction,
     QCheckBox,
@@ -35,7 +35,7 @@ from qgis.PyQt.QtWidgets import (
     QVBoxLayout,
 )
 
-from . import client, layers
+from . import client, diagnostics, layers
 from .core.errors import LabelClientError
 from .core.fields import DEFAULT_FIELDS
 from .core.pending import JournalError, JournalStore, decode_value, encode_value
@@ -139,6 +139,8 @@ class PendingEdits:
         self.closed = False
         self.syncing = False
         self.warning = None
+        self.warning_trace = ""
+        self.warning_copy = None
         self.review_dialog = None
 
     def install(self, menu):
@@ -467,7 +469,8 @@ class PendingEdits:
                     )
                 self._persist(layer, document)
                 self.commits[layer.id()] = document["id"]
-                QTimer.singleShot(0, lambda: self._warn_failed_save(layer))
+                level = QThread.currentThread().loopLevel()
+                QTimer.singleShot(0, lambda: self._after_commit_returns(layer, level))
             return True
         except (JournalError, ValueError, TypeError) as exc:
             # setAllowCommit is not exposed to Python. Do not claim the native save was stopped.
@@ -476,11 +479,23 @@ class PendingEdits:
             )
             return False
 
+    def _after_commit_returns(self, layer, level):
+        # The class provider awaits each HTTP request in a nested event loop, which
+        # also runs zero-delay timers. Judge the save only after QGIS's commit returns.
+        if self.closed:
+            return
+        if QThread.currentThread().loopLevel() > level:
+            QTimer.singleShot(100, lambda: self._after_commit_returns(layer, level))
+            return
+        with suppress(RuntimeError):
+            self._warn_failed_save(layer)
+
     def _warn_failed_save(self, layer):
         document = self.documents.get(layer.id())
         if not self.closed and document and document["state"] == "uncertain":
+            name = layer.customProperty(NAME_PROPERTY, "") or layer.name()
             self._warn(
-                f"{layer.name()}: the server has not confirmed the save. "
+                f"{name}: the server has not confirmed the save. "
                 "Your local recovery copy remains; automatic retry is paused to prevent duplicates."
             )
 
@@ -574,12 +589,13 @@ class PendingEdits:
         )
         if names:
             bar = self.plugin.iface.messageBar()
-            item = bar.createMessage(
-                "CVI Label Client", f"{', '.join(names)}: some local edits were not uploaded."
-            )
+            text = f"{', '.join(names)}: some local edits were not uploaded."
+            item = bar.createMessage("CVI Label Client", text)
             button = QPushButton("Review…", item)
             button.clicked.connect(lambda _checked=False: self.review())
             item.layout().addWidget(button)
+            trace = diagnostics.trace_for(text, context_of=self.plugin._trace_context)
+            item.layout().addWidget(diagnostics.copy_button(trace, item))
             bar.pushWidget(item, Qgis.MessageLevel.Warning, -1)
 
     def on_connected(self, finished):
@@ -1011,12 +1027,17 @@ class PendingEdits:
     def _warn(self, text):
         if self.closed:
             return
+        self.warning_trace = diagnostics.trace_for(text, context_of=self.plugin._trace_context)
         if self.warning is None:
             self.warning = QMessageBox(self.plugin.iface.mainWindow())
             self.warning.setWindowTitle("Unpushed edits")
             self.warning.setIcon(QMessageBox.Icon.Warning)
             self.warning.setStandardButtons(QMessageBox.StandardButton.Ok)
             self.warning.setModal(False)
+            self.warning_copy = diagnostics.add_copy_button(
+                self.warning, lambda: self.warning_trace
+            )
+        self.warning_copy.setText(diagnostics.COPY_LABEL)
         self.warning.setText(text)
         self.warning.show()
 

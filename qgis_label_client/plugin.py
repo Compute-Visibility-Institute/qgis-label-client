@@ -27,7 +27,8 @@ from collections.abc import Callable, Sequence
 from contextlib import suppress
 from typing import Any
 
-from qgis.core import Qgis, QgsFeedback, QgsProject
+from qgis.core import Qgis, QgsApplication, QgsFeedback, QgsProject
+from qgis.gui import QgsMessageBar
 from qgis.PyQt.QtCore import Qt, QTimer
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import (
@@ -38,7 +39,7 @@ from qgis.PyQt.QtWidgets import (
     QMessageBox,
 )
 
-from . import auth, client, layertree, network, oauth_flow, qa
+from . import auth, client, diagnostics, layertree, network, oauth_flow, qa
 from . import layers as layer_tools
 from . import publish as publish_tools
 from .access import LayerAccess
@@ -175,6 +176,14 @@ class LabelClientPlugin:
     def initGui(self) -> None:  # noqa: N802 - name fixed by the QGIS plugin contract
         icon = QIcon(os.path.join(PLUGIN_DIR, "icons", "cvi.svg"))
 
+        # First, so the trace of an error during loading still has the log before it.
+        message_log = QgsApplication.messageLog()
+        message_log.messageReceived.connect(diagnostics.record_log)
+        self.teardown.add(
+            "trace log capture",
+            lambda: message_log.messageReceived.disconnect(diagnostics.record_log),
+        )
+
         # Before any layer is built: layers.build_label_layer installs a field default
         # that calls cvi_valid_from(), and QGIS will not evaluate a default naming a
         # function it does not know. Torn down through the same registry as everything
@@ -235,6 +244,16 @@ class LabelClientPlugin:
         self.teardown.add(
             "menu: pull all remote",
             lambda: self.iface.removePluginMenu(MENU_NAME, self.pull_action),
+        )
+        self.trace_action = QAction(diagnostics.COPY_LABEL, self.iface.mainWindow())
+        self.trace_action.setToolTip(
+            "Copy technical details for the CVI team, e.g. after QGIS refused Save Layer Edits."
+        )
+        self.trace_action.triggered.connect(self.copy_trace)
+        self.iface.addPluginToMenu(MENU_NAME, self.trace_action)
+        self.teardown.add(
+            "menu: copy trace information",
+            lambda: self.iface.removePluginMenu(MENU_NAME, self.trace_action),
         )
         log("Plugin loaded.")
 
@@ -354,13 +373,61 @@ class LabelClientPlugin:
     def _message(
         self, text: str, level: Qgis.MessageLevel = Qgis.MessageLevel.Info, details: str = ""
     ) -> None:
-        duration = 0 if level == Qgis.MessageLevel.Critical else -1
+        bar = self.iface.messageBar()
+        if level not in (Qgis.MessageLevel.Warning, Qgis.MessageLevel.Critical):
+            if details:
+                bar.pushMessage(
+                    "CVI Label Client", text, showMore=details, level=level, duration=-1
+                )
+            else:
+                bar.pushMessage("CVI Label Client", text, level, -1)
+            return
+        # Every problem carries its trace, built now while an exception being handled by
+        # the caller is still in scope.
+        trace = diagnostics.trace_for(text, details, self._trace_context)
+        item = bar.createMessage("CVI Label Client", text)
         if details:
-            self.iface.messageBar().pushMessage(
-                "CVI Label Client", text, showMore=details, level=level, duration=duration
+            item.layout().addWidget(
+                diagnostics.details_button("CVI Label Client", text, details, item)
             )
-        else:
-            self.iface.messageBar().pushMessage("CVI Label Client", text, level, duration)
+        item.layout().addWidget(diagnostics.copy_button(trace, item))
+        duration = (
+            0 if level == Qgis.MessageLevel.Critical else QgsMessageBar.defaultMessageTimeout(level)
+        )
+        bar.pushWidget(item, level, duration)
+
+    def _trace_context(self) -> tuple:
+        """Where an error happened. Names the account, never a credential."""
+        settings = self.settings
+        context = [
+            ("Backend", settings.api_base_url or "-"),
+            ("Track", settings.track or "-"),
+            ("Account", settings.oauth_email or "signed out"),
+        ]
+        with suppress(RuntimeError, AttributeError):
+            layer = self.iface.activeLayer()
+            if layer is not None:
+                state = [
+                    layer.providerType(),
+                    layer_tools.collection_of(layer) or "not a CVI layer",
+                ]
+                if layer_tools.track_of(layer):
+                    state.append("track " + layer_tools.track_of(layer))
+                if layer.isEditable():
+                    state.append("editing")
+                if layer.isModified():
+                    state.append("unsaved edits")
+                context.append(("Active layer", f"{layer.name()} ({', '.join(state)})"))
+        return tuple(context)
+
+    def copy_trace(self, _checked: bool = False) -> None:
+        """For errors QGIS shows itself, such as a refused Save, or a message already gone."""
+        diagnostics.copy_to_clipboard(
+            diagnostics.build_trace(
+                "Copied from the plugin menu.", context=self._trace_context(), shown=False
+            )
+        )
+        self._message("Trace information copied to the clipboard.", Qgis.MessageLevel.Success)
 
     def _sync_activity(self, state: ActivityState) -> None:
         if self.dock is not None:

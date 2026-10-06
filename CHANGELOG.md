@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and `qgis-plugin-ci` copies the
 most recent entries into `metadata.txt` at release time.
 
+## [0.3.14] - 2026-10-06
+
+### Added
+
+- Every plugin error and warning has a "Copy trace information" button. It copies the
+  plugin, QGIS and system versions, the backend, environment, account and active layer,
+  any Python traceback, the recent requests with their request IDs, and the recent log, so
+  the server's side of the same failure can be found. Query strings and credentials are
+  never included. The plugin menu has the same item for errors QGIS shows itself, such
+  as a refused Save Layer Edits.
+- Each API request carries an `X-Request-ID`, which the server logs with the request.
+
+### Fixed
+
+- Saving a class layer no longer shows "the server has not confirmed the save" when the
+  save succeeds. The check ran while the save was still waiting for the server.
+
 ## [0.3.13] - 2026-10-04
 
 ### Changed

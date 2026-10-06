@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -25,6 +26,7 @@ from qgis.core import QgsBlockingNetworkRequest, QgsFeedback
 from qgis.PyQt.QtCore import QByteArray, QUrl
 from qgis.PyQt.QtNetwork import QNetworkRequest
 
+from . import diagnostics
 from .core import oauth
 from .core.errors import BackendError
 from .core.tracks import TRACK_HEADER
@@ -49,6 +51,10 @@ FORM_MEDIA_TYPE = "application/x-www-form-urlencoded"
 #: is resolved by asking the history collection for that exact reason, which only works
 #: while no two chunks share one.
 EDIT_REASON_HEADER = "X-Edit-Reason"
+
+#: A fresh ID per request. The API edge logs it with the request and echoes it back, so
+#: the ID in a copied error trace finds the server's side of the same failure.
+REQUEST_ID_HEADER = "X-Request-ID"
 
 # TRACK_HEADER is imported rather than defined: it is set here on the plugin's own
 # requests, and QGIS's OAPIF provider makes its own -- which this module never sees --
@@ -185,6 +191,7 @@ def _prepare(
     request = QNetworkRequest(QUrl(url))
     request.setRawHeader(b"Accept", accept.encode("ascii"))
     request.setRawHeader(b"User-Agent", USER_AGENT.encode("ascii"))
+    request.setRawHeader(REQUEST_ID_HEADER.encode("ascii"), uuid.uuid4().hex.encode("ascii"))
     if reason:
         request.setRawHeader(EDIT_REASON_HEADER.encode("ascii"), reason.encode("utf-8"))
     if track:
@@ -199,7 +206,20 @@ def _prepare(
     return request, fetcher
 
 
-def _read(fetcher: Any, error: Any, url: str) -> Response:
+def _request_id(reply: Any) -> str:
+    """The ID the edge logged: its echo, else the one sent (no response, no echo)."""
+    header = REQUEST_ID_HEADER.encode("ascii")
+    for source in (reply, reply.request()):
+        try:
+            value = bytes(source.rawHeader(header)).decode("ascii", errors="replace").strip()
+        except (AttributeError, TypeError):
+            continue
+        if value:
+            return value
+    return ""
+
+
+def _read(fetcher: Any, error: Any, url: str, method: str = "GET") -> Response:
     """Turn a completed blocking request into a :class:`Response`, or raise.
 
     The status is checked before the error code on purpose: a 4xx sets both, and the
@@ -209,6 +229,10 @@ def _read(fetcher: Any, error: Any, url: str) -> Response:
     status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
     status = int(status) if status is not None else 0
     body = bytes(reply.content())
+    failure = ""
+    if error != QgsBlockingNetworkRequest.ErrorCode.NoError:
+        failure = fetcher.errorMessage() or reply.errorString() or "unknown network error"
+    diagnostics.record_request(method, url, status, _request_id(reply), failure)
 
     if status and not (200 <= status < 300):
         raise BackendError(
@@ -222,9 +246,8 @@ def _read(fetcher: Any, error: Any, url: str) -> Response:
             payload=_json_object(body),
         )
 
-    if error != QgsBlockingNetworkRequest.ErrorCode.NoError:
-        message = fetcher.errorMessage() or reply.errorString() or "unknown network error"
-        raise BackendError(f"Request to {url} failed: {message}")
+    if failure:
+        raise BackendError(f"Request to {url} failed: {failure}")
 
     content_type = bytes(reply.rawHeader(b"Content-Type")).decode("ascii", errors="replace")
     return Response(status=status or 200, body=body, content_type=content_type)
@@ -288,7 +311,7 @@ def post_json(
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
     error = fetcher.post(request, QByteArray(body), False, feedback)
-    response = _read(fetcher, error, url)
+    response = _read(fetcher, error, url, "POST")
     if not response.body.strip():
         return None
     try:
@@ -329,7 +352,7 @@ def post_form(
     body = bytes(reply.content()) if reply is not None else b""
     oauth.raise_for_token_error(_json_object(body) or {})
 
-    response = _read(fetcher, error, url)
+    response = _read(fetcher, error, url, "POST")
     if not response.body.strip():
         # The revocation endpoint answers 200 with nothing, and that is a success.
         return None

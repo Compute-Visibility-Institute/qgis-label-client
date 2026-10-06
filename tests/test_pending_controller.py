@@ -172,6 +172,7 @@ def controller(tmp_path, monkeypatch, fake_iface):
     )
     plugin._current_write_access = lambda: True
     plugin._message = lambda text, *_args: fake_iface.messages.append(text)
+    plugin._trace_context = lambda: (("Backend", settings.api_base_url),)
     instance = pending.PendingEdits(plugin)
     instance.store = JournalStore(tmp_path / "journals")
     timers = []
@@ -200,6 +201,44 @@ def test_new_edit_invalidates_check_before_deferred_journal_flush(controller):
     task.done("")
     assert layer.commits == 0
     assert layer.buffer.added[-2]["name"] == "edit made while check was in flight"
+
+
+def test_save_outcome_is_judged_only_after_the_native_commit_returns(controller, monkeypatch):
+    shown = []
+    controller._warn = shown.append
+    loop = SimpleNamespace(level=1)
+    monkeypatch.setattr(
+        pending.QThread, "currentThread", lambda: SimpleNamespace(loopLevel=lambda: loop.level)
+    )
+    monkeypatch.setattr(pending.layers, "refresh_class_layer_after_commit", lambda _layer: None)
+
+    def run_timers():
+        due = list(controller.test_timers)
+        controller.test_timers.clear()
+        for callback in due:
+            callback()
+
+    layer = Layer()
+    controller.watch_layers([layer])
+    layer.beforeCommitChanges.emit(True)
+    # The class provider awaits its POST in a nested event loop, which runs timers too.
+    loop.level = 2
+    run_timers()
+    assert shown == []
+    loop.level = 1
+    layer.afterCommitChanges.emit()
+    run_timers()
+    assert shown == []
+    assert controller.store.list() == []
+
+    layer.buffer.added[-2] = Feature("refused by the server")
+    controller.changed(layer, -2)
+    run_timers()
+    layer.beforeCommitChanges.emit(True)
+    # The commit returned without afterCommitChanges: QGIS could not save.
+    run_timers()
+    assert len(shown) == 1
+    assert shown[0].startswith("Labels: the server has not confirmed the save.")
 
 
 def test_editing_is_journaled_silently(controller):
@@ -277,8 +316,8 @@ def test_copies_left_after_connect_are_reported_once_in_the_message_bar(controll
     assert [text for _title, text, _level in controller.plugin.iface.messages] == [
         "Labels: some local edits were not uploaded."
     ]
-    # The line carries a Review… button that opens the cleanup dialog.
-    assert len(controller.plugin.iface.message_items[0].widgets) == 1
+    # The line carries a Review… button that opens the cleanup dialog, and the trace copy.
+    assert len(controller.plugin.iface.message_items[0].widgets) == 2
     assert shown == []
 
 

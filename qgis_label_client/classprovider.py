@@ -117,7 +117,7 @@ def _request(method, url, *, authcfg, track, payload=None):
             request.setRawHeader(b"Content-Type", b"application/geo+json")
             body = QByteArray(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
             error = getattr(fetcher, method.lower())(request, body)
-        response = network._read(fetcher, error, url)
+        response = network._read(fetcher, error, url, method)
         return response.json() if response.body.strip() else None
 
     # QGIS network timers require a genuine QThread. Keep main-thread auth

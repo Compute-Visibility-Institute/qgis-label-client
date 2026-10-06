@@ -26,8 +26,8 @@ def test_one_cycle_attaches_and_detaches_everything(fake_iface):
     plugin.initGui()
     assert len(fake_iface.toolbar_icons) == 1
     assert len(fake_iface.docks) == 1
-    # Panel, connection prompt, recovery review, push and pull remain in the menu.
-    assert [menu for menu, _ in fake_iface.plugin_menu] == [MENU_NAME] * 5
+    # Panel, connection prompt, recovery review, push, pull and trace copy are in the menu.
+    assert [menu for menu, _ in fake_iface.plugin_menu] == [MENU_NAME] * 6
 
     plugin.unload()
     assert fake_iface.toolbar_icons == []
@@ -57,6 +57,7 @@ def test_every_attachment_registers_a_teardown(fake_iface):
     plugin.initGui()
     # Every menu entry and project attachment has a matching teardown.
     assert plugin.teardown.labels == [
+        "trace log capture",
         "valid-time expression",
         "dock widget",
         "toolbar icon",
@@ -72,6 +73,7 @@ def test_every_attachment_registers_a_teardown(fake_iface):
         "local source additions",
         "local source project read",
         "menu: pull all remote",
+        "menu: copy trace information",
     ]
     plugin.unload()
     assert len(plugin.teardown) == 0
