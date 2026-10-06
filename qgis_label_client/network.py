@@ -27,7 +27,7 @@ from qgis.PyQt.QtCore import QByteArray, QUrl
 from qgis.PyQt.QtNetwork import QNetworkRequest
 
 from . import diagnostics
-from .core import oauth
+from .core import oauth, refusals
 from .core.errors import BackendError
 from .core.tracks import TRACK_HEADER
 
@@ -153,12 +153,19 @@ def _describe_status(status: int, url: str, body: bytes) -> str:
             "can also be a cold start: a scale-to-zero deployment is slow to answer the "
             "first request after an idle period."
         )
-    detail = _body_detail(body)
     parts = [f"HTTP {status} from {url}"]
     if hint:
         parts.append(hint)
-    if detail:
-        parts.append(f"Server said: {detail}")
+    # The API's own refusals are a JSON document with a code and a description. Said
+    # as a sentence, it is the message; dumped raw, it was 300 characters of JSON cut
+    # off mid-word, after the URL, in front of the analyst who had to fix the data.
+    described = refusals.describe(_json_object(body))
+    if described:
+        parts.append(described)
+    else:
+        detail = _body_detail(body)
+        if detail:
+            parts.append(f"Server said: {detail}")
     return " ".join(parts)
 
 

@@ -11,6 +11,7 @@ import pytest
 from qgis_stubs import Signal
 
 from qgis_label_client import pending
+from qgis_label_client.core.errors import BackendError
 from qgis_label_client.core.pending import JournalError, JournalStore
 
 
@@ -238,7 +239,215 @@ def test_save_outcome_is_judged_only_after_the_native_commit_returns(controller,
     # The commit returned without afterCommitChanges: QGIS could not save.
     run_timers()
     assert len(shown) == 1
-    assert shown[0].startswith("Labels: the server has not confirmed the save.")
+    assert shown[0].startswith(
+        "Labels: the save did not complete, and it is not known which edits reached the server."
+    )
+
+
+SELF_INTERSECTION = {
+    "code": "GeometryInvalid",
+    "description": "the feature is not a valid geometry: Self-intersection at "
+    "POINT(12.34567891234567 45.67890123456). This is the same check app.label_check() makes.",
+}
+
+
+class ClassLayer(Layer):
+    """A class layer whose provider reports what the server said to this Save."""
+
+    def __init__(self, refusal, *, wrote=False, failure=None):
+        super().__init__()
+        self.provider = SimpleNamespace(
+            reset_write_session=lambda: None,
+            last_refresh_error="",
+            begin_save=lambda: None,
+            save_refusal=lambda: None if wrote else refusal,
+            last_refusal=lambda: refusal,
+            last_failure=lambda: failure or refusal,
+            wrote_this_save=lambda: wrote,
+        )
+
+    def providerType(self):  # noqa: N802
+        return pending.layers.CLASS_PROVIDER
+
+    def dataProvider(self):  # noqa: N802
+        return self.provider
+
+
+def _refused_save(controller, monkeypatch, layer):
+    shown = []
+    controller._warn = shown.append
+    monkeypatch.setattr(
+        pending.QThread, "currentThread", lambda: SimpleNamespace(loopLevel=lambda: 1)
+    )
+    controller.watch_layers([layer])
+    layer.beforeCommitChanges.emit(True)
+    # The commit returned without afterCommitChanges: the server refused it.
+    for callback in list(controller.test_timers):
+        callback()
+    return shown
+
+
+def test_a_refused_save_says_why_and_keeps_the_edits_ready_to_save(controller, monkeypatch):
+    refusal = BackendError("HTTP 422", status=422, payload=SELF_INTERSECTION)
+    layer = ClassLayer(refusal)
+    shown = _refused_save(controller, monkeypatch, layer)
+    # Nothing was written, so nothing is in doubt: no duplicate-risk dialog.
+    assert shown == []
+    assert controller.plugin.iface.messages[-1] == (
+        "Labels was not saved. The server refused a shape because its outline crosses "
+        "itself near 45.678901° N, 12.345679° E. Find it with Vector ▸ Geometry Tools ▸ "
+        "Check Validity, fix it (or run the Fix geometries tool), then Save again. Your edits are "
+        "still in the layer."
+    )
+    [copy] = controller.store.list()
+    assert copy["state"] == "pending"
+    assert copy["note"].startswith("Not saved: The server refused a shape")
+    assert layer.name() == "Labels [Unpushed: 1]"
+
+
+def test_a_refusal_after_part_of_the_save_was_written_stays_held(controller, monkeypatch):
+    refusal = BackendError("HTTP 422", status=422, payload=SELF_INTERSECTION)
+    layer = ClassLayer(refusal, wrote=True)
+    shown = _refused_save(controller, monkeypatch, layer)
+    assert len(shown) == 1
+    assert shown[0].startswith(
+        "Labels: part of this save reached the server before it refused the rest. "
+        "The server refused a shape because its outline crosses itself"
+    )
+    assert controller.store.list()[0]["state"] == "uncertain"
+
+
+def test_an_unclassified_failure_is_quoted_not_explained(controller, monkeypatch):
+    failure = ValueError("This class layer is not editable")
+    shown = _refused_save(controller, monkeypatch, ClassLayer(None, failure=failure))
+    assert len(shown) == 1
+    assert "It stopped with: This class layer is not editable." in shown[0]
+    assert "connection" not in shown[0] and "timed out" not in shown[0]
+
+
+def test_a_refusal_whose_copy_cannot_be_released_says_so(controller, monkeypatch):
+    shown = []
+    controller._warn = shown.append
+    monkeypatch.setattr(
+        pending.QThread, "currentThread", lambda: SimpleNamespace(loopLevel=lambda: 1)
+    )
+    layer = ClassLayer(BackendError("HTTP 422", status=422, payload=SELF_INTERSECTION))
+    controller.watch_layers([layer])
+    layer.beforeCommitChanges.emit(True)
+    # Another session changed the copy on disk before this one judged the Save.
+    load = controller.store.load
+    monkeypatch.setattr(controller.store, "load", lambda key: dict(load(key), state="conflict"))
+    for callback in list(controller.test_timers):
+        callback()
+    assert len(shown) == 1
+    assert shown[0].startswith("Labels was not saved. The server refused a shape")
+    assert "could not be updated" in shown[0]
+    assert "part of this save" not in shown[0]
+
+
+def test_a_not_saved_note_goes_once_the_edits_change(controller, monkeypatch):
+    refusal = BackendError("HTTP 422", status=422, payload=SELF_INTERSECTION)
+    layer = ClassLayer(refusal)
+    _refused_save(controller, monkeypatch, layer)
+    assert controller.store.list()[0]["note"].startswith("Not saved:")
+    layer.buffer.added[-2] = Feature("the fixed shape")
+    controller.snapshot(layer)
+    assert "note" not in controller.store.list()[0]
+
+
+def test_a_copy_already_held_is_not_released_by_a_later_clean_refusal(controller, monkeypatch):
+    """A partly written Save holds the copy. The next Save is refused before sending
+    anything -- but the earlier attempt may already have created or updated rows, so
+    releasing the copy now would let a later upload create them a second time."""
+    refusal = BackendError("HTTP 422", status=422, payload=SELF_INTERSECTION)
+    layer = ClassLayer(refusal, wrote=True)
+    _refused_save(controller, monkeypatch, layer)
+    assert controller.store.list()[0]["state"] == "uncertain"
+
+    layer.provider.save_refusal = lambda: refusal  # this attempt wrote nothing
+    controller.test_timers.clear()
+    shown = _refused_save(controller, monkeypatch, layer)
+    assert controller.store.list()[0]["state"] == "uncertain"
+    assert len(shown) == 1
+    assert shown[0].startswith("Labels was not saved. The server refused a shape")
+    assert "so the copy stays held" in shown[0]
+    assert controller.plugin.iface.messages == []
+
+
+class RefusingClassLayer(ClassLayer):
+    """QGIS's commit as the class provider makes it when the server refuses: the
+    native signal fires, nothing is acknowledged, and the commit returns False."""
+
+    def commitChanges(self, stop_editing=True):  # noqa: N802
+        self.commits += 1
+        self.beforeCommitChanges.emit(stop_editing)
+        return False
+
+
+def test_a_first_upload_on_connect_that_is_refused_goes_back_to_unsaved(controller, monkeypatch):
+    """The upload calls before_commit itself and again through commitChanges. The
+    second call sees the copy already marked uncertain; it must not decide where the
+    copy started, or a first refusal reads as a held earlier attempt."""
+    monkeypatch.setattr(
+        pending.QThread, "currentThread", lambda: SimpleNamespace(loopLevel=lambda: 1)
+    )
+    shown = []
+    controller._warn = shown.append
+    layer = RefusingClassLayer(BackendError("HTTP 422", status=422, payload=SELF_INTERSECTION))
+    controller.watch_layers([layer])
+    document = controller.snapshot(layer)
+    controller._check_and_push(layer, document, lambda: None)
+    controller.plugin.tasks.calls[-1].done("")
+    for callback in list(controller.test_timers):
+        callback()
+    assert layer.commits == 1
+    assert shown == []
+    assert controller.store.list()[0]["state"] == "pending"
+    assert controller.plugin.iface.messages[-1].startswith(
+        "Labels was not saved. The server refused a shape"
+    )
+    assert layer.name() == "Labels [Unpushed: 1]"
+
+
+def test_a_refusal_held_only_by_an_earlier_unanswered_create_does_not_claim_a_write(
+    controller, monkeypatch
+):
+    """An unanswered create earlier on this layer keeps every later refused Save held
+    (the provider will not call it clean). This Save wrote nothing, so say that."""
+    refusal = BackendError("HTTP 422", status=422, payload=SELF_INTERSECTION)
+    layer = ClassLayer(refusal)
+    layer.provider.save_refusal = lambda: None  # the earlier create's outcome is unknown
+    shown = _refused_save(controller, monkeypatch, layer)
+    assert len(shown) == 1
+    assert shown[0].startswith("Labels was not saved. The server refused a shape")
+    assert "An earlier save on this layer may already have reached the server" in shown[0]
+    assert "part of this save" not in shown[0]
+
+
+def test_a_refused_sign_in_says_to_sign_in_again(controller, monkeypatch):
+    refusal = BackendError(
+        "HTTP 401 from https://api.example.org The API rejected the credential.",
+        status=401,
+        payload={"detail": "ID token could not be verified"},
+    )
+    _refused_save(controller, monkeypatch, ClassLayer(refusal))
+    assert controller.plugin.iface.messages[-1] == (
+        "Labels was not saved. The server did not accept your sign-in. Sign in again from "
+        "the CVI panel, then Save again. Your edits are still in the layer."
+    )
+
+
+def test_one_layers_note_is_not_given_as_the_reason_for_several(controller):
+    first, second = Layer(), Layer("layer-second")
+    second.title = "Second"
+    controller.watch_layers([first, second])
+    noted = controller.snapshot(first)
+    noted["note"] = "Not saved: something about the first layer only."
+    controller._persist(first, noted)
+    controller.snapshot(second)
+    controller.report_attention()
+    [(_title, text, _level)] = controller.plugin.iface.messages
+    assert text == "Labels, Second: edits kept on this computer are not saved on the server yet."
 
 
 def test_editing_is_journaled_silently(controller):
@@ -314,7 +523,7 @@ def test_copies_left_after_connect_are_reported_once_in_the_message_bar(controll
     assert controller.plugin.iface.messages == []
     controller.report_attention()
     assert [text for _title, text, _level in controller.plugin.iface.messages] == [
-        "Labels: some local edits were not uploaded."
+        "Labels: edits kept on this computer are not saved on the server yet."
     ]
     # The line carries a Review… button that opens the cleanup dialog, and the trace copy.
     assert len(controller.plugin.iface.message_items[0].widgets) == 2

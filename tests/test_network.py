@@ -34,6 +34,20 @@ def test_a_json_error_body_is_kept_because_it_says_something():
     assert "bad bbox" in detail
 
 
+def test_a_refusal_document_is_said_as_a_sentence_not_dumped_as_json():
+    body = (
+        b'{"code":"GeometryInvalid","description":"the feature is not a valid geometry: '
+        b"Self-intersection at POINT(12.34567891234567 45.67890123456). This is the same "
+        b'check app.label_check() makes on the way in."}'
+    )
+    url = "https://api.example.org/class-layers/collections/x/items"
+    message = _describe_status(422, url, body)
+    assert message.startswith(f"HTTP 422 from {url} ")
+    assert "its outline crosses itself near 45.678901° N, 12.345679° E" in message
+    assert '{"code"' not in message
+    assert "Server said" not in message
+
+
 def test_a_server_error_names_the_cause_that_actually_produces_one_on_a_write():
     # The trigger enforces the class's JSON Schema, the geometry type and ST_IsValid, and
     # the feature service reports the exception as a bare 500. Naming only the cold start

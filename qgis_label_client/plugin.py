@@ -1715,7 +1715,7 @@ class LabelClientPlugin:
             f"{len(result.refreshed)} loaded label layer(s) in {track.name}."
         )
         if result.editing:
-            summary += f" Kept {len(result.editing)} layer(s) with unpushed local edits unchanged."
+            summary += f" Left {len(result.editing)} layer(s) with unsaved edits as they are."
         if result.failed:
             summary += f" {len(result.failed)} layer(s) could not refresh."
         if not (result.refreshed or result.editing or result.failed):

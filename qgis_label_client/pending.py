@@ -36,6 +36,7 @@ from qgis.PyQt.QtWidgets import (
 )
 
 from . import client, diagnostics, layers
+from .core import refusals
 from .core.errors import LabelClientError
 from .core.fields import DEFAULT_FIELDS
 from .core.pending import JournalError, JournalStore, decode_value, encode_value
@@ -133,6 +134,8 @@ class PendingEdits:
         self.revisions = {}
         self.bound_buffers = set()
         self.commits = {}
+        # layer id -> was its copy "pending" when the current Save began?
+        self.attempted_from_pending = {}
         self.claimed = set()
         self.scheduled = set()
         self.saving = set()
@@ -320,7 +323,8 @@ class PendingEdits:
             self.snapshot(layer)
         except (JournalError, ValueError, TypeError, RuntimeError) as exc:
             self._error(
-                f"Could not protect your unpushed edits: {exc}. Keep QGIS open and export the edited layer."
+                f"Could not keep a local copy of your unsaved edits: {exc}. Keep QGIS open "
+                "and export the edited layer, so the edits are not lost."
             )
 
     def snapshot(self, layer):
@@ -415,6 +419,17 @@ class PendingEdits:
             raise ValueError(
                 "Sign in and connect this layer's track before editing; its owner cannot be identified"
             )
+        if (
+            document.get("state") == "pending"
+            and previous
+            and (
+                previous["operations"] != operations
+                or previous.get("added_fields", []) != added_fields
+            )
+        ):
+            # A "Not saved: ..." note is about the edits that were refused. Once they
+            # change, it may describe a problem already fixed, so it goes.
+            document.pop("note", None)
         document["operations"] = operations
         document["added_fields"] = added_fields
         self._persist(layer, document)
@@ -460,8 +475,21 @@ class PendingEdits:
         if not layer.isModified():
             return True
         try:
+            if layer.providerType() == layers.CLASS_PROVIDER:
+                # A provider created by an older plugin version, still alive after an
+                # in-session upgrade, does not have this. Saving must still work.
+                begin = getattr(layer.dataProvider(), "begin_save", None)
+                if begin is not None:
+                    begin()
             document = self.snapshot(layer)
             if document:
+                # Only a copy that was "not saved yet" when this Save began may go back to
+                # that. One already held -- an earlier attempt reached the server in part,
+                # or never answered -- stays held whatever this attempt is told. Recorded
+                # once per Save: the upload on Connect calls this itself and then again
+                # through commitChanges, when the copy is already marked uncertain.
+                if layer.id() not in self.saving:
+                    self.attempted_from_pending[layer.id()] = document["state"] == "pending"
                 if document["operations"]:
                     document["state"] = "uncertain"
                     document["note"] = (
@@ -492,12 +520,92 @@ class PendingEdits:
 
     def _warn_failed_save(self, layer):
         document = self.documents.get(layer.id())
-        if not self.closed and document and document["state"] == "uncertain":
-            name = layer.customProperty(NAME_PROPERTY, "") or layer.name()
+        if self.closed or not document or document["state"] != "uncertain":
+            return
+        name = layer.customProperty(NAME_PROPERTY, "") or layer.name()
+        provider = layer.dataProvider() if layer.providerType() == layers.CLASS_PROVIDER else None
+        fresh = self.attempted_from_pending.pop(layer.id(), False)
+        # Absent on a provider from an older plugin version: then nothing is known.
+        refusal = getattr(provider, "save_refusal", lambda: None)()
+        held = (
+            "QGIS will not send these edits again automatically, because that could "
+            "create duplicates. Your edits are kept here. Check the layer against the "
+            "server, then use Unpushed edits… to keep or discard the local copy."
+        )
+        if refusal is not None and not fresh:
+            # Refused before writing anything -- but the copy was already held, because
+            # an earlier attempt may have reached the server. This answer changes nothing.
+            reason = refusals.explain(refusal.status, refusal.payload, str(refusal))
             self._warn(
-                f"{name}: the server has not confirmed the save. "
-                "Your local recovery copy remains; automatic retry is paused to prevent duplicates."
+                f"{name} was not saved. {reason} An earlier save of these edits may "
+                f"already have reached the server, so the copy stays held. {held}"
             )
+            return
+        if refusal is not None:
+            # The server refused before anything was written, so nothing is in doubt:
+            # these edits are simply not saved yet, and saving them again once fixed
+            # cannot create a duplicate. Say why, and do not hold them for review.
+            reason = refusals.explain(refusal.status, refusal.payload, str(refusal))
+            if self._release_refused(layer, document, f"Not saved: {reason}"):
+                self.plugin._message(
+                    f"{name} was not saved. {reason} Your edits are still in the layer.",
+                    Qgis.MessageLevel.Critical,
+                )
+                return
+            # Refused, but the local copy could not be returned to "not saved yet" --
+            # it changed on disk, or could not be read. Say exactly that.
+            self._warn(
+                f"{name} was not saved. {reason} Its local copy could not be updated to "
+                "match, so it is kept for review: use Unpushed edits… to keep or discard it."
+            )
+            return
+        seen = getattr(provider, "last_refusal", lambda: None)()
+        if seen is not None:
+            reason = refusals.explain(seen.status, seen.payload, str(seen))
+            if getattr(provider, "wrote_this_save", lambda: True)():
+                self._warn(
+                    f"{name}: part of this save reached the server before it refused the "
+                    f"rest. {reason} {held}"
+                )
+            else:
+                # Refused before writing anything, yet held: an earlier attempt on this
+                # layer -- a create that never got an answer, say -- may have reached
+                # the server. Do not claim this one did.
+                self._warn(
+                    f"{name} was not saved. {reason} An earlier save on this layer may "
+                    f"already have reached the server, so the copy stays held. {held}"
+                )
+            return
+        # Nothing here was classified, so claim no cause: say what stopped the save,
+        # when it is known, and that what reached the server is unknown.
+        failure = getattr(provider, "last_failure", lambda: None)()
+        stopped = f" It stopped with: {failure}" if failure is not None else ""
+        if stopped and not stopped.endswith((".", "!", "?")):
+            stopped += "."
+        self._warn(
+            f"{name}: the save did not complete, and it is not known which edits reached "
+            f"the server.{stopped} {held}"
+        )
+
+    def _release_refused(self, layer, document, note):
+        """Return a refused save's copy to pending, if it is still the one this Save wrote."""
+        try:
+            stored = self.store.load(document["id"])
+        except JournalError:
+            return False
+        if stored.get("state") != "uncertain" or stored.get("operations") != document["operations"]:
+            return False
+        key = document["id"]
+        held = key in self.claimed
+        self.claimed.add(key)
+        try:
+            self._persist(layer, dict(document, state="pending", note=note))
+        except JournalError:
+            return False
+        finally:
+            if not held:
+                self.claimed.discard(key)
+        return True
 
     def saved(self, layer):
         document = self.documents.get(layer.id())
@@ -526,6 +634,7 @@ class PendingEdits:
             layer.dataProvider().reset_write_session()
         # An empty Save or a different recovery copy is not acknowledgement of this journal.
         journal_id = self.commits.pop(layer.id(), None)
+        self.attempted_from_pending.pop(layer.id(), None)
         if journal_id and self.documents.get(layer.id(), {}).get("id") == journal_id:
             self.saved(layer)
         QTimer.singleShot(0, lambda: self._refresh_committed_class_layer(layer))
@@ -589,7 +698,18 @@ class PendingEdits:
         )
         if names:
             bar = self.plugin.iface.messageBar()
-            text = f"{', '.join(names)}: some local edits were not uploaded."
+            notes = {
+                str(document.get("note") or "")
+                for layer_id, document in self.documents.items()
+                if layer_id in self.watches and layer_id not in skip
+            } - {""}
+            # A reason only when one layer is listed: beside several it would read as
+            # the reason for all of them.
+            reason = f" {notes.pop()}" if len(names) == 1 and len(notes) == 1 else ""
+            text = (
+                f"{', '.join(names)}: edits kept on this computer are not saved on the "
+                f"server yet.{reason}"
+            )
             item = bar.createMessage("CVI Label Client", text)
             button = QPushButton("Review…", item)
             button.clicked.connect(lambda _checked=False: self.review())
@@ -718,7 +838,7 @@ class PendingEdits:
                     finally:
                         self.claimed.discard(frozen["id"])
             except (LabelClientError, ValueError, TypeError, RuntimeError) as exc:
-                self._error(f"Unpushed edits were kept for review: {exc}")
+                self._error(f"Your local edits were not sent and are kept for review: {exc}")
             finally:
                 self.saving.discard(layer_id)
                 if stop:
@@ -728,7 +848,8 @@ class PendingEdits:
 
         def failed(message):
             self._error(
-                f"Unpushed edits remain saved locally. Reconnect could not check the server: {message}"
+                "Your unsaved edits are kept on this computer, but they could not be sent: "
+                f"checking the server before sending them failed. {message}"
             )
             finished(stop=True)
 
@@ -1030,7 +1151,7 @@ class PendingEdits:
         self.warning_trace = diagnostics.trace_for(text, context_of=self.plugin._trace_context)
         if self.warning is None:
             self.warning = QMessageBox(self.plugin.iface.mainWindow())
-            self.warning.setWindowTitle("Unpushed edits")
+            self.warning.setWindowTitle("Save not confirmed")
             self.warning.setIcon(QMessageBox.Icon.Warning)
             self.warning.setStandardButtons(QMessageBox.StandardButton.Ok)
             self.warning.setModal(False)

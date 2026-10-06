@@ -335,19 +335,148 @@ def test_unknown_create_outcome_blocks_repeat_post(status, uncertain):
         _uncertain_create=False,
         _created={},
         _created_payloads={},
+        _deleted=set(),
+        _refusal=None,
+        _wrote=False,
         _properties=lambda feature: {},
         _collection_url="https://api.example/class-layers/collections/cl_test__point",
         _http=http,
         pushError=errors.append,
     )
     state._mark_uncertain_create = lambda: setattr(state, "_uncertain_create", True)
+    state._note_failure = lambda exc: provider.ClassLayerProvider._note_failure(state, exc)
     feature = SimpleNamespace(
         id=lambda: -1,
         geometry=lambda: SimpleNamespace(asJson=lambda: '{"type":"Point","coordinates":[1,2]}'),
     )
     assert provider.ClassLayerProvider.addFeatures(state, [feature]) == (False, [])
     assert state._uncertain_create is uncertain
+    # Only an answered refusal, with nothing written, lets the edits go back unsaved.
+    refusal = provider.ClassLayerProvider.save_refusal(state)
+    assert (refusal is not None) is (not uncertain)
     if uncertain:
         assert provider.ClassLayerProvider.addFeatures(state, [feature]) == (False, [])
         assert len(calls) == 1
-        assert "unknown save outcome" in errors[-1]
+        assert "got no answer from the server" in errors[-1]
+
+
+def test_a_refusal_after_a_successful_create_is_not_the_whole_story():
+    responses = [
+        {"type": "Feature", "id": "12.ab", "properties": {}},
+        BackendError("no", status=422),
+    ]
+
+    def http(*_args):
+        answer = responses.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    state = SimpleNamespace(
+        _require_writable=lambda: None,
+        _uncertain_create=False,
+        _created={},
+        _created_payloads={},
+        _deleted=set(),
+        _refusal=None,
+        _wrote=False,
+        _properties=lambda feature: {},
+        _collection_url="https://api.example/class-layers/collections/cl_test__point",
+        _http=http,
+        _cache_row=lambda row: row,
+        pushError=lambda _text: None,
+    )
+    state._mark_uncertain_create = lambda: setattr(state, "_uncertain_create", True)
+    state._note_failure = lambda exc: provider.ClassLayerProvider._note_failure(state, exc)
+    features = [
+        SimpleNamespace(
+            id=lambda fid=fid: fid,
+            geometry=lambda: SimpleNamespace(asJson=lambda: '{"type":"Point","coordinates":[1,2]}'),
+        )
+        for fid in (-1, -2)
+    ]
+    ok, _completed = provider.ClassLayerProvider.addFeatures(state, features)
+    assert ok is False
+    # The first feature is on the server: re-sending everything could duplicate it.
+    assert provider.ClassLayerProvider.save_refusal(state) is None
+    assert provider.ClassLayerProvider.last_refusal(state).status == 422
+
+
+def test_a_deletion_kept_from_an_earlier_attempt_is_not_unwritten():
+    """Deleting A succeeds and B is refused; the retry skips A and B is refused again.
+
+    The retry wrote nothing itself, but A is gone from the server, so the recovery copy
+    still describes something that happened and must not be released as unsaved.
+    """
+    rows = {1: {"id": "11.aa"}, 2: {"id": "12.bb"}}
+
+    def http(method, url):
+        if url.endswith("12.bb"):
+            raise BackendError("refused", status=409)
+
+    state = SimpleNamespace(
+        _require_writable=lambda: None,
+        _uncertain_create=False,
+        _created={},
+        _deleted=set(),
+        _rows=dict(rows),
+        _fid_by_rowid={"11": 1, "12": 2},
+        _memory=SimpleNamespace(deleteFeatures=lambda _fids: True),
+        _refusal=None,
+        _wrote=False,
+        _collection_url="https://api.example/class-layers/collections/cl_test__point",
+        _http=http,
+        pushError=lambda _text: None,
+    )
+    state._note_failure = lambda exc: provider.ClassLayerProvider._note_failure(state, exc)
+
+    assert provider.ClassLayerProvider.deleteFeatures(state, [1, 2]) is False
+    assert provider.ClassLayerProvider.save_refusal(state) is None
+    # The next Save starts clean but keeps the deletion that already happened.
+    provider.ClassLayerProvider.begin_save(state)
+    state._rows[1] = rows[1]
+    assert provider.ClassLayerProvider.deleteFeatures(state, [1, 2]) is False
+    assert state._wrote is False
+    assert provider.ClassLayerProvider.save_refusal(state) is None
+    assert provider.ClassLayerProvider.last_refusal(state).status == 409
+
+
+def test_an_update_written_before_a_refusal_in_the_same_save_keeps_it_held():
+    """The first update is written and the second refused, in one Save: the server has
+    the first, so this is not a refusal of the whole Save."""
+    rows = {
+        1: {"id": "11.aa", "properties": {}, "geometry": None},
+        2: {"id": "12.bb", "properties": {}, "geometry": None},
+    }
+    answers = [{"id": "11.ab"}, BackendError("refused", status=422)]
+
+    def http(method, url, payload):
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    state = SimpleNamespace(
+        _require_writable=lambda: None,
+        _uncertain_create=False,
+        _created={},
+        _deleted=set(),
+        _rows=rows,
+        _refusal=None,
+        _failure=None,
+        _wrote=False,
+        _definitions={},
+        _wire_by_name={},
+        fields=lambda: [],
+        _collection_url="https://api.example/class-layers/collections/cl_test__point",
+        _http=http,
+        _cache_row=lambda row: row,
+        pushError=lambda _text: None,
+    )
+    state._note_failure = lambda exc: provider.ClassLayerProvider._note_failure(state, exc)
+    geometry = SimpleNamespace(asJson=lambda: '{"type":"Point","coordinates":[1,2]}')
+
+    assert provider.ClassLayerProvider._change(state, {}, {1: geometry, 2: geometry}) is False
+    assert state._wrote is True
+    assert provider.ClassLayerProvider.save_refusal(state) is None
+    assert provider.ClassLayerProvider.last_refusal(state).status == 422
