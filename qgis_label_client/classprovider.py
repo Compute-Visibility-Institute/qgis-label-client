@@ -548,6 +548,10 @@ class ClassLayerProvider(QgsVectorDataProvider):
         """The server's refusal in this Save, whatever else happened, for the message."""
         return self._refusal
 
+    def wrote_this_save(self):
+        """Did any request of this Save write to the server? (Not an earlier one's.)"""
+        return self._wrote
+
     def last_failure(self):
         """Why this Save stopped, as raised -- a refusal, no answer, or a local check."""
         return self._failure

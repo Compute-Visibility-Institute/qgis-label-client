@@ -562,10 +562,19 @@ class PendingEdits:
         seen = getattr(provider, "last_refusal", lambda: None)()
         if seen is not None:
             reason = refusals.explain(seen.status, seen.payload, str(seen))
-            self._warn(
-                f"{name}: part of this save reached the server before it refused the rest. "
-                f"{reason} {held}"
-            )
+            if getattr(provider, "wrote_this_save", lambda: True)():
+                self._warn(
+                    f"{name}: part of this save reached the server before it refused the "
+                    f"rest. {reason} {held}"
+                )
+            else:
+                # Refused before writing anything, yet held: an earlier attempt on this
+                # layer -- a create that never got an answer, say -- may have reached
+                # the server. Do not claim this one did.
+                self._warn(
+                    f"{name} was not saved. {reason} An earlier save on this layer may "
+                    f"already have reached the server, so the copy stays held. {held}"
+                )
             return
         # Nothing here was classified, so claim no cause: say what stopped the save,
         # when it is known, and that what reached the server is unknown.

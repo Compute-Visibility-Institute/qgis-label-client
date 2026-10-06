@@ -263,6 +263,7 @@ class ClassLayer(Layer):
             save_refusal=lambda: None if wrote else refusal,
             last_refusal=lambda: refusal,
             last_failure=lambda: failure or refusal,
+            wrote_this_save=lambda: wrote,
         )
 
     def providerType(self):  # noqa: N802
@@ -406,6 +407,21 @@ def test_a_first_upload_on_connect_that_is_refused_goes_back_to_unsaved(controll
         "Labels was not saved. The server refused a shape"
     )
     assert layer.name() == "Labels [Unpushed: 1]"
+
+
+def test_a_refusal_held_only_by_an_earlier_unanswered_create_does_not_claim_a_write(
+    controller, monkeypatch
+):
+    """An unanswered create earlier on this layer keeps every later refused Save held
+    (the provider will not call it clean). This Save wrote nothing, so say that."""
+    refusal = BackendError("HTTP 422", status=422, payload=SELF_INTERSECTION)
+    layer = ClassLayer(refusal)
+    layer.provider.save_refusal = lambda: None  # the earlier create's outcome is unknown
+    shown = _refused_save(controller, monkeypatch, layer)
+    assert len(shown) == 1
+    assert shown[0].startswith("Labels was not saved. The server refused a shape")
+    assert "An earlier save on this layer may already have reached the server" in shown[0]
+    assert "part of this save" not in shown[0]
 
 
 def test_a_refused_sign_in_says_to_sign_in_again(controller, monkeypatch):
