@@ -2,15 +2,22 @@
 
 For ordinary change requests, implement the change and report the result. Do not
 automatically run tests, Ruff, type checks, native QGIS/browser checks, builds,
-packaging, or deployment validation. Do not bump versions, tag, publish a plugin,
-install a release, or dispatch workflows unless the current request asks for it.
-Earlier blanket deployment approval does not authorize future automatic releases.
+packaging, or deployment validation, except before a pull request (below). Do not
+bump versions, tag, publish a plugin, install a release, or dispatch workflows
+unless the current request asks for it. Earlier blanket deployment approval does
+not authorize future automatic releases.
 
 When the user explicitly requests tests or publication/deployment, run the checks
 relevant to the change and the required release checks. Release tags still run the
 release workflow's tests and packaging checks. Reuse successful checks for unchanged
 code; do not duplicate them locally, through subagents, and in CI without a
 concrete reason.
+
+Before opening a pull request, or pushing an update to one (review-fix rounds
+included), run `pytest` and `ruff check . && ruff format --check .` and fix
+failures before pushing. Say in the pull request or the reply which checks ran
+and their results; a change that touches no code needs no run. This covers checks
+only: it does not authorize a version bump, tag, release, or workflow dispatch.
 
 Use established repository commands and [the release procedure](docs/releasing.md).
 Avoid new temporary validation scripts or approval paths when existing commands
