@@ -1,0 +1,15 @@
+# Development and CI only. The plugin itself has NO runtime dependencies beyond what
+# QGIS 3.44 already ships -- deliberately, because every extra dependency is something an
+# annotator has to install into the QGIS Python environment by hand.
+#
+# This file holds the version ranges. requirements-dev.txt is the lock CI installs with
+# --require-hashes, because the release job runs these tools while holding a token that
+# can publish to every labeler's QGIS. After changing a range here, regenerate the lock:
+#
+#     uv pip compile --universal --generate-hashes --python-version 3.11 \
+#         requirements-dev.in -o requirements-dev.txt
+#
+# and bump to newer versions within the ranges with the same command plus --upgrade.
+pytest~=8.3
+ruff~=0.6
+qgis-plugin-ci~=2.8
