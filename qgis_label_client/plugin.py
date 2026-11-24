@@ -39,7 +39,7 @@ from qgis.PyQt.QtWidgets import (
     QMessageBox,
 )
 
-from . import auth, client, diagnostics, layertree, network, oauth_flow, qa
+from . import auth, client, diagnostics, layertree, netreset, network, oauth_flow, qa
 from . import layers as layer_tools
 from . import publish as publish_tools
 from .access import LayerAccess
@@ -325,6 +325,7 @@ class LabelClientPlugin:
         self.dock.connectRequested.connect(self.connect_backend)
         self.dock.signInRequested.connect(self.sign_in)
         self.dock.signOutRequested.connect(self.sign_out)
+        self.dock.signOutClearNetworkRequested.connect(self.sign_out_and_clear_network)
         self.dock.copyAddressRequested.connect(self.copy_address)
         self.dock.loadLayersRequested.connect(self.load_collections)
         self.dock.loadReadOnlyLayersRequested.connect(
@@ -1301,12 +1302,20 @@ class LabelClientPlugin:
     def _on_refresh_timer(self) -> None:
         self._refresh_credential(quiet=True)
 
-    def sign_out(self) -> None:
+    def sign_out_and_clear_network(self) -> None:
+        """Sign out, then clear what QGIS remembers about the network. See netreset."""
+        self.sign_out(clear_network=True)
+
+    def sign_out(self, clear_network: bool = False) -> None:
         """Remove every credential, and revoke the grant at Google.
 
         Local removal alone would leave a live, long-lived refresh token on the analyst's
         Google account after the panel said the sign-in was gone. "Signed out" has to be
         true on both sides or it is not a statement about anything.
+
+        ``clear_network`` also clears QGIS's download cache, retires open connections and
+        removes saved certificate exceptions for this plugin's servers (netreset), all
+        reported in the same message.
         """
         self._abandon_sign_in()
         stored = self.settings.authcfg_by_track
@@ -1338,10 +1347,32 @@ class LabelClientPlugin:
         self._session.cancel_pending()
         self._arm_refresh_timer()
         self._refresh_auth_label()
-        self._message(f"Signed out. {removed} credential(s) removed.")
+        text = f"Signed out. {removed} credential(s) removed."
+        if clear_network:
+            text += " " + self._clear_network()
+        self._message(text)
 
         if refresh_token:
             self._revoke(refresh_token)
+
+    def _clear_network(self) -> str:
+        """Run netreset.clear and say what it did, in a sentence for the message bar."""
+        cleared = netreset.clear(netreset.hosts_for(self.settings.api_base_url))
+        parts = [
+            "Cleared QGIS's download cache"
+            if cleared.download_cache
+            else "Could not clear QGIS's download cache (details in the CVI Label Client log)"
+        ]
+        if cleared.exceptions_removed:
+            parts.append(
+                "removed saved certificate exceptions for " + ", ".join(cleared.exceptions_removed)
+            )
+        done = " and ".join(parts) + "; the plugin's next requests use fresh connections"
+        # The one thing a plugin cannot reach: QGIS keeps "Ignore" in memory. See netreset.
+        return (
+            done + ". If you clicked Ignore on a certificate warning, restart QGIS too: "
+            "QGIS remembers that choice until it restarts."
+        )
 
     def _revoke(self, refresh_token: str) -> None:
         """Tell Google the refresh token is dead. Best effort, and it says so on failure.
