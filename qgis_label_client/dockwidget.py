@@ -337,7 +337,8 @@ class LabelClientDock(QDockWidget):
             "Signs out like Sign out, then clears QGIS's download cache (map tiles download "
             "again), makes this plugin open fresh connections, and removes saved certificate "
             "exceptions for this plugin's servers. Use it when Connect keeps failing and you "
-            "want to start from scratch."
+            "want to start from scratch. QGIS may pause for a moment while a large cache is "
+            "deleted."
         )
         self.copy_address_button = QPushButton("Copy address", group)
         self.copy_address_button.setIcon(QgsApplication.getThemeIcon("/mActionEditCopy.svg"))

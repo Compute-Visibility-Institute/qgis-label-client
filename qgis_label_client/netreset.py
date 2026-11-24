@@ -21,11 +21,12 @@ WHAT IT CLEARS
   (:func:`drop_stale_connections`, called by ``network._prepare``). The main thread's
   manager is left alone: the plugin makes no requests on it, and clearing it would cut
   off whatever else QGIS has in flight there.
-* Saved certificate exceptions ("Save SSL Server Exception") for the hosts this plugin
-  talks to. A saved exception makes QGIS accept that certificate silently from then on.
-  Saved behind an intercepting proxy, it sends the Google token through the proxy on
-  every request without a word; removing it brings the warning back, and the warning is
-  how a person sees who issued the certificate.
+* Saved certificate exceptions ("Save SSL Server Exception") for the servers this
+  plugin talks to, matched on ``host:port`` exactly as QGIS keys them, so an exception for
+  another service on the same host stays. A saved exception makes QGIS accept that
+  certificate silently from then on. Saved behind an intercepting proxy, it sends the
+  Google token through the proxy on every request without a word; removing it brings the
+  warning back, and the warning is how a person sees who issued the certificate.
 
 WHAT IT CANNOT CLEAR
 
@@ -36,7 +37,6 @@ expose it to Python, so only a restart forgets it. The message after clearing sa
 
 from __future__ import annotations
 
-import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -46,9 +46,14 @@ from qgis.core import QgsApplication, QgsAuthCertUtils, QgsNetworkAccessManager
 from .core import oauth
 from .log import log_warning
 
-# Bumped by every clear. A thread whose last-seen value differs drops its connections.
+# Bumped by every clear. A thread whose manager has seen a different value drops its
+# connections before its next request.
 _generation = 0
-_thread_state = threading.local()
+#: The dynamic property on each thread's network manager that records the generation that
+#: thread has caught up with. See drop_stale_connections for why not threading.local.
+_SEEN_PROPERTY = "cviLabelClientNetresetGeneration"
+#: QGIS keys saved exceptions on ``host:port`` and uses 443 when a URL names no port.
+_DEFAULT_PORT = 443
 
 
 @dataclass(frozen=True)
@@ -58,24 +63,53 @@ class Cleared:
     download_cache: bool
     #: ``host:port`` of each saved certificate exception removed.
     exceptions_removed: tuple[str, ...]
+    #: ``host:port`` of each saved exception for these servers that could not be removed.
+    exceptions_failed: tuple[str, ...] = ()
+    #: Why the saved exceptions could not all be checked, or "" if they could.
+    exceptions_error: str = ""
+
+    @property
+    def complete(self) -> bool:
+        """Every step did what it says. Anything else is a warning, never a quiet "done"."""
+        return self.download_cache and not self.exceptions_failed and not self.exceptions_error
 
 
-def hosts_for(api_base_url: str) -> set[str]:
-    """The hosts this plugin itself connects to through QGIS: the api and Google's token
-    endpoints. The browser sign-in page is not one of them; QGIS never opens it."""
-    urls = (api_base_url, oauth.TOKEN_ENDPOINT, oauth.REVOCATION_ENDPOINT)
-    return {host for host in (urlsplit(url).hostname for url in urls if url) if host}
+def hosts_for(*api_base_urls: str) -> set[str]:
+    """``host:port`` of each server this plugin itself connects to through QGIS: the api
+    and Google's token endpoints. The browser sign-in page is not one of them; QGIS never
+    opens it.
+
+    The caller passes both the saved api URL and the one in the panel field: the field is
+    where the next Connect goes, the saved one is where the last one went. A URL that does
+    not parse names no server QGIS could have connected to, and is skipped rather than
+    allowed to stop the sign-out it is part of.
+    """
+    found = set()
+    for url in (*api_base_urls, oauth.TOKEN_ENDPOINT, oauth.REVOCATION_ENDPOINT):
+        if not url:
+            continue
+        try:
+            parts = urlsplit(url.strip())
+            host, port = parts.hostname, parts.port
+        except ValueError:  # "https://[bad", "https://host:port", ...
+            continue
+        if host:
+            found.add(f"{host}:{port or _DEFAULT_PORT}")
+    return found
 
 
-def clear(hosts: Iterable[str]) -> Cleared:
-    """Clear the download cache and saved exceptions for ``hosts``; retire connections.
+def clear(hostports: Iterable[str]) -> Cleared:
+    """Clear the download cache and saved exceptions for ``hostports``; retire connections.
 
     Main thread only. Connections are not closed here but on each worker thread's next
     request. Each step is independent, and the caller has already signed out, so a step
-    that fails is logged and the rest still run.
+    that fails is logged, reported in the result, and the rest still run.
+
+    The generation moves LAST. A worker request that starts while the cache is being
+    deleted is set up with the saved exception still in place; if the generation had
+    already moved, that request would count as fresh and its connection would be kept.
     """
     global _generation
-    _generation += 1
 
     cache_cleared = False
     try:
@@ -89,49 +123,87 @@ def clear(hosts: Iterable[str]) -> Cleared:
     except Exception as exc:  # noqa: BLE001 - the saved exceptions must still go
         log_warning(f"Could not clear QGIS's network cache: {exc}")
 
-    try:
-        removed = _remove_saved_exceptions(hosts)
-    except Exception as exc:  # noqa: BLE001 - reported through the result instead
-        log_warning(f"Could not remove saved certificate exceptions: {exc}")
-        removed = []
-    return Cleared(download_cache=cache_cleared, exceptions_removed=tuple(removed))
+    removed, failed, error = _remove_saved_exceptions(hostports)
+    _generation += 1
+    return Cleared(
+        download_cache=cache_cleared,
+        exceptions_removed=tuple(removed),
+        exceptions_failed=tuple(failed),
+        exceptions_error=error,
+    )
 
 
 def drop_stale_connections() -> None:
     """Before a request: drop this thread's kept-alive connections if a clear happened.
 
-    One attribute read when nothing has changed. Never raises: a request must not fail
-    because tidying up before it did.
+    The generation a thread has caught up with is kept on that thread's own network
+    manager, not in ``threading.local``. QgsTask work runs on QThreadPool threads that
+    Python did not start, and the Python thread state there -- with everything
+    ``threading.local`` holds -- is created and destroyed around every task. The value
+    would be forgotten between tasks, and every task after a clear would drop its
+    connections again until QGIS restarted. The manager lives as long as its thread.
+
+    Free until the first clear, one property read after it. Never raises: a request must
+    not fail because tidying up before it did.
     """
-    if getattr(_thread_state, "generation", 0) == _generation:
+    generation = _generation
+    if not generation:
         return
-    _thread_state.generation = _generation
     try:
         manager = QgsNetworkAccessManager.instance()
-        if manager is not None:
-            manager.clearConnectionCache()
+        if manager is None or manager.property(_SEEN_PROPERTY) == generation:
+            return
+        # Recorded first, so a manager that cannot clear warns once rather than per request.
+        manager.setProperty(_SEEN_PROPERTY, generation)
+        manager.clearConnectionCache()
     except Exception as exc:  # noqa: BLE001 - see docstring
         log_warning(f"Could not drop this thread's open connections: {exc}")
 
 
-def _remove_saved_exceptions(hosts: Iterable[str]) -> list[str]:
-    """Remove saved certificate exceptions for ``hosts``; return their ``host:port``.
+def _remove_saved_exceptions(hostports: Iterable[str]) -> tuple[list[str], list[str], str]:
+    """Remove saved certificate exceptions for ``hostports``.
+
+    Returns the ``host:port`` of each one removed, of each one that could not be, and why
+    the list could not be fully checked ("" if it could). A failure is never folded into
+    "none found": the person would read that as the exception being gone.
 
     Removing an exception also drops its entry from QGIS's in-memory ignore list, which
     is keyed the same way.
     """
-    wanted = {host.lower() for host in hosts if host}
-    manager = QgsApplication.authManager()
-    if not wanted or manager is None or manager.isDisabled():
-        return []
-    removed = []
-    for config in manager.sslCertCustomConfigs():
-        hostport = str(config.sslHostPort()).strip()
-        if hostport.rsplit(":", 1)[0].lower() not in wanted:
+    wanted = {hostport.lower() for hostport in hostports if hostport}
+    if not wanted:
+        return [], [], ""
+    try:
+        manager = QgsApplication.authManager()
+        if manager is None or manager.isDisabled():
+            return [], [], "QGIS's authentication system is not available"
+        configs = list(manager.sslCertCustomConfigs())
+    except Exception as exc:  # noqa: BLE001 - reported through the result
+        log_warning(f"Could not read QGIS's saved certificate exceptions: {exc}")
+        return [], [], f"could not read them: {exc}"
+
+    removed: list[str] = []
+    failed: list[str] = []
+    unreadable = 0
+    for config in configs:
+        try:
+            hostport = str(config.sslHostPort()).strip()
+        except Exception as exc:  # noqa: BLE001 - might be one of ours; say so
+            log_warning(f"Could not read a saved certificate exception: {exc}")
+            unreadable += 1
             continue
-        digest = QgsAuthCertUtils.shaHexForCert(config.sslCertificate())
-        if manager.removeSslCertCustomConfig(digest, hostport):
+        if hostport.lower() not in wanted:
+            continue
+        try:
+            digest = QgsAuthCertUtils.shaHexForCert(config.sslCertificate())
+            done = bool(manager.removeSslCertCustomConfig(digest, hostport))
+            reason = "QGIS did not remove it"
+        except Exception as exc:  # noqa: BLE001 - the next exception must still go
+            done, reason = False, str(exc)
+        if done:
             removed.append(hostport)
         else:
-            log_warning(f"Could not remove the saved certificate exception for {hostport}.")
-    return removed
+            log_warning(f"Could not remove the saved exception for {hostport}: {reason}")
+            failed.append(hostport)
+    error = f"{unreadable} saved exception(s) could not be read" if unreadable else ""
+    return removed, failed, error
