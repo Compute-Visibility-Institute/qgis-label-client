@@ -175,6 +175,10 @@ class LabelClientDock(QDockWidget):
     connectRequested = pyqtSignal()
     signInRequested = pyqtSignal()
     signOutRequested = pyqtSignal()
+    #: Sign out, then clear QGIS's download cache, open connections and saved certificate
+    #: exceptions for this plugin's servers. Separate from Sign out on purpose: it reaches
+    #: into state all of QGIS shares. See netreset.
+    signOutClearNetworkRequested = pyqtSignal()
     #: "Copy my address". The single most common next action after the backend answers
     #: "you authenticated fine and are not on the access list" is pasting that address to
     #: an administrator, and retyping an address by eye is how a grant lands on nobody.
@@ -328,6 +332,14 @@ class LabelClientDock(QDockWidget):
             "Removes every stored credential and revokes this plugin's access at Google, "
             "so 'signed out' is true on both sides."
         )
+        self.sign_out_clear_button = QPushButton("Sign out and clear network cache", group)
+        self.sign_out_clear_button.setToolTip(
+            "Signs out like Sign out, then clears QGIS's download cache (map tiles download "
+            "again), makes this plugin open fresh connections, and removes saved certificate "
+            "exceptions for this plugin's servers. Use it when Connect keeps failing and you "
+            "want to start from scratch. QGIS may pause for a moment while a large cache is "
+            "deleted."
+        )
         self.copy_address_button = QPushButton("Copy address", group)
         self.copy_address_button.setIcon(QgsApplication.getThemeIcon("/mActionEditCopy.svg"))
         self.copy_address_button.setToolTip(
@@ -340,6 +352,7 @@ class LabelClientDock(QDockWidget):
         buttons.addWidget(self.sign_in_button)
         buttons.addWidget(self.sign_out_button)
         form.addRow(buttons)
+        form.addRow(self.sign_out_clear_button)
         actions = QHBoxLayout()
         actions.addWidget(self.copy_address_button)
         actions.addWidget(self.connect_button)
@@ -355,6 +368,7 @@ class LabelClientDock(QDockWidget):
 
         self.sign_in_button.clicked.connect(self.signInRequested)
         self.sign_out_button.clicked.connect(self.signOutRequested)
+        self.sign_out_clear_button.clicked.connect(self.signOutClearNetworkRequested)
         self.copy_address_button.clicked.connect(self.copyAddressRequested)
         self.connect_button.clicked.connect(self.connectRequested)
         return group

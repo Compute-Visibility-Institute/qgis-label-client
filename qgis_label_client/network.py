@@ -26,7 +26,7 @@ from qgis.core import QgsBlockingNetworkRequest, QgsFeedback
 from qgis.PyQt.QtCore import QByteArray, QUrl
 from qgis.PyQt.QtNetwork import QNetworkRequest
 
-from . import diagnostics
+from . import diagnostics, netreset
 from .core import oauth, refusals
 from .core.errors import BackendError
 from .core.tracks import TRACK_HEADER
@@ -195,6 +195,9 @@ def _prepare(
     track: str = "",
     reason: str = "",
 ) -> tuple[QNetworkRequest, Any]:
+    # After "Sign out and clear network cache": a fresh connection, and so a fresh
+    # certificate check, rather than one kept alive from before. See netreset.
+    netreset.drop_stale_connections()
     request = QNetworkRequest(QUrl(url))
     request.setRawHeader(b"Accept", accept.encode("ascii"))
     request.setRawHeader(b"User-Agent", USER_AGENT.encode("ascii"))

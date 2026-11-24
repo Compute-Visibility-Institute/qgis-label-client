@@ -25,6 +25,7 @@ import os
 import time
 from collections.abc import Callable, Sequence
 from contextlib import suppress
+from functools import partial
 from typing import Any
 
 from qgis.core import Qgis, QgsApplication, QgsFeedback, QgsProject
@@ -39,7 +40,7 @@ from qgis.PyQt.QtWidgets import (
     QMessageBox,
 )
 
-from . import auth, client, diagnostics, layertree, network, oauth_flow, qa
+from . import auth, client, diagnostics, layertree, netreset, network, oauth_flow, qa
 from . import layers as layer_tools
 from . import publish as publish_tools
 from .access import LayerAccess
@@ -325,6 +326,7 @@ class LabelClientPlugin:
         self.dock.connectRequested.connect(self.connect_backend)
         self.dock.signInRequested.connect(self.sign_in)
         self.dock.signOutRequested.connect(self.sign_out)
+        self.dock.signOutClearNetworkRequested.connect(self.sign_out_and_clear_network)
         self.dock.copyAddressRequested.connect(self.copy_address)
         self.dock.loadLayersRequested.connect(self.load_collections)
         self.dock.loadReadOnlyLayersRequested.connect(
@@ -1301,12 +1303,23 @@ class LabelClientPlugin:
     def _on_refresh_timer(self) -> None:
         self._refresh_credential(quiet=True)
 
-    def sign_out(self) -> None:
+    def sign_out_and_clear_network(self) -> None:
+        """Sign out, then clear what QGIS remembers about the network. See netreset."""
+        self.sign_out(clear_network=True)
+
+    def sign_out(self, clear_network: bool = False) -> None:
         """Remove every credential, and revoke the grant at Google.
 
         Local removal alone would leave a live, long-lived refresh token on the analyst's
         Google account after the panel said the sign-in was gone. "Signed out" has to be
         true on both sides or it is not a statement about anything.
+
+        ``clear_network`` also clears QGIS's download cache, retires open connections and
+        removes saved certificate exceptions for this plugin's servers (netreset), in a
+        second message. That runs after the revocation, not before. Behind an intercepting
+        proxy, removing the exception for Google's endpoint first would put a certificate
+        warning in front of the revoke request. Rejecting it, as the person should, would
+        leave the grant live while the panel said "Signed out".
         """
         self._abandon_sign_in()
         stored = self.settings.authcfg_by_track
@@ -1338,18 +1351,68 @@ class LabelClientPlugin:
         self._session.cancel_pending()
         self._arm_refresh_timer()
         self._refresh_auth_label()
-        self._message(f"Signed out. {removed} credential(s) removed.")
+        text = f"Signed out. {removed} credential(s) removed."
+        then: Callable[[], None] | None = None
+        if clear_network:
+            # Both the saved URL and the one in the field, read now: the field is where the
+            # next Connect goes, and it may not have been saved yet.
+            field_url = self.dock.api_url() if self.dock is not None else ""
+            then = partial(
+                self._clear_network, netreset.hosts_for(self.settings.api_base_url, field_url)
+            )
+            text += " Clearing QGIS's network cache next."
+        self._message(text)
 
         if refresh_token:
-            self._revoke(refresh_token)
+            self._revoke(refresh_token, then=then)
+        elif then is not None:
+            # After this message is on screen: deleting a large cache blocks the main
+            # thread, and a click followed by a frozen window says nothing.
+            QTimer.singleShot(0, then)
 
-    def _revoke(self, refresh_token: str) -> None:
+    def _clear_network(self, hostports: set[str]) -> None:
+        """Run netreset.clear and say what it did. Any step that failed makes it a warning."""
+        cleared = netreset.clear(hostports)
+        parts = [
+            "Cleared QGIS's download cache"
+            if cleared.download_cache
+            else "Could not clear QGIS's download cache"
+        ]
+        if cleared.exceptions_removed:
+            parts.append(
+                "removed saved certificate exceptions for " + ", ".join(cleared.exceptions_removed)
+            )
+        sentences = [" and ".join(parts) + "; the plugin's next requests use fresh connections."]
+        if cleared.exceptions_failed:
+            sentences.append(
+                "Could not remove the saved certificate exceptions for "
+                + ", ".join(cleared.exceptions_failed)
+                + ": remove them in Settings > Options > Authentication > Manage certificates."
+            )
+        if cleared.exceptions_error:
+            sentences.append(
+                f"Could not check every saved certificate exception ({cleared.exceptions_error})."
+            )
+        # The one thing a plugin cannot reach: QGIS keeps "Ignore" in memory. See netreset.
+        sentences.append(
+            "If you clicked Ignore on a certificate warning, restart QGIS too: "
+            "QGIS remembers that choice until it restarts."
+        )
+        if cleared.complete:
+            self._message(" ".join(sentences))
+        else:
+            sentences.append("Details are in the CVI Label Client log.")
+            self._message(" ".join(sentences), Qgis.MessageLevel.Warning)
+
+    def _revoke(self, refresh_token: str, then: Callable[[], None] | None = None) -> None:
         """Tell Google the refresh token is dead. Best effort, and it says so on failure.
 
         Failure is logged rather than raised: the local credentials are already gone, so
         the analyst IS signed out of this plugin, and a red bar claiming otherwise would be
         wrong in the direction that matters. What the log line buys is somebody being able
         to find out later that the grant is still live in the Google account settings.
+
+        ``then`` runs once the revocation has finished, however it finished.
         """
 
         def work(feedback: QgsFeedback) -> None:
@@ -1361,6 +1424,8 @@ class LabelClientPlugin:
 
         def revoked(_result: Any) -> None:
             log("Revoked the Google sign-in at Google.")
+            if then is not None:
+                then()
 
         def failed(message: str) -> None:
             log_warning(
@@ -1368,8 +1433,12 @@ class LabelClientPlugin:
                 f"({message}). Remove this plugin's access from your Google account "
                 "settings if that matters to you."
             )
+            if then is not None:
+                then()
 
-        self.tasks.run("Revoke Google sign-in", work, revoked, failed)
+        # Reported even when cancelled from the task manager: "Google did not confirm" is
+        # then still true, and ``then`` still has to run.
+        self.tasks.run("Revoke Google sign-in", work, revoked, failed, deliver_when_cancelled=True)
 
     def connect_backend(self) -> None:
         """Fetch the collection list and the class registry."""
