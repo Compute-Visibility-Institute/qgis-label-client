@@ -4,16 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and `qgis-plugin-ci` copies the
 most recent entries into `metadata.txt` at release time.
 
-## [Unreleased]
+## [0.3.16] - 2026-11-24
 
 ### Added
 
 - **Sign out and clear network cache** in the panel, for when Connect keeps failing and
-  you want to start from scratch. It signs out like Sign out, then clears QGIS's download
-  cache (map tiles download again), makes the plugin open fresh connections, and removes
-  saved certificate exceptions for the plugin's servers. QGIS keeps a plain "Ignore" on a
-  certificate warning in memory, where a plugin cannot reach it. The message says to
-  restart QGIS if you clicked one.
+  you want to start from scratch. It signs out like Sign out and, once Google has answered
+  the sign-out, clears QGIS's download cache (map tiles download again), makes the plugin
+  open fresh connections, and removes saved certificate exceptions for the plugin's
+  servers. If one cannot be removed, the message says so and names it. QGIS keeps a plain
+  "Ignore" on a certificate warning in memory, where a plugin cannot reach it. The message
+  says to restart QGIS if you clicked one.
 
 ## [0.3.15] - 2026-11-01
 
